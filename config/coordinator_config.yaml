@@ -1,0 +1,41 @@
+storage:
+    password: SeCrEt_p4ssw0rd_2!
+    path: /tmp/storage.db
+rpc:
+    network: regtest
+    url: http://127.0.0.1:18443
+    username: foo
+    password: rpcpassword
+    wallet: test_wallet
+key_manager:
+    key_derivation_seed: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    key_derivation_path: m/101/1/0/0/
+    winternitz_seed: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+    network: regtest
+key_storage:
+    password: secret_password
+    path: data/key_manager
+
+# Each setting is optional and will use the default values if not provided
+settings:
+  coordinator:
+    retry_interval_seconds: 5
+    retry_attempts_sending_tx: 3
+  dispatcher:
+    max_tx_weight: 400000
+  fee:
+    max_feerate_sat_vb: 1000
+    min_network_fee_rate: 1
+    base_fee_multiplier: 1.0
+  speedup:
+    max_unconfirmed_speedups: 10
+    max_rbf_attempts: 10
+    min_blocks_before_resend_speedup: 1
+    rbf_fee_percentage: 1.5
+    bump_fee_percentage: 1.5
+  funding:
+    min_funding_amount_sats: 10000
+  monitor:
+        max_monitoring_confirmations: 6
+        indexer_settings:
+            checkpoint_height: 0
