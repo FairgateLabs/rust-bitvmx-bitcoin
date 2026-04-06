@@ -3,40 +3,52 @@ use bitvmx_bitcoin_rpc::types::BlockHeight;
 use protocol_builder::types::Utxo;
 use serde::{Deserialize, Serialize};
 
-struct CoordinatedTx {
-    txid: Txid,
-    tx: Transaction,
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub enum TransactionState {
+    ToDispatch,
+    InMempool,
+    Confirmed,
+    Finalized,
+    Failed,
+}
 
-    kind: TxKind,
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct CoordinatedTx {
+    pub txid: Txid,
+    pub tx: Transaction,
 
-    state: TransactionState,
+    pub kind: TxKind,
+
+    pub state: TransactionState,
 
     // lifecycle
-    broadcast_block_height: BlockHeight,
-    target_block_height: BlockHeight,
-    stuck_in_mempool_blocks: u32,
-    confirmation_trigger: u32,
+    pub broadcast_block_height: BlockHeight,
+    pub target_block_height: BlockHeight,
+    pub stuck_in_mempool_blocks: u32,
+    pub confirmation_trigger: u32,
 
     // retry
-    retry_count: u32,
-    last_retry_timestamp: Option<u64>,
+    pub retry_count: u32,
+    // pub last_retry_timestamp: Option<u64>,
+    pub fee_info: FeeInfo,
 
-    fee_info: FeeInfo,
-
-    context: String,
+    pub context: String,
 }
 
-struct FeeInfo {
-    fee: u64,
-    fee_rate: u64,
-    weight: u64,
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub struct FeeInfo {
+    pub fee: u64,
+    pub fee_rate: u64,
+    pub weight: u64,
 }
 
-enum TxKind {
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+pub enum TxKind {
     Normal,
     Speedup(SpeedupKind),
 }
 
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 enum SpeedupKind {
     CPFP {
         parents: Vec<Txid>,
@@ -49,11 +61,15 @@ enum SpeedupKind {
     },
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
-pub enum TransactionState {
-    ToDispatch,
-    InMempool,
-    Confirmed,
-    Finalized,
-    Failed,
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+//TODO: complete
+pub enum CoordinatorNews {
+    TxNotFound {
+        txid: Txid,
+    },
+    InvalidStateTransition {
+        txid: Txid,
+        from: TransactionState,
+        to: TransactionState,
+    },
 }
