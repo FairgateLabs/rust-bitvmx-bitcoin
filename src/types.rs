@@ -72,4 +72,60 @@ pub enum CoordinatorNews {
         from: TransactionState,
         to: TransactionState,
     },
+    EstimateFeerateTooHigh {
+        estimated_fee_rate: u64,
+        max_fee_rate: u64,
+    },
+    InvalidFundingUtxo {
+        amount: u64,
+        min_required: u64,
+    },
+    FundingNotAvailable,
+    BitcoinClientError {
+        tx_id: Txid,
+        error: BitcoinBroadcastErrorKind,
+    },
+}
+
+/// High–level categorization of errors returned by the Bitcoin node when
+/// attempting to broadcast a transaction.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+pub enum BitcoinBroadcastErrorKind {
+    /// The transaction is already known by the node (in mempool or confirmed).
+    AlreadyKnown,
+    /// The transaction was rejected by mempool policy (fee too low, mempool full, etc.).
+    MempoolRejection,
+    /// A network/connection/timeout error occurred while talking to the node.
+    NetworkError,
+    /// Any other unexpected error.
+    Other,
+}
+
+impl BitcoinBroadcastErrorKind {
+    pub fn from_error_message(error_msg: &str) -> Self {
+        let msg = error_msg;
+
+        // Already-known / already-confirmed transaction
+        if msg.contains("already in mempool")
+            || msg.contains("Transaction outputs already in utxo set")
+        {
+            return BitcoinBroadcastErrorKind::AlreadyKnown;
+        }
+
+        // Mempool policy / fee issues
+        if msg.contains("mempool full")
+            || msg.contains("insufficient priority")
+            || msg.contains("min relay fee")
+            || msg.contains("mempool min fee not met")
+        {
+            return BitcoinBroadcastErrorKind::MempoolRejection;
+        }
+
+        // Infrastructure / connectivity issues
+        if msg.contains("network") || msg.contains("connection") || msg.contains("timeout") {
+            return BitcoinBroadcastErrorKind::NetworkError;
+        }
+
+        BitcoinBroadcastErrorKind::Other
+    }
 }

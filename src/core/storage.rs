@@ -66,7 +66,7 @@ impl CoordinatorStorage {
 
         for (_, value) in entries {
             let tx: CoordinatedTx = serde_json::from_str(&value).map_err(|_| {
-                //TODO: add fn partial_get<V> in storage
+                //TODO: add fn partial_get<V> in storage //TODO: add
                 BitcoinCoordinatorError::StorageBackendError(
                     storage_backend::error::StorageError::SerializationError,
                 )
