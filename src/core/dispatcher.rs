@@ -19,7 +19,7 @@ impl Dispatcher {
 impl Dispatcher {
     pub fn dispatch(
         &self,
-        monitor: Monitor,
+        monitor: &Monitor,
         txs: Vec<Transaction>,
     ) -> Vec<(Txid, Result<(), CoordinatorNews>)> {
         let batches = self.build_batches(txs);

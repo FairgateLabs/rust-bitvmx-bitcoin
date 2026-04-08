@@ -1,5 +1,6 @@
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
+use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
 use protocol_builder::types::Utxo;
 use serde::{Deserialize, Serialize};
 
@@ -62,7 +63,6 @@ enum SpeedupKind {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
-//TODO: complete
 pub enum CoordinatorNews {
     TxNotFound {
         txid: Txid,
@@ -84,6 +84,16 @@ pub enum CoordinatorNews {
     BitcoinClientError {
         tx_id: Txid,
         error: BitcoinBroadcastErrorKind,
+    },
+    /// Transaction has been in the mempool longer than `stuck_in_mempool_blocks` threshold.
+    TransactionStuckInMempool {
+        txid: Txid,
+        context: String,
+    },
+    /// Transaction could not be dispatched after exhausting all retry attempts.
+    DispatchError {
+        txid: Txid,
+        context: String,
     },
 }
 
@@ -128,4 +138,15 @@ impl BitcoinBroadcastErrorKind {
 
         BitcoinBroadcastErrorKind::Other
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct News {
+    pub monitor_news: Vec<MonitorNews>,
+    pub coordinator_news: Vec<CoordinatorNews>,
+}
+
+pub enum AckNews {
+    Monitor(AckMonitorNews),
+    Coordinator(CoordinatorNews),
 }

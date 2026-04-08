@@ -81,3 +81,98 @@ impl FundingManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::config::FundingSettings;
+    use bitcoin::hashes::{sha256d, Hash};
+    use bitcoin::PublicKey;
+    use bitcoin::Txid;
+    use std::str::FromStr;
+
+    const MIN: u64 = 10_000;
+
+    fn settings() -> FundingSettings {
+        FundingSettings {
+            min_funding_amount_sats: MIN,
+        }
+    }
+
+    fn dummy_pubkey() -> PublicKey {
+        PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
+            .unwrap()
+    }
+
+    fn utxo(amount: u64) -> Utxo {
+        let txid = Txid::from_raw_hash(sha256d::Hash::hash(amount.to_le_bytes().as_ref()));
+        Utxo::new(txid, 0, amount, &dummy_pubkey())
+    }
+
+    #[test]
+    fn test_set_valid_funding() {
+        let mut mgr = FundingManager::new(settings());
+        let news = mgr.set_funding(utxo(MIN));
+        assert!(news.is_none());
+        assert!(mgr.has_funding());
+    }
+
+    #[test]
+    fn test_set_invalid_funding_below_min() {
+        let mut mgr = FundingManager::new(settings());
+        let news = mgr.set_funding(utxo(MIN - 1));
+        assert!(matches!(
+            news,
+            Some(CoordinatorNews::InvalidFundingUtxo { .. })
+        ));
+        assert!(!mgr.has_funding());
+    }
+
+    #[test]
+    fn test_get_funding_when_empty() {
+        let mgr = FundingManager::new(settings());
+        let (utxo, news) = mgr.get_funding();
+        assert!(utxo.is_none());
+        assert_eq!(news, Some(CoordinatorNews::FundingNotAvailable));
+    }
+
+    #[test]
+    fn test_get_funding_valid() {
+        let mut mgr = FundingManager::new(settings());
+        mgr.set_funding(utxo(MIN));
+        let (u, news) = mgr.get_funding();
+        assert!(u.is_some());
+        assert!(news.is_none());
+    }
+
+    #[test]
+    fn test_consume_updates_utxo() {
+        let mut mgr = FundingManager::new(settings());
+        mgr.set_funding(utxo(MIN * 2));
+        let news = mgr.consume(utxo(MIN));
+        assert!(news.is_none());
+        assert!(mgr.has_funding());
+        let (u, _) = mgr.get_funding();
+        assert_eq!(u.unwrap().amount, MIN);
+    }
+
+    #[test]
+    fn test_consume_invalid_clears_funding() {
+        let mut mgr = FundingManager::new(settings());
+        mgr.set_funding(utxo(MIN * 2));
+        let news = mgr.consume(utxo(MIN - 1));
+        assert!(matches!(
+            news,
+            Some(CoordinatorNews::InvalidFundingUtxo { .. })
+        ));
+        assert!(!mgr.has_funding());
+    }
+
+    #[test]
+    fn test_clear_removes_funding() {
+        let mut mgr = FundingManager::new(settings());
+        mgr.set_funding(utxo(MIN));
+        mgr.clear();
+        assert!(!mgr.has_funding());
+    }
+}

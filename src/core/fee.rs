@@ -2,9 +2,9 @@ use crate::types::CoordinatorNews;
 use crate::{
     config::config::FeeSettings,
     errors::BitcoinCoordinatorError,
-    types::{CoordinatedTx, FeeInfo, TransactionState},
+    types::{CoordinatedTx, FeeInfo},
 };
-use bitcoin::Txid;
+use bitcoin::Transaction;
 use bitvmx_transaction_monitor::monitor::Monitor;
 use tracing::warn;
 
@@ -18,12 +18,15 @@ impl FeeEngine {
     }
 
     pub fn compute_fee(&self, tx: &CoordinatedTx, network_fee_rate: u64) -> FeeInfo {
-        let fee = tx.tx.vsize() as u64 * network_fee_rate;
+        self.compute_fee_for_tx(&tx.tx, network_fee_rate)
+    }
 
+    pub fn compute_fee_for_tx(&self, tx: &Transaction, fee_rate: u64) -> FeeInfo {
+        let fee = tx.vsize() as u64 * fee_rate;
         FeeInfo {
             fee,
-            fee_rate: network_fee_rate,
-            weight: tx.tx.weight().to_wu() as u64,
+            fee_rate,
+            weight: tx.weight().to_wu() as u64,
         }
     }
 
@@ -75,4 +78,64 @@ impl FeeEngine {
 
     //     Ok((fee_chain_difference, chain_vsize))
     // }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::rc::Rc;
+
+    use super::*;
+    use crate::{
+        config::config::{BitcoinSettings, Config, FeeSettings},
+        helper::StorageTestConfig,
+    };
+    use bitcoin::{absolute::LockTime, transaction::Version, Transaction};
+    use bitvmx_bitcoin_rpc::rpc_config::{self, RpcConfig};
+    use storage_backend::storage::Storage;
+
+    fn empty_tx() -> Transaction {
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        }
+    }
+
+    fn settings(min: u64, max: u64) -> FeeSettings {
+        FeeSettings {
+            min_network_fee_rate: min,
+            max_feerate_sat_vb: max,
+            base_fee_multiplier: 1.0,
+        }
+    }
+
+    fn create_monitor() -> Monitor {
+        let config = Config::load_config("config/coordinator_config.yaml").unwrap();
+        let storage = Rc::new(Storage::new(&config.storage).unwrap());
+        let rpc_config = config.rpc.clone();
+        let monitor_config = config.settings.monitor.clone();
+        Monitor::new_with_paths(&rpc_config, storage, Some(monitor_config)).unwrap()
+    }
+
+    #[test]
+    fn test_compute_fee_for_tx() {
+        let engine = FeeEngine::new(settings(1, 1000));
+        let tx = empty_tx();
+        let vsize = tx.vsize() as u64;
+        let fee_info = engine.compute_fee_for_tx(&tx, 10);
+        assert_eq!(fee_info.fee, vsize * 10);
+        assert_eq!(fee_info.fee_rate, 10);
+        assert_eq!(fee_info.weight, tx.weight().to_wu() as u64);
+    }
+
+    #[test]
+    fn test_get_network_fee_rate() {
+        let engine = FeeEngine::new(settings(10, 100));
+        let monitor = create_monitor();
+
+        let (fee_rate, news) = engine.get_network_fee_rate(&monitor).unwrap();
+        assert!(fee_rate <= 100);
+        assert!(news.is_none());
+    }
 }

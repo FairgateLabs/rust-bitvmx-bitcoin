@@ -134,7 +134,7 @@ impl CoordinatorStorage {
         Ok(())
     }
 
-    fn mark_as_retry(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
+    pub fn mark_as_retry(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
         let mut tx = match self.get_tx_by_id(tx_id)? {
             Some(tx) => tx,
             None => {
@@ -182,6 +182,17 @@ impl CoordinatorStorage {
     pub fn clear_news(&self) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
         self.storage.delete(&key)?;
+        Ok(())
+    }
+
+    pub fn ack_news(&self, news: CoordinatorNews) -> Result<(), BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::News);
+
+        let mut all: Vec<CoordinatorNews> = self.storage.get(&key)?.unwrap_or_default();
+
+        all.retain(|n| n != &news);
+
+        self.storage.set(&key, &all, None)?;
         Ok(())
     }
 
@@ -401,6 +412,33 @@ mod tests {
 
         let news = storage.get_news().unwrap();
         assert!(news.is_empty());
+
+        drop(storage);
+        storage_backend.remove();
+    }
+
+    #[test]
+    fn test_ack_news() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = storage_backend.get_coordinator_storage();
+
+        let news_item1 = CoordinatorNews::TxNotFound {
+            txid: random_txid(),
+        };
+        let news_item2 = CoordinatorNews::InvalidStateTransition {
+            txid: random_txid(),
+            from: TransactionState::InMempool,
+            to: TransactionState::Finalized,
+        };
+
+        storage.add_news(news_item1.clone()).unwrap();
+        storage.add_news(news_item2.clone()).unwrap();
+
+        storage.ack_news(news_item1.clone()).unwrap();
+
+        let news = storage.get_news().unwrap();
+        assert_eq!(news.len(), 1);
+        assert_eq!(news[0], news_item2);
 
         drop(storage);
         storage_backend.remove();
