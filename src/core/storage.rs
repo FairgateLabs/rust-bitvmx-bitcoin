@@ -280,7 +280,6 @@ mod tests {
 
     #[test]
     fn test_get_all_txs() {
-        init_trace();
         let storage_backend = StorageTestConfig::new();
         let storage = storage_backend.get_coordinator_storage();
 
@@ -304,32 +303,77 @@ mod tests {
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::ToDispatch);
-
         storage.insert_tx(tx).unwrap();
 
-        // Update tx state successfully
+        // Valid: ToDispatch -> InMempool
         storage
             .update_tx_state(txid, TransactionState::InMempool)
             .unwrap();
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
-        let news = storage.get_news().unwrap();
         assert_eq!(updated.state, TransactionState::InMempool);
-        assert!(news.is_empty());
+        assert!(storage.get_news().unwrap().is_empty());
 
-        // Update tx state to invalid state
+        // Valid: InMempool -> Confirmed
         storage
-            .update_tx_state(txid, TransactionState::Finalized)
+            .update_tx_state(txid, TransactionState::Confirmed)
+            .unwrap();
+        let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
+        assert_eq!(updated.state, TransactionState::Confirmed);
+        assert!(storage.get_news().unwrap().is_empty());
+
+        // Invalid: Confirmed -> ToDispatch (not a valid transition)
+        storage
+            .update_tx_state(txid, TransactionState::ToDispatch)
             .unwrap();
         let news = storage.get_news().unwrap();
         assert_eq!(news.len(), 1);
         assert_eq!(
             news[0],
             CoordinatorNews::InvalidStateTransition {
-                from: TransactionState::InMempool,
-                to: TransactionState::Finalized,
-                txid: txid,
+                from: TransactionState::Confirmed,
+                to: TransactionState::ToDispatch,
+                txid,
             }
         );
+
+        drop(storage);
+        storage_backend.remove();
+    }
+
+    #[test]
+    fn test_crash_recovery_state_transitions() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = storage_backend.get_coordinator_storage();
+
+        // InMempool -> Finalized (fast confirmation, skipped Confirmed)
+        let txid1 = random_txid();
+        storage
+            .insert_tx(dummy_tx(txid1, TransactionState::InMempool))
+            .unwrap();
+        storage
+            .update_tx_state(txid1, TransactionState::Finalized)
+            .unwrap();
+        assert!(storage.get_news().unwrap().is_empty());
+
+        // ToDispatch -> Confirmed (restart after dispatch, tx already on-chain)
+        let txid2 = random_txid();
+        storage
+            .insert_tx(dummy_tx(txid2, TransactionState::ToDispatch))
+            .unwrap();
+        storage
+            .update_tx_state(txid2, TransactionState::Confirmed)
+            .unwrap();
+        assert!(storage.get_news().unwrap().is_empty());
+
+        // ToDispatch -> Finalized (restart after dispatch, tx already finalized)
+        let txid3 = random_txid();
+        storage
+            .insert_tx(dummy_tx(txid3, TransactionState::ToDispatch))
+            .unwrap();
+        storage
+            .update_tx_state(txid3, TransactionState::Finalized)
+            .unwrap();
+        assert!(storage.get_news().unwrap().is_empty());
 
         drop(storage);
         storage_backend.remove();

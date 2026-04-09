@@ -30,7 +30,6 @@ pub struct CoordinatedTx {
 
     // retry
     pub retry_count: u32,
-    // pub last_retry_timestamp: Option<u64>,
     pub fee_info: FeeInfo,
 
     pub context: String,
@@ -50,7 +49,7 @@ pub enum TxKind {
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
-enum SpeedupKind {
+pub enum SpeedupKind {
     CPFP {
         parents: Vec<Txid>,
         funding_input: Utxo,
@@ -80,11 +79,8 @@ pub enum CoordinatorNews {
         amount: u64,
         min_required: u64,
     },
+    /// No funding UTXO is available.
     FundingNotAvailable,
-    BitcoinClientError {
-        tx_id: Txid,
-        error: BitcoinBroadcastErrorKind,
-    },
     /// Transaction has been in the mempool longer than `stuck_in_mempool_blocks` threshold.
     TransactionStuckInMempool {
         txid: Txid,
@@ -95,49 +91,6 @@ pub enum CoordinatorNews {
         txid: Txid,
         context: String,
     },
-}
-
-/// High–level categorization of errors returned by the Bitcoin node when
-/// attempting to broadcast a transaction.
-#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
-pub enum BitcoinBroadcastErrorKind {
-    /// The transaction is already known by the node (in mempool or confirmed).
-    AlreadyKnown,
-    /// The transaction was rejected by mempool policy (fee too low, mempool full, etc.).
-    MempoolRejection,
-    /// A network/connection/timeout error occurred while talking to the node.
-    NetworkError,
-    /// Any other unexpected error.
-    Other,
-}
-
-impl BitcoinBroadcastErrorKind {
-    pub fn from_error_message(error_msg: &str) -> Self {
-        let msg = error_msg;
-
-        // Already-known / already-confirmed transaction
-        if msg.contains("already in mempool")
-            || msg.contains("Transaction outputs already in utxo set")
-        {
-            return BitcoinBroadcastErrorKind::AlreadyKnown;
-        }
-
-        // Mempool policy / fee issues
-        if msg.contains("mempool full")
-            || msg.contains("insufficient priority")
-            || msg.contains("min relay fee")
-            || msg.contains("mempool min fee not met")
-        {
-            return BitcoinBroadcastErrorKind::MempoolRejection;
-        }
-
-        // Infrastructure / connectivity issues
-        if msg.contains("network") || msg.contains("connection") || msg.contains("timeout") {
-            return BitcoinBroadcastErrorKind::NetworkError;
-        }
-
-        BitcoinBroadcastErrorKind::Other
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

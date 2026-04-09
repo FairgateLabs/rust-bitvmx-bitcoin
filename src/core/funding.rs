@@ -1,74 +1,66 @@
 use protocol_builder::types::Utxo;
+use std::rc::Rc;
+use storage_backend::storage::{KeyValueStore, Storage};
 use tracing::warn;
 
-use crate::{config::config::FundingSettings, types::CoordinatorNews};
+use crate::{
+    config::config::FundingSettings, errors::BitcoinCoordinatorError, types::CoordinatorNews,
+};
 
+const FUNDING_KEY: &str = "bitcoin_coordinator/funding/utxo";
+
+/// `FundingManager` owns its own storage slice (same underlying [`Storage`]
+/// shared with the rest of the coordinator, but under its own key prefix).
+/// It does not depend on [`CoordinatorStorage`].
 pub struct FundingManager {
     settings: FundingSettings,
-    current_utxo: Option<Utxo>,
+    storage: Rc<Storage>,
 }
 
 impl FundingManager {
-    pub fn new(settings: FundingSettings) -> Self {
-        Self {
-            settings,
-            current_utxo: None,
-        }
+    pub fn new(settings: FundingSettings, storage: Rc<Storage>) -> Self {
+        Self { settings, storage }
     }
 
-    pub fn set_funding(&mut self, utxo: Utxo) -> Option<CoordinatorNews> {
+    /// Validate and persist a new funding UTXO.
+    pub fn set_funding(
+        &self,
+        utxo: Utxo,
+    ) -> Result<Option<CoordinatorNews>, BitcoinCoordinatorError> {
         match self.validate(&utxo) {
             Ok(()) => {
-                self.current_utxo = Some(utxo);
-                None
+                self.storage.set(FUNDING_KEY, &utxo, None)?;
+                Ok(None)
             }
             Err(news) => {
                 warn!("FundingManager: invalid funding utxo: {:?}", utxo);
-                self.current_utxo = None;
-                Some(news)
+                // Clear any stale value so a previously valid UTXO is not
+                // accidentally reused after a failed update.
+                self.storage.delete(FUNDING_KEY)?;
+                Ok(Some(news))
             }
         }
     }
 
-    pub fn get_funding(&self) -> (Option<Utxo>, Option<CoordinatorNews>) {
-        match &self.current_utxo {
-            None => (None, Some(CoordinatorNews::FundingNotAvailable)),
-
-            Some(utxo) => match self.validate(utxo) {
-                Ok(()) => (Some(utxo.clone()), None),
-
-                Err(news) => {
-                    warn!("FundingManager: stored utxo became invalid: {:?}", utxo);
-                    (None, Some(news))
-                }
-            },
-        }
+    /// Load the current funding UTXO from storage.
+    pub fn get_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
+        Ok(self.storage.get(FUNDING_KEY)?)
     }
 
-    pub fn consume(&mut self, new_change: Utxo) -> Option<CoordinatorNews> {
-        match self.validate(&new_change) {
-            Ok(()) => {
-                self.current_utxo = Some(new_change);
-                None
-            }
-            Err(news) => {
-                warn!("FundingManager: new change utxo invalid: {:?}", new_change);
-                self.current_utxo = None;
-                Some(news)
-            }
-        }
+    /// Remove the funding UTXO from storage.
+    pub fn clear_funding(&self) -> Result<(), BitcoinCoordinatorError> {
+        self.storage.delete(FUNDING_KEY)?;
+        Ok(())
     }
 
-    pub fn clear(&mut self) {
-        self.current_utxo = None;
+    /// Return `true` when a funding UTXO is currently stored.
+    pub fn has_funding(&self) -> Result<bool, BitcoinCoordinatorError> {
+        Ok(self.get_funding()?.is_some())
     }
 
-    pub fn has_funding(&self) -> bool {
-        self.current_utxo
-            .as_ref()
-            .map(|u| self.validate(u).is_ok())
-            .unwrap_or(false)
-    }
+    // -------------------------------------------------------------------------
+    // Private helpers
+    // -------------------------------------------------------------------------
 
     fn validate(&self, utxo: &Utxo) -> Result<(), CoordinatorNews> {
         if utxo.amount < self.settings.min_funding_amount_sats {
@@ -85,7 +77,7 @@ impl FundingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::config::FundingSettings;
+    use crate::{config::config::FundingSettings, helper::StorageTestConfig};
     use bitcoin::hashes::{sha256d, Hash};
     use bitcoin::PublicKey;
     use bitcoin::Txid;
@@ -99,6 +91,12 @@ mod tests {
         }
     }
 
+    fn make_manager() -> (FundingManager, StorageTestConfig) {
+        let config = StorageTestConfig::new();
+        let storage = config.get_raw_storage();
+        (FundingManager::new(settings(), storage), config)
+    }
+
     fn dummy_pubkey() -> PublicKey {
         PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
             .unwrap()
@@ -110,69 +108,92 @@ mod tests {
     }
 
     #[test]
-    fn test_set_valid_funding() {
-        let mut mgr = FundingManager::new(settings());
-        let news = mgr.set_funding(utxo(MIN));
+    fn test_set_valid_funding_persists() {
+        let (mgr, config) = make_manager();
+
+        let news = mgr.set_funding(utxo(MIN)).unwrap();
         assert!(news.is_none());
-        assert!(mgr.has_funding());
+
+        let stored = mgr.get_funding().unwrap();
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap().amount, MIN);
+
+        drop(mgr);
+        config.remove();
     }
 
     #[test]
-    fn test_set_invalid_funding_below_min() {
-        let mut mgr = FundingManager::new(settings());
-        let news = mgr.set_funding(utxo(MIN - 1));
+    fn test_set_invalid_funding_below_min_returns_news_and_clears_storage() {
+        let (mgr, config) = make_manager();
+
+        // Set a valid UTXO first, then overwrite with an invalid one.
+        mgr.set_funding(utxo(MIN)).unwrap();
+        let news = mgr.set_funding(utxo(MIN - 1)).unwrap();
+
         assert!(matches!(
             news,
             Some(CoordinatorNews::InvalidFundingUtxo { .. })
         ));
-        assert!(!mgr.has_funding());
+
+        // Invalid UTXO must not be stored, and the previous value must be cleared.
+        assert!(mgr.get_funding().unwrap().is_none());
+
+        drop(mgr);
+        config.remove();
     }
 
     #[test]
     fn test_get_funding_when_empty() {
-        let mgr = FundingManager::new(settings());
-        let (utxo, news) = mgr.get_funding();
-        assert!(utxo.is_none());
-        assert_eq!(news, Some(CoordinatorNews::FundingNotAvailable));
+        let (mgr, config) = make_manager();
+
+        let stored = mgr.get_funding().unwrap();
+        assert!(stored.is_none());
+
+        drop(mgr);
+        config.remove();
     }
 
     #[test]
-    fn test_get_funding_valid() {
-        let mut mgr = FundingManager::new(settings());
-        mgr.set_funding(utxo(MIN));
-        let (u, news) = mgr.get_funding();
-        assert!(u.is_some());
-        assert!(news.is_none());
+    fn test_has_funding() {
+        let (mgr, config) = make_manager();
+
+        assert!(!mgr.has_funding().unwrap());
+        mgr.set_funding(utxo(MIN)).unwrap();
+        assert!(mgr.has_funding().unwrap());
+
+        drop(mgr);
+        config.remove();
     }
 
     #[test]
-    fn test_consume_updates_utxo() {
-        let mut mgr = FundingManager::new(settings());
-        mgr.set_funding(utxo(MIN * 2));
-        let news = mgr.consume(utxo(MIN));
-        assert!(news.is_none());
-        assert!(mgr.has_funding());
-        let (u, _) = mgr.get_funding();
-        assert_eq!(u.unwrap().amount, MIN);
+    fn test_clear_funding() {
+        let (mgr, config) = make_manager();
+
+        mgr.set_funding(utxo(MIN)).unwrap();
+        mgr.clear_funding().unwrap();
+        assert!(!mgr.has_funding().unwrap());
+
+        drop(mgr);
+        config.remove();
     }
 
+    /// Simulates a coordinator restart: a second `FundingManager` built from
+    /// the same storage must see the UTXO set by the first.
     #[test]
-    fn test_consume_invalid_clears_funding() {
-        let mut mgr = FundingManager::new(settings());
-        mgr.set_funding(utxo(MIN * 2));
-        let news = mgr.consume(utxo(MIN - 1));
-        assert!(matches!(
-            news,
-            Some(CoordinatorNews::InvalidFundingUtxo { .. })
-        ));
-        assert!(!mgr.has_funding());
-    }
+    fn test_funding_survives_restart() {
+        let config = StorageTestConfig::new();
+        let storage = config.get_raw_storage();
 
-    #[test]
-    fn test_clear_removes_funding() {
-        let mut mgr = FundingManager::new(settings());
-        mgr.set_funding(utxo(MIN));
-        mgr.clear();
-        assert!(!mgr.has_funding());
+        let mgr1 = FundingManager::new(settings(), Rc::clone(&storage));
+        mgr1.set_funding(utxo(MIN * 2)).unwrap();
+        drop(mgr1);
+
+        let mgr2 = FundingManager::new(settings(), Rc::clone(&storage));
+        let stored = mgr2.get_funding().unwrap();
+        assert!(stored.is_some());
+        assert_eq!(stored.unwrap().amount, MIN * 2);
+
+        drop(mgr2);
+        config.remove();
     }
 }

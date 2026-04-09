@@ -2,11 +2,7 @@ use std::rc::Rc;
 
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::{rpc_config::RpcConfig, types::BlockHeight};
-use bitvmx_transaction_monitor::{
-    monitor::Monitor,
-    types::{AckMonitorNews, MonitorNews, TypesToMonitor},
-    TransactionStatus,
-};
+use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor, TransactionStatus};
 use protocol_builder::types::Utxo;
 use storage_backend::storage::Storage;
 use tracing::{debug, info, warn};
@@ -14,14 +10,14 @@ use tracing::{debug, info, warn};
 use crate::{
     config::config::{BitcoinSettings, CoordinatorSettings},
     core::{
-        dispatcher::Dispatcher, fee::FeeEngine, funding::FundingManager, speedup::SpeedupEngine,
+        dispatcher::{DispatchOutcome, Dispatcher},
+        fee::FeeEngine,
+        funding::FundingManager,
+        speedup::SpeedupEngine,
         storage::CoordinatorStorage,
     },
     errors::BitcoinCoordinatorError,
-    types::{
-        AckNews, BitcoinBroadcastErrorKind, CoordinatedTx, CoordinatorNews, News, TransactionState,
-        TxKind,
-    },
+    types::{AckNews, CoordinatedTx, CoordinatorNews, FeeInfo, News, TransactionState, TxKind},
 };
 
 pub struct BitcoinCoordinator {
@@ -47,22 +43,25 @@ impl BitcoinCoordinator {
     ) -> Result<Self, BitcoinCoordinatorError> {
         let settings = settings.unwrap_or_default();
         settings.validate()?;
+
+        // All modules share the same underlying Storage via Rc clones.
         let monitor = Monitor::new_with_paths(rpc_config, storage.clone(), Some(settings.monitor))?;
-        let storage = CoordinatorStorage::new(storage);
+        let funding_manager = FundingManager::new(settings.funding, storage.clone());
+        let coordinator_storage = CoordinatorStorage::new(storage);
+
         let dispatcher = Dispatcher::new(settings.dispatcher);
         let fee_engine = FeeEngine::new(settings.fee);
         let speedup_engine = SpeedupEngine::new(settings.speedup);
-        let funding_manager = FundingManager::new(settings.funding);
-        let settings = settings.coordinator;
+        let coordinator_settings = settings.coordinator;
 
         Ok(Self {
             monitor,
-            storage,
+            storage: coordinator_storage,
             dispatcher,
             fee_engine,
             speedup_engine,
             funding_manager,
-            settings,
+            settings: coordinator_settings,
         })
     }
 
@@ -70,7 +69,7 @@ impl BitcoinCoordinator {
     // Public API
     // =========================================================================
 
-    /// Returns true when the monitor is fully synced with the chain.
+    /// Returns `true` when the monitor is fully synced with the chain.
     pub fn is_ready(&self) -> Result<bool, BitcoinCoordinatorError> {
         Ok(self.monitor.is_ready()?)
     }
@@ -160,14 +159,15 @@ impl BitcoinCoordinator {
 
     /// Register a funding UTXO for potential future speedups.
     ///
-    /// Returns `Some(news)` if the UTXO is invalid (e.g. below dust threshold).
-    pub fn add_funding(&mut self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
+    /// Validation is performed immediately; if the UTXO is invalid (e.g. below
+    /// dust threshold) a news item is stored and the call still returns `Ok`.
+    /// Valid UTXOs are persisted to storage.
+    pub fn add_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
         info!(
             "Funding added | Txid({}) | Vout({}) | Amount({})",
             utxo.txid, utxo.vout, utxo.amount
         );
-        let funding = self.funding_manager.set_funding(utxo);
-        if let Some(news) = funding {
+        if let Some(news) = self.funding_manager.set_funding(utxo)? {
             self.storage.add_news(news)?;
         }
         Ok(())
@@ -181,6 +181,16 @@ impl BitcoinCoordinator {
         Ok(self.monitor.get_tx_status(&txid, true)?)
     }
 
+    // /// Registers a type of data to be monitored by the coordinator
+    // /// The data will be tracked for confirmations and status changes, and updates will be reported through the news.
+    // ///
+    // /// # Arguments
+    // /// * `data` - The data to monitor
+    // pub fn monitor(&self, data: TypesToMonitor) -> Result<(), BitcoinCoordinatorError> {
+    //     self.monitor.monitor(data, true)?; //ASK: why true or false?
+    //     Ok(())
+    // }
+
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
         let monitor_news = self.monitor.get_news()?;
         let coordinator_news = self.storage.get_news()?;
@@ -190,8 +200,8 @@ impl BitcoinCoordinator {
         })
     }
 
-    /// Acknowledge news item so it is not returned again.
-    pub fn ack_monitor_news(&self, news: AckNews) -> Result<(), BitcoinCoordinatorError> {
+    /// Acknowledge a news item so it is not returned again.
+    pub fn ack_news(&self, news: AckNews) -> Result<(), BitcoinCoordinatorError> {
         match news {
             AckNews::Monitor(news) => self.monitor.ack_news(news)?,
             AckNews::Coordinator(news) => self.storage.ack_news(news)?,
@@ -221,7 +231,7 @@ impl BitcoinCoordinator {
         for tx in active_txs {
             match tx.state {
                 TransactionState::ToDispatch => {
-                    if current_height >= tx.target_block_height {
+                    if tx.is_ready_to_dispatch(current_height) {
                         to_dispatch.push(tx);
                     }
                 }
@@ -242,8 +252,8 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
-    /// Check the chain/mempool status of each InMempool or Confirmed transaction
-    /// and transition its state accordingly.
+    /// Check the chain/mempool status of each `InMempool` or `Confirmed`
+    /// transaction and transition its state accordingly.
     fn review_transactions(
         &self,
         txs: Vec<CoordinatedTx>,
@@ -253,24 +263,23 @@ impl BitcoinCoordinator {
         let max_confs = self.monitor.settings.max_monitoring_confirmations;
 
         for tx in txs {
-            // Only query the mempool once the tx has been broadcast.
+            // Only search the mempool after the tx has been broadcast.
             let search_in_mempool = tx.broadcast_block_height > 0;
             let status = self.monitor.get_tx_status(&tx.txid, search_in_mempool)?;
 
             if status.is_in_mempool() {
-                if tx.stuck_in_mempool_blocks > 0 && tx.broadcast_block_height > 0 {
-                    let blocks_waiting = current_height.saturating_sub(tx.broadcast_block_height);
-                    if blocks_waiting >= tx.stuck_in_mempool_blocks {
-                        warn!(
-                            "Transaction({}) stuck in mempool for {} blocks (threshold: {})",
-                            tx.txid, blocks_waiting, tx.stuck_in_mempool_blocks
-                        );
-                        self.storage
-                            .add_news(CoordinatorNews::TransactionStuckInMempool {
-                                txid: tx.txid,
-                                context: tx.context.clone(),
-                            })?;
-                    }
+                if tx.is_stuck_in_mempool(current_height) {
+                    warn!(
+                        "Transaction({}) stuck in mempool for {} blocks (threshold: {})",
+                        tx.txid,
+                        current_height.saturating_sub(tx.broadcast_block_height),
+                        tx.stuck_in_mempool_blocks,
+                    );
+                    self.storage
+                        .add_news(CoordinatorNews::TransactionStuckInMempool {
+                            txid: tx.txid,
+                            context: tx.context.clone(),
+                        })?;
                 }
                 continue;
             }
@@ -330,41 +339,32 @@ impl BitcoinCoordinator {
         let raw_txs: Vec<Transaction> = txs.iter().map(|t| t.tx.clone()).collect();
         let results = self.dispatcher.dispatch(&self.monitor, raw_txs);
 
-        for (txid, result) in results {
+        for (txid, outcome) in results {
             let tx = match txs.iter().find(|t| t.txid == txid) {
-                Some(t) => t.clone(),
+                Some(t) => t,
                 None => continue,
             };
 
-            match result {
-                Ok(()) => {
-                    self.on_dispatch_success(&tx, txid, current_height, fee_rate)?;
+            match outcome {
+                DispatchOutcome::Success => {
+                    self.on_dispatch_success(tx, txid, current_height, fee_rate)?;
                 }
 
-                Err(CoordinatorNews::BitcoinClientError {
-                    error: BitcoinBroadcastErrorKind::AlreadyKnown,
-                    ..
-                }) => {
+                DispatchOutcome::AlreadyKnown => {
                     warn!(
                         "Transaction({}) already known by node — treating as in-mempool",
                         txid
                     );
-                    self.on_dispatch_success(&tx, txid, current_height, fee_rate)?;
+                    self.on_dispatch_success(tx, txid, current_height, fee_rate)?;
                 }
 
-                Err(CoordinatorNews::BitcoinClientError { error, .. })
-                    if matches!(
-                        error,
-                        BitcoinBroadcastErrorKind::MempoolRejection
-                            | BitcoinBroadcastErrorKind::NetworkError
-                    ) =>
-                {
-                    // Retryable error — either queue for retry or permanently fail.
+                DispatchOutcome::Retryable(msg) => {
                     if tx.retry_count + 1 >= self.settings.retry_attempts_sending_tx {
                         warn!(
-                            "Transaction({}) failed after {} attempts",
+                            "Transaction({}) failed after {} attempts: {}",
                             txid,
-                            tx.retry_count + 1
+                            tx.retry_count + 1,
+                            msg
                         );
                         self.storage
                             .update_tx_state(txid, TransactionState::Failed)?;
@@ -374,21 +374,27 @@ impl BitcoinCoordinator {
                         })?;
                     } else {
                         debug!(
-                            "Transaction({}) dispatch failed (attempt {}/{}) — will retry",
+                            "Transaction({}) dispatch failed (attempt {}/{}) — will retry: {}",
                             txid,
                             tx.retry_count + 1,
-                            self.settings.retry_attempts_sending_tx
+                            self.settings.retry_attempts_sending_tx,
+                            msg
                         );
                         self.storage.mark_as_retry(txid)?;
                     }
                 }
 
-                Err(news) => {
-                    // Fatal / unexpected error — mark as failed immediately.
-                    warn!("Transaction({}) failed with fatal dispatch error", txid);
+                DispatchOutcome::Fatal(msg) => {
+                    warn!(
+                        "Transaction({}) failed with fatal dispatch error: {}",
+                        txid, msg
+                    );
                     self.storage
                         .update_tx_state(txid, TransactionState::Failed)?;
-                    self.storage.add_news(news)?;
+                    self.storage.add_news(CoordinatorNews::DispatchError {
+                        txid,
+                        context: tx.context.clone(),
+                    })?;
                 }
             }
         }
