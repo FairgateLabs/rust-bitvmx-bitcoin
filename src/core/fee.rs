@@ -82,25 +82,11 @@ impl FeeEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::rc::Rc;
-
     use super::*;
     use crate::{
-        config::config::{BitcoinSettings, Config, FeeSettings},
-        helper::StorageTestConfig,
+        config::config::FeeSettings,
+        test_utils::{dummy_tx, StorageTestConfig, TestBitcoind},
     };
-    use bitcoin::{absolute::LockTime, transaction::Version, Transaction};
-    use bitvmx_bitcoin_rpc::rpc_config::{self, RpcConfig};
-    use storage_backend::storage::Storage;
-
-    fn empty_tx() -> Transaction {
-        Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![],
-            output: vec![],
-        }
-    }
 
     fn settings(min: u64, max: u64) -> FeeSettings {
         FeeSettings {
@@ -110,18 +96,10 @@ mod tests {
         }
     }
 
-    fn create_monitor() -> Monitor {
-        let config = Config::load_config("config/coordinator_config.yaml").unwrap();
-        let storage = Rc::new(Storage::new(&config.storage).unwrap());
-        let rpc_config = config.rpc.clone();
-        let monitor_config = config.settings.monitor.clone();
-        Monitor::new_with_paths(&rpc_config, storage, Some(monitor_config)).unwrap()
-    }
-
     #[test]
     fn test_compute_fee_for_tx() {
         let engine = FeeEngine::new(settings(1, 1000));
-        let tx = empty_tx();
+        let tx = dummy_tx();
         let vsize = tx.vsize() as u64;
         let fee_info = engine.compute_fee_for_tx(&tx, 10);
         assert_eq!(fee_info.fee, vsize * 10);
@@ -132,10 +110,16 @@ mod tests {
     #[test]
     fn test_get_network_fee_rate() {
         let engine = FeeEngine::new(settings(10, 100));
-        let monitor = create_monitor();
+        let storage = StorageTestConfig::new();
+        let bitcoind = TestBitcoind::default();
+        let monitor = bitcoind.create_monitor(storage.get_raw_storage());
 
         let (fee_rate, news) = engine.get_network_fee_rate(&monitor).unwrap();
         assert!(fee_rate <= 100);
         assert!(news.is_none());
+
+        drop(monitor);
+        storage.remove().unwrap();
+        bitcoind.stop().unwrap();
     }
 }

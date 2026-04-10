@@ -77,11 +77,8 @@ impl FundingManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::config::FundingSettings, helper::StorageTestConfig};
-    use bitcoin::hashes::{sha256d, Hash};
-    use bitcoin::PublicKey;
-    use bitcoin::Txid;
-    use std::str::FromStr;
+    use crate::test_utils::utxo;
+    use crate::{config::config::FundingSettings, test_utils::StorageTestConfig};
 
     const MIN: u64 = 10_000;
 
@@ -97,16 +94,6 @@ mod tests {
         (FundingManager::new(settings(), storage), config)
     }
 
-    fn dummy_pubkey() -> PublicKey {
-        PublicKey::from_str("0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798")
-            .unwrap()
-    }
-
-    fn utxo(amount: u64) -> Utxo {
-        let txid = Txid::from_raw_hash(sha256d::Hash::hash(amount.to_le_bytes().as_ref()));
-        Utxo::new(txid, 0, amount, &dummy_pubkey())
-    }
-
     #[test]
     fn test_set_valid_funding_persists() {
         let (mgr, config) = make_manager();
@@ -119,7 +106,7 @@ mod tests {
         assert_eq!(stored.unwrap().amount, MIN);
 
         drop(mgr);
-        config.remove();
+        config.remove().unwrap();
     }
 
     #[test]
@@ -139,7 +126,7 @@ mod tests {
         assert!(mgr.get_funding().unwrap().is_none());
 
         drop(mgr);
-        config.remove();
+        config.remove().unwrap();
     }
 
     #[test]
@@ -150,7 +137,7 @@ mod tests {
         assert!(stored.is_none());
 
         drop(mgr);
-        config.remove();
+        config.remove().unwrap();
     }
 
     #[test]
@@ -162,7 +149,7 @@ mod tests {
         assert!(mgr.has_funding().unwrap());
 
         drop(mgr);
-        config.remove();
+        config.remove().unwrap();
     }
 
     #[test]
@@ -174,7 +161,7 @@ mod tests {
         assert!(!mgr.has_funding().unwrap());
 
         drop(mgr);
-        config.remove();
+        config.remove().unwrap();
     }
 
     /// Simulates a coordinator restart: a second `FundingManager` built from
@@ -192,8 +179,9 @@ mod tests {
         let stored = mgr2.get_funding().unwrap();
         assert!(stored.is_some());
         assert_eq!(stored.unwrap().amount, MIN * 2);
-
         drop(mgr2);
-        config.remove();
+
+        drop(storage);
+        config.remove().unwrap();
     }
 }

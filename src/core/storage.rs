@@ -66,7 +66,7 @@ impl CoordinatorStorage {
 
         for (_, value) in entries {
             let tx: CoordinatedTx = serde_json::from_str(&value).map_err(|_| {
-                //TODO: add fn partial_get<V> in storage //TODO: add
+                //TODO: add fn partial_get<V> in storage
                 BitcoinCoordinatorError::StorageBackendError(
                     storage_backend::error::StorageError::SerializationError,
                 )
@@ -215,14 +215,12 @@ impl CoordinatorStorage {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::{
-        helper::{init_trace, StorageTestConfig},
+        test_utils::StorageTestConfig,
         types::{FeeInfo, TxKind},
     };
-
-    use super::*;
     use bitcoin::{transaction::Version, Transaction, Txid};
-    use tracing::info;
 
     fn dummy_tx(txid: Txid, state: TransactionState) -> CoordinatedTx {
         CoordinatedTx {
@@ -258,7 +256,6 @@ mod tests {
 
     #[test]
     fn test_insert_get_remove_tx() {
-        init_trace();
         let storage_backend = StorageTestConfig::new();
         let storage = storage_backend.get_coordinator_storage();
 
@@ -275,7 +272,7 @@ mod tests {
         assert!(fetched.is_none());
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 
     #[test]
@@ -293,7 +290,7 @@ mod tests {
         assert!(all.contains(&tx2));
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 
     #[test]
@@ -337,7 +334,7 @@ mod tests {
         );
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 
     #[test]
@@ -376,7 +373,7 @@ mod tests {
         assert!(storage.get_news().unwrap().is_empty());
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 
     #[test]
@@ -395,7 +392,7 @@ mod tests {
         assert_eq!(news[0], CoordinatorNews::TxNotFound { txid: txid });
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 
     #[test]
@@ -416,7 +413,7 @@ mod tests {
         assert_eq!(updated.retry_count, 1);
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 
     #[test]
@@ -439,7 +436,7 @@ mod tests {
         assert!(news.is_empty());
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 
     #[test]
@@ -458,7 +455,7 @@ mod tests {
         assert!(news.is_empty());
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 
     #[test]
@@ -485,6 +482,6 @@ mod tests {
         assert_eq!(news[0], news_item2);
 
         drop(storage);
-        storage_backend.remove();
+        storage_backend.remove().unwrap();
     }
 }

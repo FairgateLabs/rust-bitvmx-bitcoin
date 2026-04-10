@@ -1,5 +1,5 @@
 use rust_bitvmx_bitcoin::{
-    config::config::Config, coordinator::BitcoinCoordinator, helper::init_trace,
+    config::config::Config, coordinator::BitcoinCoordinator, test_utils::init_trace,
 };
 use std::rc::Rc;
 use storage_backend::storage::Storage;

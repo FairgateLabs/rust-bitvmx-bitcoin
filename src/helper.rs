@@ -1,15 +1,8 @@
-use crate::{
-    core::storage::CoordinatorStorage,
-    types::{
-        CoordinatedTx,
-        TransactionState::{self, *},
-    },
+use crate::types::{
+    CoordinatedTx,
+    TransactionState::{self, *},
 };
 use bitvmx_bitcoin_rpc::types::BlockHeight;
-use std::{fs, path, rc::Rc};
-use storage_backend::{storage::Storage, storage_config::StorageConfig};
-use tracing::{error, info};
-use tracing_subscriber::EnvFilter;
 
 impl TransactionState {
     /// Returns `true` when transitioning from `self` to `next` is a valid
@@ -75,97 +68,15 @@ impl CoordinatedTx {
     }
 }
 
-// =============================================================================
-// Test utilities
-// =============================================================================
-
-pub fn init_trace() {
-    let default_modules = [
-        "info",
-        "libp2p=off",
-        "bitvmx_transaction_monitor=debug",
-        "bitcoin_indexer=debug",
-        "bitcoin_coordinator=debug",
-        "bitcoin_rpc=debug",
-        "bitcoin_client=debug",
-        "p2p_protocol=off",
-        "p2p_handler=off",
-        "tarpc=off",
-        "key_manager=off",
-        "memory=off",
-    ];
-
-    let filter = EnvFilter::builder()
-        .parse(default_modules.join(","))
-        .expect("Invalid filter");
-
-    let _ = tracing_subscriber::fmt()
-        .with_target(true)
-        .with_env_filter(filter)
-        .try_init();
-}
-
-pub struct StorageTestConfig {
-    path: String,
-    storage: Rc<Storage>,
-}
-
-impl StorageTestConfig {
-    pub fn new() -> Self {
-        let path = Self::get_storage_path();
-        let config = StorageConfig {
-            path: path.clone(),
-            password: None,
-        };
-
-        let storage = Rc::new(Storage::new(&config).unwrap());
-        info!("Initialized test storage at: {}", path);
-
-        Self { path, storage }
-    }
-
-    pub fn get_coordinator_storage(&self) -> CoordinatorStorage {
-        CoordinatorStorage::new(Rc::clone(&self.storage))
-    }
-
-    pub fn get_raw_storage(&self) -> Rc<Storage> {
-        Rc::clone(&self.storage)
-    }
-
-    pub fn remove(self) {
-        let path = self.path.clone();
-        drop(self);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        Self::remove_storage_path(&path);
-    }
-
-    fn get_storage_path() -> String {
-        let storage_path = format!("temp-runs/storage_{}.db", std::process::id());
-        if path::Path::new(&storage_path).exists() {
-            Self::remove_storage_path(&storage_path);
-        }
-        storage_path
-    }
-
-    fn remove_storage_path(storage_path: &str) {
-        info!("Cleaning up storage file: {}", storage_path);
-        if path::Path::new(&storage_path).exists() {
-            fs::remove_dir_all(&storage_path)
-                .unwrap_or_else(|e| error!("Warning: could not remove storage: {e}"))
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{CoordinatedTx, FeeInfo, TxKind};
+    use bitcoin::hashes::{sha256d, Hash};
+    use bitcoin::{absolute::LockTime, transaction::Version, Transaction, Txid};
 
     #[test]
     fn test_is_ready_to_dispatch() {
-        use crate::types::{CoordinatedTx, FeeInfo, TxKind};
-        use bitcoin::hashes::{sha256d, Hash};
-        use bitcoin::{absolute::LockTime, transaction::Version, Transaction, Txid};
-
         let make_tx = |target: BlockHeight| CoordinatedTx {
             txid: Txid::from_raw_hash(sha256d::Hash::hash(&[0u8; 32])),
             tx: Transaction {
@@ -196,10 +107,6 @@ mod tests {
 
     #[test]
     fn test_is_stuck_in_mempool() {
-        use crate::types::{CoordinatedTx, FeeInfo, TxKind};
-        use bitcoin::hashes::{sha256d, Hash};
-        use bitcoin::{absolute::LockTime, transaction::Version, Transaction, Txid};
-
         let make_tx = |broadcast: BlockHeight, threshold: u32| CoordinatedTx {
             txid: Txid::from_raw_hash(sha256d::Hash::hash(&[1u8; 32])),
             tx: Transaction {

@@ -17,7 +17,7 @@ use crate::{
         storage::CoordinatorStorage,
     },
     errors::BitcoinCoordinatorError,
-    types::{AckNews, CoordinatedTx, CoordinatorNews, FeeInfo, News, TransactionState, TxKind},
+    types::{AckNews, CoordinatedTx, CoordinatorNews, News, TransactionState, TxKind},
 };
 
 pub struct BitcoinCoordinator {

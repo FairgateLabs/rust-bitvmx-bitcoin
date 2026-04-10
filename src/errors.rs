@@ -5,15 +5,11 @@ use protocol_builder::errors::ProtocolBuilderError;
 use storage_backend::error::StorageError;
 use thiserror::Error;
 
-use crate::types::TransactionState;
-
 #[derive(Error, Debug)]
 pub enum BitcoinCoordinatorError {
     #[error("Bad configuration: {0}")]
     InvalidConfiguration(String),
 
-    // #[error("Bitcoin Client Error: {0}")]
-    // BitcoinClientError(#[from] BitcoinClientError),
     #[error("Monitor Error: {0}")]
     MonitorError(#[from] MonitorError),
 
