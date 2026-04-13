@@ -1,13 +1,14 @@
-use bitcoin::{Address, CompressedPublicKey, Network, PublicKey};
+use bitcoin::{Address, Amount, CompressedPublicKey, Network, PublicKey, Transaction};
+use bitcoincore_rpc::RpcApi as _;
 use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
-use console::style;
 use rust_bitvmx_bitcoin::{
+    config::config::BitcoinSettings,
     coordinator::BitcoinCoordinator,
+    core::storage::CoordinatorStorage,
     errors::BitcoinCoordinatorError,
-    test_utils::{
-        dummy_pubkey, init_trace as internal_init_trace, StorageTestConfig, TestBitcoind,
-    },
+    test_utils::{dummy_pubkey, StorageTestConfig, TestBitcoind},
+    types::TransactionState,
 };
 use std::rc::Rc;
 use tracing::info;
@@ -75,10 +76,8 @@ impl TestSetup {
             .map_err(|e| anyhow::anyhow!("Failed to init wallet: {:?}", e))?;
 
         info!(
-            "{} Mine {} blocks to address {:?}",
-            style("Test").green(),
-            blocks_mined,
-            regtest_wallet
+            "Mine {} blocks to address {:?}",
+            blocks_mined, regtest_wallet
         );
 
         bitcoin_client
@@ -95,6 +94,120 @@ impl TestSetup {
     }
 }
 
+// =============================================================================
+// Coordinator construction helpers
+// =============================================================================
+
+/// Creates a `BitcoinCoordinator` from a `TestSetup` using default settings.
+pub fn create_coordinator(setup: &TestSetup) -> BitcoinCoordinator {
+    BitcoinCoordinator::new_with_paths(
+        &setup.bitcoind.rpc_config,
+        setup.storage.get_raw_storage(),
+        None,
+    )
+    .expect("Failed to create BitcoinCoordinator")
+}
+
+/// Creates a `BitcoinCoordinator` from a `TestSetup` with custom `BitcoinSettings`.
+pub fn create_coordinator_with_settings(
+    setup: &TestSetup,
+    settings: BitcoinSettings,
+) -> BitcoinCoordinator {
+    BitcoinCoordinator::new_with_paths(
+        &setup.bitcoind.rpc_config,
+        setup.storage.get_raw_storage(),
+        Some(settings),
+    )
+    .expect("Failed to create BitcoinCoordinator with settings")
+}
+
+/// Returns a `CoordinatorStorage` view over the test setup's shared storage.
+pub fn get_coord_storage(setup: &TestSetup) -> CoordinatorStorage {
+    setup.storage.get_coordinator_storage()
+}
+
+// =============================================================================
+// Transaction helpers
+// =============================================================================
+
+/// Creates a funded, signed Bitcoin transaction that is **not yet broadcast**.
+///
+/// Internally this:
+/// 1. Sends 1 000 000 sats from the test wallet to itself (via `fund_address`),
+///    mining one confirming block in the process.
+/// 2. Builds a raw transaction that spends that output (900 000 sats to a new
+///    wallet address, leaving 100 000 sats for fees).
+/// 3. Signs the transaction with the test wallet.
+/// 4. Returns the signed `Transaction` object without broadcasting it.
+///
+/// The returned transaction is immediately valid for broadcast and can be
+/// handed to the coordinator for dispatch.
+pub fn create_signed_tx_to_dispatch(bitcoin_client: &BitcoinClient) -> anyhow::Result<Transaction> {
+    // Ensure the wallet is loaded and get a wallet address.
+    let wallet_address = bitcoin_client
+        .init_wallet("test_wallet")
+        .map_err(|e| anyhow::anyhow!("init_wallet failed: {:?}", e))?;
+
+    // Fund the wallet address (broadcasts + mines 1 block so the output is confirmed).
+    let (funding_tx, funding_vout) = bitcoin_client
+        .fund_address(&wallet_address, Amount::from_sat(1_000_000))
+        .map_err(|e| anyhow::anyhow!("fund_address failed: {:?}", e))?;
+    let funding_txid = funding_tx.compute_txid();
+
+    // Pick a fresh recipient address.
+    let recipient = bitcoin_client
+        .client
+        .get_new_address(None, Some(bitcoincore_rpc::json::AddressType::Bech32))
+        .map_err(|e| anyhow::anyhow!("get_new_address failed: {:?}", e))?;
+
+    // Build a raw transaction spending the funded UTXO.
+    let inputs = vec![bitcoincore_rpc::json::CreateRawTransactionInput {
+        txid: funding_txid,
+        vout: funding_vout,
+        sequence: None,
+    }];
+    let mut outputs = std::collections::HashMap::new();
+    outputs.insert(
+        format!("{}", recipient.assume_checked()),
+        Amount::from_sat(900_000),
+    );
+    let raw_tx = bitcoin_client
+        .client
+        .create_raw_transaction(&inputs, &outputs, None, None)
+        .map_err(|e| anyhow::anyhow!("create_raw_transaction failed: {:?}", e))?;
+
+    // Sign with the wallet key.
+    let signed = bitcoin_client
+        .client
+        .sign_raw_transaction_with_wallet(&raw_tx, None, None)
+        .map_err(|e| anyhow::anyhow!("sign_raw_transaction_with_wallet failed: {:?}", e))?;
+    anyhow::ensure!(
+        signed.complete,
+        "Transaction signing incomplete: {:?}",
+        signed.errors
+    );
+
+    // Decode to a `Transaction` (still unbroadcast).
+    let tx = bitcoin::consensus::Decodable::consensus_decode(&mut &signed.hex[..])
+        .map_err(|e| anyhow::anyhow!("consensus_decode failed: {:?}", e))?;
+    Ok(tx)
+}
+
+/// Mines `n` blocks to `address` using `bitcoin_client`.
+pub fn mine_blocks(
+    bitcoin_client: &BitcoinClient,
+    n: u64,
+    address: &Address,
+) -> anyhow::Result<()> {
+    bitcoin_client
+        .mine_blocks_to_address(n, address)
+        .map_err(|e| anyhow::anyhow!("mine_blocks_to_address failed: {:?}", e))
+}
+
+// =============================================================================
+// Monitor / coordinator sync helpers
+// =============================================================================
+
 /// Tick the coordinator until `is_ready()` returns `true`.
 pub fn tick_until_ready(coordinator: &BitcoinCoordinator) -> Result<(), BitcoinCoordinatorError> {
     loop {
@@ -106,6 +219,29 @@ pub fn tick_until_ready(coordinator: &BitcoinCoordinator) -> Result<(), BitcoinC
     Ok(())
 }
 
-pub fn init_trace() {
-    internal_init_trace();
+/// Poll the coordinator storage until `txid` reaches `expected_state`, or
+/// until `max_ticks` ticks have been performed.  Returns `true` if the state
+/// was reached.
+pub fn tick_until_state(
+    coordinator: &BitcoinCoordinator,
+    storage: &CoordinatorStorage,
+    txid: bitcoin::Txid,
+    expected_state: TransactionState,
+    max_ticks: u32,
+) -> Result<bool, BitcoinCoordinatorError> {
+    for i in 0..max_ticks {
+        coordinator.tick()?;
+        if let Some(tx) = storage.get_tx_by_id(txid)? {
+            if tx.state == expected_state {
+                info!(
+                    "After {} ticks, reached expected state {:?} for txid {}",
+                    i + 1,
+                    expected_state,
+                    txid
+                );
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }

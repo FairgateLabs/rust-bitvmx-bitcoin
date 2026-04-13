@@ -97,7 +97,7 @@ impl TestBitcoind {
         rpc_config: Option<RpcConfig>,
         flags: Option<BitcoindFlags>,
     ) -> Result<Self, anyhow::Error> {
-        let _guard = RPC_LOCK.lock().unwrap();
+        let _guard = RPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let rpc_config = rpc_config.unwrap_or_else(Self::default_rpc_config);
         let bitcoind = Self::create_and_start_bitcoind(&rpc_config, flags)?;
         Ok(Self {

@@ -148,11 +148,13 @@ impl BitcoinCoordinator {
     pub fn cancel(&self, data: TypesToMonitor) -> Result<(), BitcoinCoordinatorError> {
         self.monitor.cancel(data.clone())?;
 
-        if let TypesToMonitor::Transactions(txids, _, _) = data {
+        if let TypesToMonitor::Transactions(txids, _, _) = data.clone() {
             for txid in txids {
                 self.storage.remove_tx(txid)?;
             }
         }
+
+        info!("Cancelled monitoring for {:?}", data);
 
         Ok(())
     }

@@ -1,5 +1,5 @@
 use crate::types::{
-    CoordinatedTx,
+    CoordinatedTx, News,
     TransactionState::{self, *},
 };
 use bitvmx_bitcoin_rpc::types::BlockHeight;
@@ -65,6 +65,13 @@ impl CoordinatedTx {
             && self.broadcast_block_height > 0
             && current_height.saturating_sub(self.broadcast_block_height)
                 >= self.stuck_in_mempool_blocks
+    }
+}
+
+//implement is_empty for News
+impl News {
+    pub fn is_empty(&self) -> bool {
+        self.monitor_news.is_empty() && self.coordinator_news.is_empty()
     }
 }
 
