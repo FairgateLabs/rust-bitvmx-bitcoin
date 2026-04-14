@@ -4,6 +4,7 @@
 # databases
 data
 test_output
+/temp-runs
 
 # macos
 .DS_Store
