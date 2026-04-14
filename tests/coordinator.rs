@@ -324,3 +324,87 @@ fn test_cancel_pending_tx_before_dispatch() {
     drop(coord_storage);
     setup.end_all().unwrap();
 }
+
+/// `get_transaction` can query the status of any transaction that the indexer
+/// has processed, including transactions confirmed before the coordinator was
+/// constructed.
+#[test]
+fn test_get_transaction_old_tx() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+
+    // Mine 1 block.
+    let wallet_addr = setup.bitcoin_client.init_wallet("test_wallet").unwrap();
+    setup
+        .bitcoin_client
+        .mine_blocks_to_address(1, &wallet_addr)
+        .unwrap();
+
+    // Use `fund_address` to create a confirmed transaction.
+    let (funded_tx, _vout) = setup
+        .bitcoin_client
+        .fund_address(&wallet_addr, bitcoin::Amount::from_sat(500_000))
+        .unwrap();
+    let funded_txid = funded_tx.compute_txid();
+
+    // Sync coordinator to the new blocks.
+    tick_until_ready(&coordinator).unwrap();
+
+    // Query via coordinator.
+    let status = coordinator.get_transaction(funded_txid).unwrap();
+    assert!(
+        status.confirmations > 0,
+        "funded tx must have at least 1 confirmation; got {}",
+        status.confirmations
+    );
+
+    drop(coordinator);
+    setup.end_all().unwrap();
+}
+
+/// Full news lifecycle: coordinator news is produced, retrievable, and
+/// accurately removed after acknowledgement.
+#[test]
+fn test_news_ack() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Add a UTXO below the minimum to generate InvalidFundingUtxo news.
+    coordinator.add_funding(utxo(500)).unwrap(); // min is 10 000
+
+    let news = coordinator.get_news().unwrap();
+    assert_eq!(
+        news.coordinator_news.len(),
+        1,
+        "Expected exactly one coordinator news item; got {:?}",
+        news.coordinator_news
+    );
+
+    let news_item = news.coordinator_news[0].clone();
+    assert!(
+        matches!(news_item, CoordinatorNews::InvalidFundingUtxo { .. }),
+        "Expected InvalidFundingUtxo; got {:?}",
+        news_item
+    );
+
+    // Acknowledge the news item.
+    coordinator
+        .ack_news(AckNews::Coordinator(news_item))
+        .unwrap();
+
+    // After ack the coordinator news list must be empty.
+    let news_after_ack = coordinator.get_news().unwrap();
+    assert!(
+        news_after_ack.coordinator_news.is_empty(),
+        "Coordinator news must be empty after ack; got {:?}",
+        news_after_ack.coordinator_news
+    );
+
+    drop(coordinator);
+    setup.end_all().unwrap();
+}

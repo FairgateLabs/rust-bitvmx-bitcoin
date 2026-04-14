@@ -36,18 +36,6 @@ impl TransactionState {
     }
 }
 
-impl std::fmt::Display for TransactionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ToDispatch => write!(f, "ToDispatch"),
-            InMempool => write!(f, "InMempool"),
-            Confirmed => write!(f, "Confirmed"),
-            Finalized => write!(f, "Finalized"),
-            Failed => write!(f, "Failed"),
-        }
-    }
-}
-
 impl CoordinatedTx {
     /// Returns `true` when the transaction is due to be dispatched at `current_height`.
     pub fn is_ready_to_dispatch(&self, current_height: BlockHeight) -> bool {

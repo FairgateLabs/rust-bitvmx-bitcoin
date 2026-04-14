@@ -187,6 +187,18 @@ pub fn create_signed_tx_to_dispatch(bitcoin_client: &BitcoinClient) -> anyhow::R
         signed.errors
     );
 
+    //TODO: check if nedded:
+    // Lock the funding UTXO so that subsequent wallet operations (e.g. a
+    // second call to `fund_address`) do not select it as an input while this
+    // transaction is still unbroadcast.  Without this, the wallet sees the
+    // UTXO as available and may spend it in the next `send_to_address` call,
+    // causing this signed-but-unbroadcast transaction to fail with
+    // "bad-txns-inputs-missingorspent" when it is later submitted.
+    bitcoin_client
+        .client
+        .lock_unspent(&[bitcoin::OutPoint::new(funding_txid, funding_vout)])
+        .map_err(|e| anyhow::anyhow!("lock_unspent failed: {:?}", e))?;
+
     // Decode to a `Transaction` (still unbroadcast).
     let tx = bitcoin::consensus::Decodable::consensus_decode(&mut &signed.hex[..])
         .map_err(|e| anyhow::anyhow!("consensus_decode failed: {:?}", e))?;

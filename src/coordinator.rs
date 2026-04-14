@@ -1,11 +1,13 @@
 use std::rc::Rc;
 
 use bitcoin::{Transaction, Txid};
-use bitvmx_bitcoin_rpc::{rpc_config::RpcConfig, types::BlockHeight};
+use bitvmx_bitcoin_rpc::{
+    bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
+};
 use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor, TransactionStatus};
 use protocol_builder::types::Utxo;
 use storage_backend::storage::Storage;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::config::{BitcoinSettings, CoordinatorSettings},
@@ -44,12 +46,13 @@ impl BitcoinCoordinator {
         let settings = settings.unwrap_or_default();
         settings.validate()?;
 
+        let bitcoin_client = Rc::new(BitcoinClient::new_from_config(rpc_config)?);
+
         // All modules share the same underlying Storage via Rc clones.
         let monitor = Monitor::new_with_paths(rpc_config, storage.clone(), Some(settings.monitor))?;
         let funding_manager = FundingManager::new(settings.funding, storage.clone());
         let coordinator_storage = CoordinatorStorage::new(storage);
-
-        let dispatcher = Dispatcher::new(settings.dispatcher);
+        let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client);
         let fee_engine = FeeEngine::new(settings.fee);
         let speedup_engine = SpeedupEngine::new(settings.speedup);
         let coordinator_settings = settings.coordinator;
@@ -240,7 +243,12 @@ impl BitcoinCoordinator {
                 TransactionState::InMempool | TransactionState::Confirmed => {
                     to_review.push(tx);
                 }
-                _ => {} //TODO: notify error via news, it should never reach here. And remove it?
+                _ => {
+                    error!(
+                        " Inconsistent error: transaction {} in unexpected state {:?}",
+                        tx.txid, tx.state
+                    );
+                }
             }
         }
 
@@ -279,6 +287,7 @@ impl BitcoinCoordinator {
                     );
                     self.storage
                         .add_news(CoordinatorNews::TransactionStuckInMempool {
+                            //TODO: it should be done one notification per block (add block consideration to add_news)
                             txid: tx.txid,
                             context: tx.context.clone(),
                         })?;
@@ -321,6 +330,7 @@ impl BitcoinCoordinator {
                 debug!("Transaction({}) orphaned — keeping InMempool", tx.txid);
                 self.storage
                     .update_tx_state(tx.txid, TransactionState::InMempool)?;
+                continue;
             }
         }
 
@@ -339,7 +349,7 @@ impl BitcoinCoordinator {
         }
 
         let raw_txs: Vec<Transaction> = txs.iter().map(|t| t.tx.clone()).collect();
-        let results = self.dispatcher.dispatch(&self.monitor, raw_txs);
+        let results = self.dispatcher.dispatch(raw_txs);
 
         for (txid, outcome) in results {
             let tx = match txs.iter().find(|t| t.txid == txid) {
@@ -362,6 +372,7 @@ impl BitcoinCoordinator {
 
                 DispatchOutcome::Retryable(msg) => {
                     if tx.retry_count + 1 >= self.settings.retry_attempts_sending_tx {
+                        // TODO: Not spamming, retry every once in a while (can be general to avoid adding a field to the tx)
                         warn!(
                             "Transaction({}) failed after {} attempts: {}",
                             txid,
