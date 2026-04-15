@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::{
@@ -19,6 +19,7 @@ use crate::{
         storage::CoordinatorStorage,
     },
     errors::BitcoinCoordinatorError,
+    helper::now_secs,
     types::{AckNews, CoordinatedTx, CoordinatorNews, News, TransactionState, TxKind},
 };
 
@@ -34,6 +35,7 @@ pub struct BitcoinCoordinator {
     funding_manager: FundingManager,
 
     settings: CoordinatorSettings,
+    last_retry_at: Cell<Option<u64>>, // Timestamp of last retry attempt, for rate-limiting retries
 }
 
 impl BitcoinCoordinator {
@@ -65,6 +67,7 @@ impl BitcoinCoordinator {
             speedup_engine,
             funding_manager,
             settings: coordinator_settings,
+            last_retry_at: Cell::new(None),
         })
     }
 
@@ -288,7 +291,6 @@ impl BitcoinCoordinator {
                     );
                     self.storage
                         .add_news(CoordinatorNews::TransactionStuckInMempool {
-                            //TODO: it should be done one notification per block (add block consideration to add_news)
                             txid: tx.txid,
                             context: tx.context.clone(),
                         })?;
@@ -349,6 +351,8 @@ impl BitcoinCoordinator {
             self.storage.add_news(news)?;
         }
 
+        let txs = self.apply_retry_rate_limit(txs);
+
         let raw_txs: Vec<Transaction> = txs.iter().map(|t| t.tx.clone()).collect();
         let results = self.dispatcher.dispatch(raw_txs);
 
@@ -373,7 +377,6 @@ impl BitcoinCoordinator {
 
                 DispatchOutcome::Retryable(msg) => {
                     if tx.retry_count + 1 >= self.settings.retry_attempts_sending_tx {
-                        // TODO: Not spamming, retry every once in a while (can be general to avoid adding a field to the tx)
                         warn!(
                             "Transaction({}) failed after {} attempts: {}",
                             txid,
@@ -445,5 +448,31 @@ impl BitcoinCoordinator {
             txid, current_height
         );
         Ok(())
+    }
+
+    /// Filter out retry transactions if the retry interval has not elapsed.
+    fn apply_retry_rate_limit(&self, txs: Vec<CoordinatedTx>) -> Vec<CoordinatedTx> {
+        let retry_ready = match self.last_retry_at.get() {
+            None => true,
+            Some(last) => now_secs().saturating_sub(last) >= self.settings.retry_interval_seconds,
+        };
+        let mut has_retries = false;
+        let filtered: Vec<CoordinatedTx> = txs
+            .into_iter()
+            .filter(|t| {
+                if t.retry_count > 0 {
+                    has_retries = true;
+                    retry_ready
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if has_retries && retry_ready {
+            self.last_retry_at.set(Some(now_secs()));
+        } else if has_retries {
+            debug!("Skipping retry txs — retry interval not elapsed");
+        }
+        filtered
     }
 }
