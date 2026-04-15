@@ -6,7 +6,6 @@ use bitvmx_transaction_monitor::types::AckMonitorNews;
 use bitvmx_transaction_monitor::types::TypesToMonitor;
 use rust_bitvmx_bitcoin::{
     config::config::{BitcoinSettings, CoordinatorSettings},
-    test_utils::{dummy_tx, init_trace, utxo},
     types::{AckNews, CoordinatorNews, TransactionState},
 };
 use tracing::info;

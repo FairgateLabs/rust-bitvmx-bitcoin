@@ -1,4 +1,3 @@
-use crate::core::storage::CoordinatorStorage;
 use bitcoin::{
     absolute::LockTime,
     hashes::{sha256d, Hash},
@@ -171,10 +170,6 @@ impl StorageTestConfig {
         info!("Initialized test storage at: {}", path);
 
         Self { path, storage }
-    }
-
-    pub fn get_coordinator_storage(&self) -> CoordinatorStorage {
-        CoordinatorStorage::new(Rc::clone(&self.storage))
     }
 
     pub fn get_raw_storage(&self) -> Rc<Storage> {

@@ -292,7 +292,7 @@ mod tests {
     #[test]
     fn test_insert_get_remove_tx() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::ToDispatch);
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn test_get_all_txs() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let tx1 = dummy_tx(random_txid(), TransactionState::ToDispatch);
         let tx2 = dummy_tx(random_txid(), TransactionState::InMempool);
@@ -331,7 +331,7 @@ mod tests {
     #[test]
     fn test_update_tx_state() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::ToDispatch);
@@ -375,7 +375,7 @@ mod tests {
     #[test]
     fn test_crash_recovery_state_transitions() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         // InMempool -> Finalized (fast confirmation, skipped Confirmed)
         let txid1 = random_txid();
@@ -414,7 +414,7 @@ mod tests {
     #[test]
     fn test_update_tx_state_not_found() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let txid = random_txid();
 
@@ -433,7 +433,7 @@ mod tests {
     #[test]
     fn test_mark_as_retry_success() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::InMempool);
@@ -454,7 +454,7 @@ mod tests {
     #[test]
     fn test_add_get_clear_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let news_item = CoordinatorNews::TxNotFound {
             txid: random_txid(),
@@ -477,7 +477,7 @@ mod tests {
     #[test]
     fn test_clear_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let news_item = CoordinatorNews::TxNotFound {
             txid: random_txid(),
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn test_ack_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let news_item1 = CoordinatorNews::TxNotFound {
             txid: random_txid(),
@@ -526,7 +526,7 @@ mod tests {
     #[test]
     fn test_add_news_dedup() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let news = CoordinatorNews::FundingNotAvailable;
 
@@ -548,7 +548,7 @@ mod tests {
     #[test]
     fn test_add_news_distinct_items_both_stored() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let item1 = CoordinatorNews::FundingNotAvailable;
         let item2 = CoordinatorNews::EstimateFeerateTooHigh {
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn test_get_news_new_block_delivers_again() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         storage
             .add_news(CoordinatorNews::FundingNotAvailable)
@@ -595,7 +595,7 @@ mod tests {
     #[test]
     fn test_ack_then_readd_is_fresh() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
 
         let news = CoordinatorNews::FundingNotAvailable;
         storage.add_news(news.clone()).unwrap();
