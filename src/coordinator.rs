@@ -53,7 +53,7 @@ impl BitcoinCoordinator {
         // All modules share the same underlying Storage via Rc clones.
         let monitor = Monitor::new_with_paths(rpc_config, storage.clone(), Some(settings.monitor))?;
         let funding_manager = FundingManager::new(settings.funding, storage.clone());
-        let coordinator_storage = CoordinatorStorage::new(storage);
+        let coordinator_storage = CoordinatorStorage::new(storage, settings.storage);
         let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client);
         let fee_engine = FeeEngine::new(settings.fee);
         let speedup_engine = SpeedupEngine::new(settings.speedup);
@@ -139,6 +139,7 @@ impl BitcoinCoordinator {
             target_block_height: target_height,
             stuck_in_mempool_blocks,
             confirmation_trigger: confirmation_trigger.unwrap_or(0),
+            settled_block_height: 0,
             retry_count: 0,
             fee_info,
             context,
@@ -223,6 +224,10 @@ impl BitcoinCoordinator {
 
     /// Main processing loop: review active txs, then dispatch pending ones.
     fn process_active_transactions(&self) -> Result<(), BitcoinCoordinatorError> {
+        let current_height = self.monitor.get_monitor_height()?;
+
+        self.storage.evict_stale_txs(current_height)?;
+
         let active_txs = self.storage.get_active_txs()?;
 
         if active_txs.is_empty() {
@@ -230,8 +235,6 @@ impl BitcoinCoordinator {
         }
 
         debug!("Processing {} active transactions", active_txs.len());
-
-        let current_height = self.monitor.get_monitor_height()?;
 
         let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
         let mut to_review: Vec<CoordinatedTx> = Vec::new();
@@ -303,7 +306,7 @@ impl BitcoinCoordinator {
                     tx.txid
                 );
                 self.storage
-                    .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
+                    .update_tx_state(tx.txid, TransactionState::ToDispatch, current_height)?;
                 to_dispatch.push(tx);
                 continue;
             }
@@ -314,7 +317,7 @@ impl BitcoinCoordinator {
                     tx.txid, status.confirmations
                 );
                 self.storage
-                    .update_tx_state(tx.txid, TransactionState::Finalized)?;
+                    .update_tx_state(tx.txid, TransactionState::Finalized, current_height)?;
                 continue;
             }
 
@@ -324,14 +327,14 @@ impl BitcoinCoordinator {
                     tx.txid, status.confirmations
                 );
                 self.storage
-                    .update_tx_state(tx.txid, TransactionState::Confirmed)?;
+                    .update_tx_state(tx.txid, TransactionState::Confirmed, current_height)?;
                 continue;
             }
 
             if status.is_orphan() {
                 debug!("Transaction({}) orphaned — keeping InMempool", tx.txid);
                 self.storage
-                    .update_tx_state(tx.txid, TransactionState::InMempool)?;
+                    .update_tx_state(tx.txid, TransactionState::InMempool, current_height)?;
                 continue;
             }
         }
@@ -383,7 +386,7 @@ impl BitcoinCoordinator {
                             msg
                         );
                         self.storage
-                            .update_tx_state(txid, TransactionState::Failed)?;
+                            .update_tx_state(txid, TransactionState::Failed, current_height)?;
                         self.storage.add_news(CoordinatorNews::DispatchError {
                             txid,
                             context: tx.context.clone(),
@@ -406,7 +409,7 @@ impl BitcoinCoordinator {
                         txid, msg
                     );
                     self.storage
-                        .update_tx_state(txid, TransactionState::Failed)?;
+                        .update_tx_state(txid, TransactionState::Failed, current_height)?;
                     self.storage.add_news(CoordinatorNews::DispatchError {
                         txid,
                         context: tx.context.clone(),

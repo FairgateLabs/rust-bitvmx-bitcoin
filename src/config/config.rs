@@ -6,7 +6,7 @@ use crate::{
         DEFAULT_MIN_NETWORK_FEE_RATE, DEFAULT_RBF_FEE_MULTIPLIER,
         DEFAULT_RETRY_ATTEMPTS_SENDING_TX, DEFAULT_RETRY_INTERVAL_SECONDS,
         MAX_LIMIT_UNCONFIRMED_PARENTS, MAX_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP,
-        MAX_RBF_FEE_PERCENTAGE,
+        MAX_RBF_FEE_PERCENTAGE, MAX_TRACKING_CONFIRMATIONS,
     },
     errors::BitcoinCoordinatorError,
 };
@@ -33,8 +33,6 @@ pub struct Config {
     pub storage: StorageConfig,
     pub rpc: RpcConfig,
     pub key_manager: KeyManagerConfig,
-    pub key_storage: StorageConfig,
-    pub log_level: Option<String>,
 
     #[serde(default)]
     pub settings: BitcoinSettings,
@@ -66,6 +64,9 @@ pub struct BitcoinSettings {
 
     #[serde(default)]
     pub funding: FundingSettings,
+
+    #[serde(default)]
+    pub storage: CoordinatorStorageSettings,
 
     #[serde(default)]
     pub monitor: MonitorSettingsConfig,
@@ -150,6 +151,19 @@ impl Default for FundingSettings {
     }
 }
 
+#[derive(Debug, Deserialize, Clone)]
+pub struct CoordinatorStorageSettings {
+    pub max_tracking_confirmations: u32,
+}
+
+impl Default for CoordinatorStorageSettings {
+    fn default() -> Self {
+        Self {
+            max_tracking_confirmations: MAX_TRACKING_CONFIRMATIONS,
+        }
+    }
+}
+
 impl BitcoinSettings {
     pub fn validate(&self) -> Result<(), BitcoinCoordinatorError> {
         ensure!(
@@ -224,6 +238,12 @@ impl BitcoinSettings {
         ensure!(
             self.fee.max_feerate_sat_vb >= self.fee.min_network_fee_rate,
             "max_feerate_sat_vb must be greater than min_network_fee_rate"
+        );
+
+        ensure!(
+            self.storage.max_tracking_confirmations > 0
+                && self.storage.max_tracking_confirmations <= MAX_TRACKING_CONFIRMATIONS,
+            "invalid max_tracking_confirmations"
         );
 
         Ok(())

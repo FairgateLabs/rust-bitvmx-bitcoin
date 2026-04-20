@@ -27,6 +27,7 @@ pub struct CoordinatedTx {
     pub target_block_height: BlockHeight,
     pub stuck_in_mempool_blocks: u32,
     pub confirmation_trigger: u32,
+    pub settled_block_height: BlockHeight, // Block height at which this transaction reached `Finalized` or `Failed`. `0` means the transaction has not yet settled.
 
     // retry
     pub retry_count: u32,
@@ -88,6 +89,12 @@ pub enum CoordinatorNews {
     },
     /// Transaction could not be dispatched after exhausting all retry attempts.
     DispatchError {
+        txid: Txid,
+        context: String,
+    },
+    /// Transaction has been evicted from coordinator storage after exceeding
+    /// `max_tracking_confirmations` blocks in the `Finalized` or `Failed` state.
+    TransactionEvicted {
         txid: Txid,
         context: String,
     },

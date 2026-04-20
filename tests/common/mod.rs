@@ -4,8 +4,11 @@ use bitcoin::{Address, Amount, CompressedPublicKey};
 use bitcoincore_rpc::RpcApi as _;
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use rust_bitvmx_bitcoin::{
-    config::config::BitcoinSettings, coordinator::BitcoinCoordinator,
-    core::storage::CoordinatorStorage, errors::BitcoinCoordinatorError, types::TransactionState,
+    config::config::{BitcoinSettings, CoordinatorStorageSettings},
+    coordinator::BitcoinCoordinator,
+    core::storage::CoordinatorStorage,
+    errors::BitcoinCoordinatorError,
+    types::TransactionState,
 };
 
 /// Configuration for creating a test setup
@@ -118,7 +121,10 @@ pub fn create_coordinator_with_settings(
 
 /// Returns a `CoordinatorStorage` view over the test setup's shared storage.
 pub fn get_coord_storage(setup: &TestSetup) -> CoordinatorStorage {
-    CoordinatorStorage::new(setup.storage.get_raw_storage())
+    CoordinatorStorage::new(
+        setup.storage.get_raw_storage(),
+        CoordinatorStorageSettings::default(),
+    )
 }
 
 // =============================================================================

@@ -93,6 +93,7 @@ mod tests {
             target_block_height: target,
             stuck_in_mempool_blocks: 0,
             confirmation_trigger: 0,
+            settled_block_height: 0,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,
@@ -123,6 +124,7 @@ mod tests {
             target_block_height: 0,
             stuck_in_mempool_blocks: threshold,
             confirmation_trigger: 0,
+            settled_block_height: 0,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,

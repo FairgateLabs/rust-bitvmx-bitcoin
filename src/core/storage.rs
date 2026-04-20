@@ -1,9 +1,10 @@
 use bitcoin::Txid;
-use serde::{Deserialize, Serialize};
+use bitvmx_bitcoin_rpc::types::BlockHeight;
 use std::rc::Rc;
 use storage_backend::storage::{KeyValueStore, Storage};
 
 use crate::{
+    config::config::CoordinatorStorageSettings,
     errors::BitcoinCoordinatorError,
     types::{CoordinatedTx, CoordinatorNews, TransactionState},
 };
@@ -12,6 +13,7 @@ const TX_PREFIX: &str = "bitcoin_coordinator";
 
 pub struct CoordinatorStorage {
     pub storage: Rc<Storage>,
+    settings: CoordinatorStorageSettings,
 }
 
 enum StoreKey {
@@ -20,8 +22,8 @@ enum StoreKey {
 }
 
 impl CoordinatorStorage {
-    pub fn new(storage: Rc<Storage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Rc<Storage>, settings: CoordinatorStorageSettings) -> Self {
+        Self { storage, settings }
     }
 
     pub fn insert_tx(&self, tx: CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
@@ -111,6 +113,7 @@ impl CoordinatorStorage {
         &self,
         tx_id: Txid,
         new_state: TransactionState,
+        block_height: BlockHeight,
     ) -> Result<(), BitcoinCoordinatorError> {
         let mut tx = match self.get_tx_by_id(tx_id)? {
             Some(tx) => tx,
@@ -127,6 +130,13 @@ impl CoordinatorStorage {
                 to: new_state,
             })?;
             return Ok(());
+        }
+
+        if matches!(
+            new_state,
+            TransactionState::Finalized | TransactionState::Failed
+        ) {
+            tx.settled_block_height = block_height;
         }
 
         tx.state = new_state;
@@ -157,6 +167,43 @@ impl CoordinatorStorage {
         tx.retry_count += 1;
 
         self.update_tx(&tx)?;
+        Ok(())
+    }
+
+    /// Return all transactions that have reached a terminal state (`Finalized` or `Failed`).
+    pub fn get_settled_txs(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        let txs = self.get_all_txs()?;
+        Ok(txs
+            .into_iter()
+            .filter(|tx| {
+                matches!(
+                    tx.state,
+                    TransactionState::Finalized | TransactionState::Failed
+                )
+            })
+            .collect())
+    }
+
+    /// Remove transactions that have been in a terminal state for at least
+    /// `max_tracking_confirmations` blocks, emitting a `TransactionEvicted`
+    /// news item for each one.
+    pub fn evict_stale_txs(
+        &self,
+        current_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let settled = self.get_settled_txs()?;
+        for tx in settled {
+            if tx.settled_block_height > 0
+                && current_height.saturating_sub(tx.settled_block_height)
+                    >= self.settings.max_tracking_confirmations
+            {
+                self.remove_tx(tx.txid)?;
+                self.add_news(CoordinatorNews::TransactionEvicted {
+                    txid: tx.txid,
+                    context: tx.context.clone(),
+                })?;
+            }
+        }
         Ok(())
     }
 
@@ -219,6 +266,7 @@ impl CoordinatorStorage {
 mod tests {
     use super::*;
     use crate::{
+        config::config::CoordinatorStorageSettings,
         test_utils::StorageTestConfig,
         types::{FeeInfo, TxKind},
     };
@@ -241,6 +289,7 @@ mod tests {
             target_block_height: 0,
             stuck_in_mempool_blocks: 0,
             confirmation_trigger: 0,
+            settled_block_height: 0,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 1000,
@@ -251,6 +300,13 @@ mod tests {
         }
     }
 
+    fn new_storage(storage_backend: &StorageTestConfig) -> CoordinatorStorage {
+        CoordinatorStorage::new(
+            storage_backend.get_raw_storage(),
+            CoordinatorStorageSettings::default(),
+        )
+    }
+
     fn random_txid() -> Txid {
         use bitcoin::hashes::{sha256d, Hash};
         Txid::from_raw_hash(sha256d::Hash::hash(&rand::random::<[u8; 32]>()))
@@ -259,7 +315,7 @@ mod tests {
     #[test]
     fn test_insert_get_remove_tx() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::ToDispatch);
@@ -280,7 +336,7 @@ mod tests {
     #[test]
     fn test_get_all_txs() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let tx1 = dummy_tx(random_txid(), TransactionState::ToDispatch);
         let tx2 = dummy_tx(random_txid(), TransactionState::InMempool);
@@ -298,7 +354,7 @@ mod tests {
     #[test]
     fn test_update_tx_state() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::ToDispatch);
@@ -306,7 +362,7 @@ mod tests {
 
         // Valid: ToDispatch -> InMempool
         storage
-            .update_tx_state(txid, TransactionState::InMempool)
+            .update_tx_state(txid, TransactionState::InMempool, 0)
             .unwrap();
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::InMempool);
@@ -314,7 +370,7 @@ mod tests {
 
         // Valid: InMempool -> Confirmed
         storage
-            .update_tx_state(txid, TransactionState::Confirmed)
+            .update_tx_state(txid, TransactionState::Confirmed, 0)
             .unwrap();
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::Confirmed);
@@ -322,7 +378,7 @@ mod tests {
 
         // Invalid: Confirmed -> ToDispatch (not a valid transition)
         storage
-            .update_tx_state(txid, TransactionState::ToDispatch)
+            .update_tx_state(txid, TransactionState::ToDispatch, 0)
             .unwrap();
         let news = storage.get_news().unwrap();
         assert_eq!(news.len(), 1);
@@ -342,7 +398,7 @@ mod tests {
     #[test]
     fn test_crash_recovery_state_transitions() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         // InMempool -> Finalized (fast confirmation, skipped Confirmed)
         let txid1 = random_txid();
@@ -350,7 +406,7 @@ mod tests {
             .insert_tx(dummy_tx(txid1, TransactionState::InMempool))
             .unwrap();
         storage
-            .update_tx_state(txid1, TransactionState::Finalized)
+            .update_tx_state(txid1, TransactionState::Finalized, 0)
             .unwrap();
         assert!(storage.get_news().unwrap().is_empty());
 
@@ -360,7 +416,7 @@ mod tests {
             .insert_tx(dummy_tx(txid2, TransactionState::ToDispatch))
             .unwrap();
         storage
-            .update_tx_state(txid2, TransactionState::Confirmed)
+            .update_tx_state(txid2, TransactionState::Confirmed, 0)
             .unwrap();
         assert!(storage.get_news().unwrap().is_empty());
 
@@ -370,7 +426,7 @@ mod tests {
             .insert_tx(dummy_tx(txid3, TransactionState::ToDispatch))
             .unwrap();
         storage
-            .update_tx_state(txid3, TransactionState::Finalized)
+            .update_tx_state(txid3, TransactionState::Finalized, 0)
             .unwrap();
         assert!(storage.get_news().unwrap().is_empty());
 
@@ -381,12 +437,12 @@ mod tests {
     #[test]
     fn test_update_tx_state_not_found() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let txid = random_txid();
 
         storage
-            .update_tx_state(txid, TransactionState::InMempool)
+            .update_tx_state(txid, TransactionState::InMempool, 0)
             .unwrap();
 
         let news = storage.get_news().unwrap();
@@ -400,7 +456,7 @@ mod tests {
     #[test]
     fn test_mark_as_retry_success() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::InMempool);
@@ -421,7 +477,7 @@ mod tests {
     #[test]
     fn test_add_get_clear_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let news_item = CoordinatorNews::TxNotFound {
             txid: random_txid(),
@@ -443,7 +499,7 @@ mod tests {
     #[test]
     fn test_clear_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         storage
             .add_news(CoordinatorNews::TxNotFound {
@@ -461,7 +517,7 @@ mod tests {
     #[test]
     fn test_ack_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let news_item1 = CoordinatorNews::TxNotFound {
             txid: random_txid(),
@@ -491,7 +547,7 @@ mod tests {
     #[test]
     fn test_add_news_dedup() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let news = CoordinatorNews::FundingNotAvailable;
 
@@ -514,7 +570,7 @@ mod tests {
     #[test]
     fn test_add_news_distinct_items_both_stored() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let item1 = CoordinatorNews::FundingNotAvailable;
         let item2 = CoordinatorNews::EstimateFeerateTooHigh {
@@ -538,7 +594,7 @@ mod tests {
     #[test]
     fn test_ack_then_readd_is_visible() {
         let storage_backend = StorageTestConfig::new();
-        let storage = CoordinatorStorage::new(storage_backend.get_raw_storage());
+        let storage = new_storage(&storage_backend);
 
         let news = CoordinatorNews::FundingNotAvailable;
         storage.add_news(news.clone()).unwrap();
@@ -550,6 +606,68 @@ mod tests {
         // Re-add: no longer a duplicate, so it is stored and returned.
         storage.add_news(news.clone()).unwrap();
         assert_eq!(storage.get_news().unwrap().len(), 1);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `update_tx_state` records `settled_block_height` when transitioning to a terminal state.
+    #[test]
+    fn test_update_tx_state_records_settled_height() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid = random_txid();
+        storage
+            .insert_tx(dummy_tx(txid, TransactionState::InMempool))
+            .unwrap();
+
+        storage
+            .update_tx_state(txid, TransactionState::Finalized, 42)
+            .unwrap();
+
+        let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
+        assert_eq!(updated.state, TransactionState::Finalized);
+        assert_eq!(updated.settled_block_height, 42);
+        assert!(storage.get_news().unwrap().is_empty());
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `evict_stale_txs` removes txs whose settled height exceeds the threshold
+    /// and emits `TransactionEvicted` news.
+    #[test]
+    fn test_evict_stale_txs() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid_stale = random_txid();
+        let txid_fresh = random_txid();
+
+        // stale: settled at height 5, current height = 16 → 11 blocks ago ≥ 10
+        let mut stale = dummy_tx(txid_stale, TransactionState::Finalized);
+        stale.settled_block_height = 5;
+        storage.insert_tx(stale).unwrap();
+
+        // fresh: settled at height 10, current height = 16 → 6 blocks ago < 10
+        let mut fresh = dummy_tx(txid_fresh, TransactionState::Finalized);
+        fresh.settled_block_height = 10;
+        storage.insert_tx(fresh).unwrap();
+
+        storage.evict_stale_txs(16).unwrap();
+
+        // Stale tx removed, fresh still present
+        assert!(storage.get_tx_by_id(txid_stale).unwrap().is_none());
+        assert!(storage.get_tx_by_id(txid_fresh).unwrap().is_some());
+
+        // One eviction news item for the stale tx
+        let news = storage.get_news().unwrap();
+        assert_eq!(news.len(), 1);
+        assert!(matches!(
+            &news[0],
+            CoordinatorNews::TransactionEvicted { txid, .. } if *txid == txid_stale
+        ));
 
         drop(storage);
         storage_backend.remove().unwrap();
