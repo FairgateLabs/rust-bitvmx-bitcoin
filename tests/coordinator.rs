@@ -479,3 +479,445 @@ fn test_retry_rate_limiting() {
     drop(coord_storage);
     setup.end_all().unwrap();
 }
+
+//TODO: test retry successfully dispatches a tx that was previously marked as retry
+
+// =============================================================================
+// ERROR CONDITION TESTS
+// =============================================================================
+
+/// Dispatching a structurally invalid (empty) transaction results in a
+/// `Fatal` dispatch outcome.  The coordinator marks the tx as `Failed` and
+/// generates a `DispatchError` coordinator news item.
+#[test]
+fn test_dispatch_invalid_empty_tx() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+
+    // One retry means the first failure marks the tx Failed immediately.
+    let settings = BitcoinSettings {
+        coordinator: CoordinatorSettings {
+            retry_attempts_sending_tx: 1,
+            retry_interval_seconds: 5,
+        },
+        ..BitcoinSettings::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
+    tick_until_ready(&coordinator).unwrap();
+
+    let tx = dummy_tx();
+    let txid = tx.compute_txid();
+
+    coordinator
+        .dispatch_without_speedup(tx, ctx("bad_tx"), None, None, 0)
+        .unwrap();
+
+    // Tick: the coordinator attempts to broadcast the empty tx.
+    coordinator.tick().unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(
+        stored.state,
+        TransactionState::Failed,
+        "Invalid tx must be Failed after one dispatch attempt; got {:?}",
+        stored.state
+    );
+
+    let news = coordinator.get_news().unwrap();
+    assert_eq!(
+        news.coordinator_news.len(),
+        1,
+        "Expected exactly one DispatchError news for txid {}; got {:?}",
+        txid,
+        news.coordinator_news
+    );
+    assert!(
+        matches!(
+            &news.coordinator_news[0],
+            CoordinatorNews::DispatchError { txid: id, .. } if *id == txid
+        ),
+        "Expected DispatchError news for txid {}; got {:?}",
+        txid,
+        news.coordinator_news
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Adding a funding UTXO below the minimum threshold generates an
+/// `InvalidFundingUtxo` coordinator news item.  The invalid UTXO is not
+/// persisted to storage.
+#[test]
+fn test_add_funding_below_min() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Default minimum is 10 000 sats; 9 999 is just below it.
+    coordinator.add_funding(utxo(9_999)).unwrap();
+
+    let news = coordinator.get_news().unwrap();
+    assert_eq!(
+        news.coordinator_news.len(),
+        1,
+        "Expected exactly one coordinator news for invalid funding; got {:?}",
+        news.coordinator_news
+    );
+    assert!(
+        matches!(
+            &news.coordinator_news[0],
+            CoordinatorNews::InvalidFundingUtxo { amount, min_required }
+            if *amount == 9_999 && *min_required == 10_000
+        ),
+        "Unexpected news item: {:?}",
+        news.coordinator_news[0]
+    );
+
+    drop(coordinator);
+    setup.end_all().unwrap();
+}
+
+/// When a valid funding UTXO is in storage and a subsequent call replaces it
+/// with an invalid one, the invalid call must:
+/// 1. Generate an `InvalidFundingUtxo` news item.
+/// 2. Clear the previously valid UTXO from storage so it cannot be
+///    accidentally reused. //TODO: add this to the test when speedup logic is implemented
+#[test]
+fn test_invalid_funding_replaces() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Set a valid UTXO first.
+    coordinator.add_funding(utxo(20_000)).unwrap();
+    assert!(
+        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        "No news expected after valid funding"
+    );
+
+    // Now replace with an invalid one.
+    coordinator.add_funding(utxo(1_000)).unwrap();
+
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.coordinator_news.len() == 1
+            && matches!(
+                &news.coordinator_news[0],
+                CoordinatorNews::InvalidFundingUtxo { amount, .. }
+                if *amount == 1_000
+            ),
+        "Expected exactly one InvalidFundingUtxo news with correct amounts; got {:?}",
+        news.coordinator_news
+    );
+
+    drop(coordinator);
+    setup.end_all().unwrap();
+}
+
+/// When one valid and one invalid transaction are registered and the
+/// coordinator ticks, they fail independently: the valid one reaches
+/// `InMempool` while the invalid one reaches `Failed` with a `DispatchError`
+/// news item.  The system remains consistent and the valid tx is unaffected.
+#[test]
+fn test_valid_and_invalid_tx() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+
+    let settings = BitcoinSettings {
+        ..BitcoinSettings::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
+
+    let valid_tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let invalid_tx = dummy_tx();
+    let valid_txid = valid_tx.compute_txid();
+    let invalid_txid = invalid_tx.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+
+    coordinator
+        .dispatch_without_speedup(valid_tx, ctx("valid"), None, None, 0)
+        .unwrap();
+    coordinator
+        .dispatch_without_speedup(invalid_tx, ctx("invalid"), None, None, 0)
+        .unwrap();
+
+    coordinator.tick().unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(valid_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "valid tx should be InMempool"
+    );
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(invalid_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::Failed,
+        "invalid tx should be Failed"
+    );
+
+    let news = coordinator.get_news().unwrap();
+    assert_eq!(
+        news.coordinator_news.len(),
+        1,
+        "Expected exactly one coordinator news for the invalid tx; got {:?}",
+        news.coordinator_news
+    );
+    assert!(
+        matches!(
+            &news.coordinator_news[0],
+            CoordinatorNews::DispatchError { txid, .. } if *txid == invalid_txid
+        ),
+        "Expected DispatchError news for the invalid tx; got {:?}",
+        news.coordinator_news[0]
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Cancelling a transaction that is already in the mempool removes it from
+/// coordinator storage and cancels monitor tracking.  Subsequent ticks do not
+/// produce any errors or spurious news for that txid.
+#[test]
+fn test_cancel_dispatched_tx() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+
+    let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid = tx.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+
+    coordinator
+        .dispatch_without_speedup(tx, ctx("cancel_after_dispatch"), None, None, 0)
+        .unwrap();
+
+    // Dispatch.
+    coordinator.tick().unwrap();
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage.get_tx_by_id(txid).unwrap().unwrap().state,
+        TransactionState::InMempool,
+        "tx must be InMempool before cancel"
+    );
+
+    // Cancel after dispatch.
+    coordinator
+        .cancel(TypesToMonitor::Transactions(
+            vec![txid],
+            ctx("cancel_after_dispatch"),
+            None,
+        ))
+        .unwrap();
+
+    assert!(
+        coord_storage.get_tx_by_id(txid).unwrap().is_none(),
+        "tx must be removed from storage after cancel"
+    );
+
+    // Several subsequent ticks must not produce news related to this tx.
+    for _ in 0..10 {
+        coordinator.tick().unwrap();
+    }
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.is_empty(),
+        "No coordinator news expected after cancelling a dispatched tx; got {:?}",
+        news.coordinator_news
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// When multiple coordinator news items are present, `ack_news` removes only
+/// the acknowledged item and leaves the rest untouched.
+#[test]
+fn test_selective_ack() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+
+    let settings = BitcoinSettings {
+        ..BitcoinSettings::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Produce one InvalidFundingUtxo news item.
+    coordinator.add_funding(utxo(1_000)).unwrap();
+
+    // Produce one DispatchError news item.
+    let tx = dummy_tx();
+    let txid = tx.compute_txid();
+    coordinator
+        .dispatch_without_speedup(tx, ctx("multi_news"), None, None, 0)
+        .unwrap();
+    coordinator.tick().unwrap();
+
+    let news = coordinator.get_news().unwrap();
+    assert_eq!(
+        news.coordinator_news.len(),
+        2,
+        "Expected 2 coordinator news items (funding + dispatch error); got {:?}",
+        news.coordinator_news
+    );
+
+    // Identify the DispatchError item.
+    let dispatch_err = news
+        .coordinator_news
+        .iter()
+        .find(|n| matches!(n, CoordinatorNews::DispatchError { txid: id, .. } if *id == txid))
+        .cloned()
+        .expect("DispatchError news must be present");
+
+    // Acknowledge only the DispatchError.
+    coordinator
+        .ack_news(AckNews::Coordinator(dispatch_err))
+        .unwrap();
+
+    // Only the InvalidFundingUtxo must remain.
+    let remaining = coordinator.get_news().unwrap().coordinator_news;
+    assert_eq!(
+        remaining.len(),
+        1,
+        "One news item must remain after selective ack; got {:?}",
+        remaining
+    );
+    assert!(
+        matches!(remaining[0], CoordinatorNews::InvalidFundingUtxo { .. }),
+        "Remaining item must be InvalidFundingUtxo; got {:?}",
+        remaining[0]
+    );
+
+    drop(coordinator);
+    setup.end_all().unwrap();
+}
+
+/// Registering multiple transactions and then querying storage directly
+/// confirms that each transaction's metadata (context, state, fee_info) is
+/// persisted correctly and independently.
+#[test]
+fn test_tx_metadata_persisted() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Use a real signed tx so the two txids are distinct.
+    let tx1 = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let tx2 = dummy_tx();
+
+    // Compute txids **before** moving the transactions.
+    let txid1 = tx1.compute_txid();
+    let txid2 = tx2.compute_txid();
+
+    assert_ne!(
+        txid1, txid2,
+        "tx1 (real) and tx2 (dummy) must have distinct txids"
+    );
+
+    coordinator
+        .dispatch_without_speedup(tx1, ctx("meta_tx1"), None, Some(2), 5)
+        .unwrap();
+    coordinator
+        .dispatch_without_speedup(tx2, ctx("meta_tx2"), None, None, 0)
+        .unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+
+    let stored1 = coord_storage.get_tx_by_id(txid1).unwrap().unwrap();
+    assert_eq!(stored1.context, ctx("meta_tx1"));
+    assert_eq!(stored1.confirmation_trigger, 2);
+    assert_eq!(stored1.stuck_in_mempool_blocks, 5);
+    assert_eq!(stored1.state, TransactionState::ToDispatch);
+
+    let stored2 = coord_storage.get_tx_by_id(txid2).unwrap().unwrap();
+    assert_eq!(stored2.context, ctx("meta_tx2"));
+    assert_eq!(stored2.confirmation_trigger, 0);
+    assert_eq!(stored2.stuck_in_mempool_blocks, 0);
+    assert_eq!(stored2.state, TransactionState::ToDispatch);
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Verifies that the coordinator handles being re-created from existing
+/// storage (simulating a restart) without losing previously registered
+/// transactions.
+#[test]
+fn test_coordinator_restart() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+
+    let valid_tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid = valid_tx.compute_txid();
+
+    // ── First coordinator instance ────────────────────────────────────────
+    {
+        let coordinator_v1 = create_coordinator(&setup);
+        tick_until_ready(&coordinator_v1).unwrap();
+
+        coordinator_v1
+            .dispatch_without_speedup(valid_tx, ctx("restart_test"), None, None, 0)
+            .unwrap();
+
+        // Verify the tx is stored as ToDispatch.
+        let coord_storage = get_coord_storage(&setup);
+        assert_eq!(
+            coord_storage.get_tx_by_id(txid).unwrap().unwrap().state,
+            TransactionState::ToDispatch
+        );
+        // Do not tick – the tx was never dispatched.
+    }
+    // coordinator_v1 dropped here (simulates process crash/restart).
+
+    // ── Second coordinator instance from the same storage ─────────────────
+    {
+        let coordinator_v2 = create_coordinator(&setup);
+
+        // The tx must still be in storage from the previous instance.
+        let coord_storage = get_coord_storage(&setup);
+        let recovered = coord_storage.get_tx_by_id(txid).unwrap();
+        assert!(recovered.is_some(), "tx must survive a coordinator restart");
+        assert_eq!(recovered.unwrap().state, TransactionState::ToDispatch);
+
+        // Dispatch on the new coordinator.
+        coordinator_v2.tick().unwrap();
+
+        assert_eq!(
+            coord_storage.get_tx_by_id(txid).unwrap().unwrap().state,
+            TransactionState::InMempool,
+            "tx must be dispatched by the restarted coordinator"
+        );
+    }
+
+    setup.end_all().unwrap();
+}
+
+//TODO: test retrying a transaction that fails again increments retry_count
