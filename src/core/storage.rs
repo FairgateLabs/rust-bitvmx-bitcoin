@@ -136,7 +136,7 @@ impl CoordinatorStorage {
             new_state,
             TransactionState::Finalized | TransactionState::Failed
         ) {
-            tx.settled_block_height = block_height;
+            tx.settled_block_height = Some(block_height);
         }
 
         tx.state = new_state;
@@ -193,15 +193,16 @@ impl CoordinatorStorage {
     ) -> Result<(), BitcoinCoordinatorError> {
         let settled = self.get_settled_txs()?;
         for tx in settled {
-            if tx.settled_block_height > 0
-                && current_height.saturating_sub(tx.settled_block_height)
+            if let Some(settled_height) = tx.settled_block_height {
+                if current_height.saturating_sub(settled_height)
                     >= self.settings.max_tracking_confirmations
-            {
-                self.remove_tx(tx.txid)?;
-                self.add_news(CoordinatorNews::TransactionEvicted {
-                    txid: tx.txid,
-                    context: tx.context.clone(),
-                })?;
+                {
+                    self.remove_tx(tx.txid)?;
+                    self.add_news(CoordinatorNews::TransactionEvicted {
+                        txid: tx.txid,
+                        context: tx.context.clone(),
+                    })?;
+                }
             }
         }
         Ok(())
@@ -285,11 +286,11 @@ mod tests {
             },
             kind: TxKind::Normal,
             state,
-            broadcast_block_height: 0,
+            broadcast_block_height: None,
             target_block_height: 0,
-            stuck_in_mempool_blocks: 0,
-            confirmation_trigger: 0,
-            settled_block_height: 0,
+            stuck_in_mempool_blocks: None,
+            confirmation_trigger: None,
+            settled_block_height: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 1000,
@@ -628,7 +629,7 @@ mod tests {
 
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::Finalized);
-        assert_eq!(updated.settled_block_height, 42);
+        assert_eq!(updated.settled_block_height, Some(42));
         assert!(storage.get_news().unwrap().is_empty());
 
         drop(storage);
@@ -647,12 +648,12 @@ mod tests {
 
         // stale: settled at height 5, current height = 16 → 11 blocks ago ≥ 10
         let mut stale = dummy_tx(txid_stale, TransactionState::Finalized);
-        stale.settled_block_height = 5;
+        stale.settled_block_height = Some(5);
         storage.insert_tx(stale).unwrap();
 
         // fresh: settled at height 10, current height = 16 → 6 blocks ago < 10
         let mut fresh = dummy_tx(txid_fresh, TransactionState::Finalized);
-        fresh.settled_block_height = 10;
+        fresh.settled_block_height = Some(10);
         storage.insert_tx(fresh).unwrap();
 
         storage.evict_stale_txs(16).unwrap();

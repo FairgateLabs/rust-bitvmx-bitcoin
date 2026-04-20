@@ -23,11 +23,11 @@ pub struct CoordinatedTx {
     pub state: TransactionState,
 
     // lifecycle
-    pub broadcast_block_height: BlockHeight,
-    pub target_block_height: BlockHeight,
-    pub stuck_in_mempool_blocks: u32,
-    pub confirmation_trigger: u32,
-    pub settled_block_height: BlockHeight, // Block height at which this transaction reached `Finalized` or `Failed`. `0` means the transaction has not yet settled.
+    pub target_block_height: BlockHeight, // earliest block at which to dispatch
+    pub confirmation_trigger: Option<u32>, // emit confirmation news at this confirmation count; None = disabled
+    pub stuck_in_mempool_blocks: Option<u32>, // emit StuckInMempool news after this many mempool blocks; None = disabled
+    pub settled_block_height: Option<BlockHeight>, // blocks when tx reached Finalized/Failed; None = not yet settled
+    pub broadcast_block_height: Option<BlockHeight>, // block when tx was broadcast; None = not yet broadcast
 
     // retry
     pub retry_count: u32,

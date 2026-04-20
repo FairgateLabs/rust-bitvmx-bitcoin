@@ -57,7 +57,7 @@ fn test_tx_dispatch_to_mempool() {
     let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let txid = tx.compute_txid();
     coordinator
-        .dispatch_without_speedup(tx, ctx("registration"), None, None, 0)
+        .dispatch_without_speedup(tx, ctx("registration"), None, None, None)
         .unwrap();
 
     // Step 1: tx must be in storage as ToDispatch before any tick.
@@ -78,7 +78,7 @@ fn test_tx_dispatch_to_mempool() {
         stored.state
     );
     assert!(
-        stored.broadcast_block_height > 0,
+        stored.broadcast_block_height.is_some(),
         "broadcast_block_height must be set after dispatch"
     );
 
@@ -109,7 +109,7 @@ fn test_full_lifecycle() {
     tick_until_ready(&coordinator).unwrap();
 
     coordinator
-        .dispatch_without_speedup(tx, ctx("lifecycle"), None, None, 0)
+        .dispatch_without_speedup(tx, ctx("lifecycle"), None, None, None)
         .unwrap();
 
     // Dispatch.
@@ -174,7 +174,7 @@ fn test_height_delays_dispatch() {
     );
 
     coordinator
-        .dispatch_without_speedup(tx, ctx("delayed_dispatch"), Some(target_height), None, 0)
+        .dispatch_without_speedup(tx, ctx("delayed_dispatch"), Some(target_height), None, None)
         .unwrap();
 
     // Ticking now must not dispatch because we are below the target.
@@ -235,7 +235,7 @@ fn test_multiple_txs_dispatched_in_single_tick() {
 
     for tx in [tx1, tx2, tx3] {
         coordinator
-            .dispatch_without_speedup(tx, ctx(&format!("batch")), None, None, 0)
+            .dispatch_without_speedup(tx, ctx(&format!("batch")), None, None, None)
             .unwrap();
     }
 
@@ -293,7 +293,7 @@ fn test_cancel_pending_tx_before_dispatch() {
     let txid = tx.compute_txid();
 
     coordinator
-        .dispatch_without_speedup(tx, ctx("cancel_test"), None, None, 0)
+        .dispatch_without_speedup(tx, ctx("cancel_test"), None, None, None)
         .unwrap();
 
     // Verify it is registered.
@@ -428,7 +428,7 @@ fn test_dispatch_already_in_mempool() {
 
     // Now register the same tx with the coordinator.
     coordinator
-        .dispatch_without_speedup(tx, ctx("already_known"), None, None, 0)
+        .dispatch_without_speedup(tx, ctx("already_known"), None, None, None)
         .unwrap();
 
     // The coordinator tries to broadcast → node returns "already in mempool" →
@@ -478,7 +478,7 @@ fn test_dispatch_invalid_empty_tx() {
     let txid = tx.compute_txid();
 
     coordinator
-        .dispatch_without_speedup(tx, ctx("bad_tx"), None, None, 0)
+        .dispatch_without_speedup(tx, ctx("bad_tx"), None, None, None)
         .unwrap();
 
     // Tick: the coordinator attempts to broadcast the empty tx.
@@ -613,10 +613,10 @@ fn test_valid_and_invalid_tx() {
     tick_until_ready(&coordinator).unwrap();
 
     coordinator
-        .dispatch_without_speedup(valid_tx, ctx("valid"), None, None, 0)
+        .dispatch_without_speedup(valid_tx, ctx("valid"), None, None, None)
         .unwrap();
     coordinator
-        .dispatch_without_speedup(invalid_tx, ctx("invalid"), None, None, 0)
+        .dispatch_without_speedup(invalid_tx, ctx("invalid"), None, None, None)
         .unwrap();
 
     coordinator.tick().unwrap();
@@ -678,7 +678,7 @@ fn test_cancel_dispatched_tx() {
     tick_until_ready(&coordinator).unwrap();
 
     coordinator
-        .dispatch_without_speedup(tx, ctx("cancel_after_dispatch"), None, None, 0)
+        .dispatch_without_speedup(tx, ctx("cancel_after_dispatch"), None, None, None)
         .unwrap();
 
     // Dispatch.
@@ -741,7 +741,7 @@ fn test_selective_ack() {
     let tx = dummy_tx();
     let txid = tx.compute_txid();
     coordinator
-        .dispatch_without_speedup(tx, ctx("multi_news"), None, None, 0)
+        .dispatch_without_speedup(tx, ctx("multi_news"), None, None, None)
         .unwrap();
     coordinator.tick().unwrap();
 
@@ -809,24 +809,24 @@ fn test_tx_metadata_persisted() {
     );
 
     coordinator
-        .dispatch_without_speedup(tx1, ctx("meta_tx1"), None, Some(2), 5)
+        .dispatch_without_speedup(tx1, ctx("meta_tx1"), None, Some(2), Some(5))
         .unwrap();
     coordinator
-        .dispatch_without_speedup(tx2, ctx("meta_tx2"), None, None, 0)
+        .dispatch_without_speedup(tx2, ctx("meta_tx2"), None, None, None)
         .unwrap();
 
     let coord_storage = get_coord_storage(&setup);
 
     let stored1 = coord_storage.get_tx_by_id(txid1).unwrap().unwrap();
     assert_eq!(stored1.context, ctx("meta_tx1"));
-    assert_eq!(stored1.confirmation_trigger, 2);
-    assert_eq!(stored1.stuck_in_mempool_blocks, 5);
+    assert_eq!(stored1.confirmation_trigger, Some(2));
+    assert_eq!(stored1.stuck_in_mempool_blocks, Some(5));
     assert_eq!(stored1.state, TransactionState::ToDispatch);
 
     let stored2 = coord_storage.get_tx_by_id(txid2).unwrap().unwrap();
     assert_eq!(stored2.context, ctx("meta_tx2"));
-    assert_eq!(stored2.confirmation_trigger, 0);
-    assert_eq!(stored2.stuck_in_mempool_blocks, 0);
+    assert_eq!(stored2.confirmation_trigger, None);
+    assert_eq!(stored2.stuck_in_mempool_blocks, None);
     assert_eq!(stored2.state, TransactionState::ToDispatch);
 
     drop(coordinator);
@@ -852,7 +852,7 @@ fn test_coordinator_restart() {
         tick_until_ready(&coordinator_v1).unwrap();
 
         coordinator_v1
-            .dispatch_without_speedup(valid_tx, ctx("restart_test"), None, None, 0)
+            .dispatch_without_speedup(valid_tx, ctx("restart_test"), None, None, None)
             .unwrap();
 
         // Verify the tx is stored as ToDispatch.
@@ -915,7 +915,7 @@ fn test_retry_dispatches_after_rate_limit() {
     let tx_prime = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let txid_prime = tx_prime.compute_txid();
     coordinator
-        .dispatch_without_speedup(tx_prime, ctx("prime"), None, None, 0)
+        .dispatch_without_speedup(tx_prime, ctx("prime"), None, None, None)
         .unwrap();
     coord_storage.mark_as_retry(txid_prime).unwrap();
     coordinator.tick().unwrap();
@@ -935,7 +935,7 @@ fn test_retry_dispatches_after_rate_limit() {
     let tx_subject = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let txid_subject = tx_subject.compute_txid();
     coordinator
-        .dispatch_without_speedup(tx_subject, ctx("subject"), None, None, 0)
+        .dispatch_without_speedup(tx_subject, ctx("subject"), None, None, None)
         .unwrap();
     coord_storage.mark_as_retry(txid_subject).unwrap();
 
@@ -1006,7 +1006,7 @@ fn test_retry_failure() {
     let tx = create_zero_fee_tx(&setup.bitcoin_client).unwrap();
     let txid = tx.compute_txid();
     coordinator
-        .dispatch_without_speedup(tx, ctx("retry_inc"), None, None, 0)
+        .dispatch_without_speedup(tx, ctx("retry_inc"), None, None, None)
         .unwrap();
 
     let coord_storage = get_coord_storage(&setup);
