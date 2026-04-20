@@ -18,4 +18,7 @@ pub enum BitcoinCoordinatorError {
 
     #[error("Bitcoin Client Error: {0}")]
     BitcoinClientError(#[from] BitcoinClientError),
+
+    #[error("Internal error (programmer bug): {0}")]
+    Internal(String),
 }

@@ -306,11 +306,8 @@ impl BitcoinCoordinator {
                     "Transaction({}) not found — re-queuing for dispatch",
                     tx.txid
                 );
-                self.storage.update_tx_state(
-                    tx.txid,
-                    TransactionState::ToDispatch,
-                    current_height,
-                )?;
+                self.storage
+                    .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
                 to_dispatch.push(tx);
                 continue;
             }
@@ -320,11 +317,8 @@ impl BitcoinCoordinator {
                     "Transaction({}) finalized ({} confirmations)",
                     tx.txid, status.confirmations
                 );
-                self.storage.update_tx_state(
-                    tx.txid,
-                    TransactionState::Finalized,
-                    current_height,
-                )?;
+                self.storage
+                    .settle_tx(tx.txid, TransactionState::Finalized, current_height)?;
                 continue;
             }
 
@@ -333,21 +327,15 @@ impl BitcoinCoordinator {
                     "Transaction({}) confirmed ({} confirmations)",
                     tx.txid, status.confirmations
                 );
-                self.storage.update_tx_state(
-                    tx.txid,
-                    TransactionState::Confirmed,
-                    current_height,
-                )?;
+                self.storage
+                    .update_tx_state(tx.txid, TransactionState::Confirmed)?;
                 continue;
             }
 
             if status.is_orphan() {
                 debug!("Transaction({}) orphaned — keeping InMempool", tx.txid);
-                self.storage.update_tx_state(
-                    tx.txid,
-                    TransactionState::InMempool,
-                    current_height,
-                )?;
+                self.storage
+                    .update_tx_state(tx.txid, TransactionState::InMempool)?;
                 continue;
             }
         }
@@ -398,11 +386,8 @@ impl BitcoinCoordinator {
                             tx.retry_count + 1,
                             msg
                         );
-                        self.storage.update_tx_state(
-                            txid,
-                            TransactionState::Failed,
-                            current_height,
-                        )?;
+                        self.storage
+                            .settle_tx(txid, TransactionState::Failed, current_height)?;
                         self.storage.add_news(CoordinatorNews::DispatchError {
                             txid,
                             context: tx.context.clone(),
@@ -425,7 +410,7 @@ impl BitcoinCoordinator {
                         txid, msg
                     );
                     self.storage
-                        .update_tx_state(txid, TransactionState::Failed, current_height)?;
+                        .settle_tx(txid, TransactionState::Failed, current_height)?;
                     self.storage.add_news(CoordinatorNews::DispatchError {
                         txid,
                         context: tx.context.clone(),

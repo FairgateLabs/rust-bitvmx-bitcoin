@@ -109,12 +109,23 @@ impl CoordinatorStorage {
         Ok(self.get_tx_by_id(tx_id)?.is_some())
     }
 
-    pub fn update_tx_state(
+    fn update_tx_state_impl(
         &self,
         tx_id: Txid,
         new_state: TransactionState,
-        block_height: BlockHeight,
+        block_height: Option<BlockHeight>,
     ) -> Result<(), BitcoinCoordinatorError> {
+        let is_terminal = matches!(
+            new_state,
+            TransactionState::Finalized | TransactionState::Failed
+        );
+
+        if is_terminal && block_height.is_none() {
+            return Err(BitcoinCoordinatorError::Internal(
+                "settle_tx must be used for terminal states (Finalized/Failed)".to_string(),
+            ));
+        }
+
         let mut tx = match self.get_tx_by_id(tx_id)? {
             Some(tx) => tx,
             None => {
@@ -132,17 +143,44 @@ impl CoordinatorStorage {
             return Ok(());
         }
 
-        if matches!(
-            new_state,
-            TransactionState::Finalized | TransactionState::Failed
-        ) {
-            tx.settled_block_height = Some(block_height);
+        if is_terminal {
+            tx.settled_block_height = block_height;
         }
 
         tx.state = new_state;
         self.update_tx(&tx)?;
 
         Ok(())
+    }
+
+    /// Transition a tx to a non-terminal state (`ToDispatch`, `InMempool`, `Confirmed`).
+    /// Returns an error if called with a terminal state — use `settle_tx` instead.
+    pub fn update_tx_state(
+        &self,
+        tx_id: Txid,
+        new_state: TransactionState,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        self.update_tx_state_impl(tx_id, new_state, None)
+    }
+
+    /// Transition a tx to a terminal state (`Finalized` or `Failed`) and record
+    /// the block height at which it settled.
+    /// Returns an error if called with a non-terminal state — use `update_tx_state` instead.
+    pub fn settle_tx(
+        &self,
+        tx_id: Txid,
+        new_state: TransactionState,
+        block_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        if !matches!(
+            new_state,
+            TransactionState::Finalized | TransactionState::Failed
+        ) {
+            return Err(BitcoinCoordinatorError::Internal(
+                "settle_tx must only be called with Finalized or Failed".to_string(),
+            ));
+        }
+        self.update_tx_state_impl(tx_id, new_state, Some(block_height))
     }
 
     pub fn mark_as_retry(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
@@ -363,7 +401,7 @@ mod tests {
 
         // Valid: ToDispatch -> InMempool
         storage
-            .update_tx_state(txid, TransactionState::InMempool, 0)
+            .update_tx_state(txid, TransactionState::InMempool)
             .unwrap();
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::InMempool);
@@ -371,7 +409,7 @@ mod tests {
 
         // Valid: InMempool -> Confirmed
         storage
-            .update_tx_state(txid, TransactionState::Confirmed, 0)
+            .update_tx_state(txid, TransactionState::Confirmed)
             .unwrap();
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::Confirmed);
@@ -379,7 +417,7 @@ mod tests {
 
         // Invalid: Confirmed -> ToDispatch (not a valid transition)
         storage
-            .update_tx_state(txid, TransactionState::ToDispatch, 0)
+            .update_tx_state(txid, TransactionState::ToDispatch)
             .unwrap();
         let news = storage.get_news().unwrap();
         assert_eq!(news.len(), 1);
@@ -407,7 +445,7 @@ mod tests {
             .insert_tx(dummy_tx(txid1, TransactionState::InMempool))
             .unwrap();
         storage
-            .update_tx_state(txid1, TransactionState::Finalized, 0)
+            .settle_tx(txid1, TransactionState::Finalized, 0)
             .unwrap();
         assert!(storage.get_news().unwrap().is_empty());
 
@@ -417,7 +455,7 @@ mod tests {
             .insert_tx(dummy_tx(txid2, TransactionState::ToDispatch))
             .unwrap();
         storage
-            .update_tx_state(txid2, TransactionState::Confirmed, 0)
+            .update_tx_state(txid2, TransactionState::Confirmed)
             .unwrap();
         assert!(storage.get_news().unwrap().is_empty());
 
@@ -427,7 +465,7 @@ mod tests {
             .insert_tx(dummy_tx(txid3, TransactionState::ToDispatch))
             .unwrap();
         storage
-            .update_tx_state(txid3, TransactionState::Finalized, 0)
+            .settle_tx(txid3, TransactionState::Finalized, 0)
             .unwrap();
         assert!(storage.get_news().unwrap().is_empty());
 
@@ -443,7 +481,7 @@ mod tests {
         let txid = random_txid();
 
         storage
-            .update_tx_state(txid, TransactionState::InMempool, 0)
+            .update_tx_state(txid, TransactionState::InMempool)
             .unwrap();
 
         let news = storage.get_news().unwrap();
@@ -612,9 +650,9 @@ mod tests {
         storage_backend.remove().unwrap();
     }
 
-    /// `update_tx_state` records `settled_block_height` when transitioning to a terminal state.
+    /// `settle_tx` records `settled_block_height` when transitioning to a terminal state.
     #[test]
-    fn test_update_tx_state_records_settled_height() {
+    fn test_settle_tx_records_height() {
         let storage_backend = StorageTestConfig::new();
         let storage = new_storage(&storage_backend);
 
@@ -624,7 +662,7 @@ mod tests {
             .unwrap();
 
         storage
-            .update_tx_state(txid, TransactionState::Finalized, 42)
+            .settle_tx(txid, TransactionState::Finalized, 42)
             .unwrap();
 
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
