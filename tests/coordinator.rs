@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 
+use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::types::AckMonitorNews;
 use bitvmx_transaction_monitor::types::TypesToMonitor;
@@ -408,79 +409,46 @@ fn test_news_ack() {
     setup.end_all().unwrap();
 }
 
-/// Once the rate-limiter fires for a retry batch, subsequent ticks within
-/// the same interval must not re-dispatch transactions still in retry state.
+/// Dispatching a transaction that is already in the mempool is treated as a
+/// success (`AlreadyKnown` → `on_dispatch_success`).  The coordinator sets the
+/// state to `InMempool` without generating any error news.
 #[test]
-fn test_retry_rate_limiting() {
+fn test_dispatch_already_in_mempool() {
     init_trace();
-    let retry_interval_seconds = 10;
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let settings = BitcoinSettings {
-        coordinator: CoordinatorSettings {
-            retry_interval_seconds: retry_interval_seconds,
-            ..CoordinatorSettings::default()
-        },
-        ..Default::default()
-    };
-    let coordinator = create_coordinator_with_settings(&setup, settings);
+    let coordinator = create_coordinator(&setup);
     tick_until_ready(&coordinator).unwrap();
 
-    // Tx1 is put in retry state and ticked — because `last_retry_at` is `None` on a fresh coordinator,
-    // the first retry attempt is always allowed.
-    let tx1 = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
-    let txid1 = tx1.compute_txid();
-    coordinator
-        .dispatch_without_speedup(tx1, ctx("rrl"), None, None, 0)
-        .unwrap();
-    let coord_storage = get_coord_storage(&setup);
-    coord_storage.mark_as_retry(txid1).unwrap();
-    coordinator.tick().unwrap(); // First tick: last_retry_at = None → retry allowed → tx1 broadcast → InMempool.
-    assert_eq!(
-        coord_storage.get_tx_by_id(txid1).unwrap().unwrap().state,
-        TransactionState::InMempool,
-        "tx1 should be InMempool after first retry dispatch"
-    );
+    let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid = tx.compute_txid();
 
-    // Tx2 must be blocked by the rate-limiter
-    let tx2 = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
-    let txid2 = tx2.compute_txid();
-    coordinator
-        .dispatch_without_speedup(tx2, ctx("rrl"), None, None, 0)
-        .unwrap();
-    coord_storage.mark_as_retry(txid2).unwrap();
-    coordinator.tick().unwrap(); // Tick immediately. Since time have not elapsed → tx2 must stay ToDispatch.
-    let stored = coord_storage.get_tx_by_id(txid2).unwrap().unwrap();
-    assert_eq!(
-        stored.state,
-        TransactionState::ToDispatch,
-        "tx2 must stay ToDispatch — retry interval blocks it"
-    );
-    assert_eq!(
-        stored.retry_count, 1,
-        "retry_count must not have incremented"
-    );
+    // Put the tx directly into the mempool before the coordinator dispatches it.
+    setup.bitcoin_client.send_transaction(&tx).unwrap();
 
-    // After waiting for the retry interval, tx2 should be allowed to retry as well.
-    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
+    // Now register the same tx with the coordinator.
+    coordinator
+        .dispatch_without_speedup(tx, ctx("already_known"), None, None, 0)
+        .unwrap();
+
+    // The coordinator tries to broadcast → node returns "already in mempool" →
+    // AlreadyKnown → treated as success → InMempool.
     coordinator.tick().unwrap();
-    let stored = coord_storage.get_tx_by_id(txid2).unwrap().unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
     assert_eq!(
         stored.state,
         TransactionState::InMempool,
-        "tx2 should be InMempool after retry interval has elapsed"
+        "AlreadyKnown must be treated as a successful dispatch"
     );
-    assert_eq!(
-        stored.retry_count, 1,
-        "retry_count should not have incremented on successful retry dispatch"
-    );
+
+    assert!(coordinator.get_news().unwrap().is_empty());
 
     drop(coordinator);
     drop(coord_storage);
     setup.end_all().unwrap();
 }
-
-//TODO: test retry successfully dispatches a tx that was previously marked as retry
 
 // =============================================================================
 // ERROR CONDITION TESTS
@@ -920,4 +888,184 @@ fn test_coordinator_restart() {
     setup.end_all().unwrap();
 }
 
-//TODO: test retrying a transaction that fails again increments retry_count
+/// A transaction in retry state is NOT dispatched until `retry_interval_seconds`
+/// has elapsed since the last retry batch.
+#[test]
+fn test_retry_dispatches_after_rate_limit() {
+    init_trace();
+    let retry_interval_seconds = 5u64;
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let settings = BitcoinSettings {
+        coordinator: CoordinatorSettings {
+            retry_interval_seconds,
+            ..CoordinatorSettings::default()
+        },
+        ..Default::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
+    tick_until_ready(&coordinator).unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+
+    // --- Prime last_retry_at ---
+    // Dispatch tx_prime, mark it as retry, then tick.  Because last_retry_at is
+    // None the first retry is always allowed → tx_prime reaches InMempool and
+    // last_retry_at is recorded as "now".
+    let tx_prime = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid_prime = tx_prime.compute_txid();
+    coordinator
+        .dispatch_without_speedup(tx_prime, ctx("prime"), None, None, 0)
+        .unwrap();
+    coord_storage.mark_as_retry(txid_prime).unwrap();
+    coordinator.tick().unwrap();
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(txid_prime)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "tx_prime must be InMempool after the priming tick"
+    );
+
+    // --- Subject under test ---
+    // tx_subject is placed in retry state right after the priming tick, so
+    // the rate-limiter window is active.
+    let tx_subject = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid_subject = tx_subject.compute_txid();
+    coordinator
+        .dispatch_without_speedup(tx_subject, ctx("subject"), None, None, 0)
+        .unwrap();
+    coord_storage.mark_as_retry(txid_subject).unwrap();
+
+    // Ticks 1 and 2 must be blocked — the interval has not elapsed yet.
+    for tick in 1..=2 {
+        coordinator.tick().unwrap();
+        assert_eq!(
+            coord_storage
+                .get_tx_by_id(txid_subject)
+                .unwrap()
+                .unwrap()
+                .state,
+            TransactionState::ToDispatch,
+            "tx_subject must still be ToDispatch on tick {tick} (rate-limited)"
+        );
+    }
+
+    // Tick 3 — after the interval — must dispatch successfully.
+    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
+    coordinator.tick().unwrap();
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(txid_subject)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "tx_subject must be InMempool after the retry interval has elapsed"
+    );
+
+    assert!(coordinator.get_news().unwrap().coordinator_news.is_empty());
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Each time a transaction fails with a retryable error the coordinator calls
+/// `mark_as_retry`, which increments `retry_count`.  Once `retry_count + 1`
+/// reaches `retry_attempts_sending_tx` the transaction is permanently marked
+/// `Failed` and a `DispatchError` news item is stored.
+#[test]
+fn test_retry_failure() {
+    init_trace();
+    let retry_interval_seconds = 1u64;
+
+    // Non-zero min_relay_tx_fee ensures our zero-fee tx is always rejected.
+    let setup = TestSetup::new(TestSetupConfig {
+        bitcoind_flags: Some(BitcoindFlags {
+            min_relay_tx_fee: 0.00002, // 2 sat/vbyte — zero-fee tx will fail
+            ..BitcoindFlags::default()
+        }),
+        ..TestSetupConfig::default()
+    })
+    .unwrap();
+
+    let settings = BitcoinSettings {
+        coordinator: CoordinatorSettings {
+            retry_interval_seconds,
+            retry_attempts_sending_tx: 3,
+            ..CoordinatorSettings::default()
+        },
+        ..Default::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
+    tick_until_ready(&coordinator).unwrap();
+
+    let tx = create_zero_fee_tx(&setup.bitcoin_client).unwrap();
+    let txid = tx.compute_txid();
+    coordinator
+        .dispatch_without_speedup(tx, ctx("retry_inc"), None, None, 0)
+        .unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+
+    // Tick 1 — first dispatch attempt (retry_count = 0, not rate-limited).
+    // The tx fails → mark_as_retry → retry_count = 1.
+    coordinator.tick().unwrap();
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(
+        stored.retry_count, 1,
+        "retry_count must be 1 after first failure"
+    );
+    assert_eq!(stored.state, TransactionState::ToDispatch);
+
+    // Tick 2 immediately — `last_retry_at` is still None so the first retry is
+    // allowed.  The tx fails again → mark_as_retry → retry_count = 2.
+    // `last_retry_at` is now set.
+    coordinator.tick().unwrap();
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(
+        stored.retry_count, 2,
+        "retry_count must be 2 after second failure"
+    );
+    assert_eq!(stored.state, TransactionState::ToDispatch);
+
+    // Tick 3 immediately — rate-limiter blocks the retry (interval not elapsed).
+    coordinator.tick().unwrap();
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(
+        stored.retry_count, 2,
+        "retry_count must not change while rate-limited"
+    );
+    assert_eq!(stored.state, TransactionState::ToDispatch);
+    assert!(
+        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        "No news should be generated while rate-limited"
+    );
+
+    // Wait for the retry interval, then tick.  Third attempt: retry_count + 1 = 3
+    // >= retry_attempts_sending_tx (3) → tx is marked Failed + DispatchError news.
+    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
+    coordinator.tick().unwrap();
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(
+        stored.state,
+        TransactionState::Failed,
+        "tx must be Failed after exhausting all retry attempts"
+    );
+
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.coordinator_news
+            .iter()
+            .any(|n| matches!(n, CoordinatorNews::DispatchError { txid: id, .. } if *id == txid)),
+        "DispatchError news must be present after retry exhaustion; got {:?}",
+        news.coordinator_news
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}

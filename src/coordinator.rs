@@ -200,9 +200,8 @@ impl BitcoinCoordinator {
     // }
 
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
-        let current_block = self.monitor.get_monitor_height()?;
         let monitor_news = self.monitor.get_news()?;
-        let coordinator_news = self.storage.get_news(current_block)?;
+        let coordinator_news = self.storage.get_news()?;
         Ok(News {
             monitor_news,
             coordinator_news,
