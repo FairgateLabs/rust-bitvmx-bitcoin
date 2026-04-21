@@ -36,7 +36,7 @@ impl FundingManager {
                 warn!("FundingManager: invalid funding utxo: {:?}", utxo);
                 // Clear any stale value so a previously valid UTXO is not
                 // accidentally reused after a failed update.
-                self.storage.delete(FUNDING_KEY)?;
+                self.storage.remove(FUNDING_KEY, None)?;
                 Ok(Some(news))
             }
         }
@@ -44,12 +44,12 @@ impl FundingManager {
 
     /// Load the current funding UTXO from storage.
     pub fn get_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
-        Ok(self.storage.get(FUNDING_KEY)?)
+        Ok(self.storage.get(FUNDING_KEY, None)?)
     }
 
     /// Remove the funding UTXO from storage.
     pub fn clear_funding(&self) -> Result<(), BitcoinCoordinatorError> {
-        self.storage.delete(FUNDING_KEY)?;
+        self.storage.remove(FUNDING_KEY, None)?;
         Ok(())
     }
 

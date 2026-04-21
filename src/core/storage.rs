@@ -47,7 +47,7 @@ impl CoordinatorStorage {
 
     pub fn remove_tx(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::Tx(tx_id));
-        self.storage.delete(&key)?;
+        self.storage.remove(&key, None)?;
         Ok(())
     }
 
@@ -56,14 +56,14 @@ impl CoordinatorStorage {
         tx_id: Txid,
     ) -> Result<Option<CoordinatedTx>, BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::Tx(tx_id));
-        Ok(self.storage.get(&key)?)
+        Ok(self.storage.get(&key, None)?)
     }
 
     /// Get all the txs, but not in insertion order
     pub fn get_all_txs(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
         let prefix = self.tx_prefix();
 
-        let entries = self.storage.partial_compare(&prefix)?;
+        let entries = self.storage.partial_compare(&prefix, None)?;
 
         let mut txs = Vec::with_capacity(entries.len());
 
@@ -253,7 +253,7 @@ impl CoordinatorStorage {
     /// Store `news` if an identical item is not already present.
     pub fn add_news(&self, news: CoordinatorNews) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        let mut all: Vec<CoordinatorNews> = self.storage.get(&key)?.unwrap_or_default();
+        let mut all: Vec<CoordinatorNews> = self.storage.get(&key, None)?.unwrap_or_default();
 
         if all.contains(&news) {
             return Ok(()); // exact duplicate already stored
@@ -267,18 +267,18 @@ impl CoordinatorStorage {
     /// Return all pending news items.
     pub fn get_news(&self) -> Result<Vec<CoordinatorNews>, BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        Ok(self.storage.get(&key)?.unwrap_or_default())
+        Ok(self.storage.get(&key, None)?.unwrap_or_default())
     }
 
     pub fn clear_news(&self) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        self.storage.delete(&key)?;
+        self.storage.remove(&key, None)?;
         Ok(())
     }
 
     pub fn ack_news(&self, news: CoordinatorNews) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        let mut all: Vec<CoordinatorNews> = self.storage.get(&key)?.unwrap_or_default();
+        let mut all: Vec<CoordinatorNews> = self.storage.get(&key, None)?.unwrap_or_default();
         all.retain(|n| n != &news);
         self.storage.set(&key, &all, None)?;
         Ok(())
