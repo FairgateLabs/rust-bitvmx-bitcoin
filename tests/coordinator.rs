@@ -3,11 +3,13 @@ use common::*;
 
 use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
-use bitvmx_transaction_monitor::types::AckMonitorNews;
-use bitvmx_transaction_monitor::types::TypesToMonitor;
+use bitvmx_transaction_monitor::{
+    config::MonitorSettingsConfig,
+    types::{AckMonitorNews, MonitorNews, TypesToMonitor},
+};
 use rust_bitvmx_bitcoin::{
-    config::config::{BitcoinSettings, CoordinatorSettings},
-    types::{AckNews, CoordinatorNews, TransactionState},
+    config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
+    types::{AckNews, CoordinatorNews, News, TransactionState},
 };
 use tracing::info;
 
@@ -17,6 +19,26 @@ use tracing::info;
 
 fn ctx(label: &str) -> String {
     format!("test_ctx:{}", label)
+}
+
+/// Ack every item in `news` so it is not returned again.
+fn ack_all_news(coordinator: &rust_bitvmx_bitcoin::coordinator::BitcoinCoordinator, news: &News) {
+    for n in &news.monitor_news {
+        let ack = match n {
+            MonitorNews::Transaction(t, _, ctx) => AckMonitorNews::Transaction(*t, ctx.clone()),
+            MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
+            MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
+                AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
+            }
+            MonitorNews::RskPeginTransaction(t, _) => AckMonitorNews::RskPeginTransaction(*t),
+        };
+        coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
+    }
+    for n in &news.coordinator_news {
+        coordinator
+            .ack_news(AckNews::Coordinator(n.clone()))
+            .unwrap();
+    }
 }
 
 // =============================================================================
@@ -89,18 +111,28 @@ fn test_tx_dispatch_to_mempool() {
     setup.end_all().unwrap();
 }
 
-/// Full lifecycle from `ToDispatch` → `InMempool` → `Confirmed`.
+/// Full lifecycle: ToDispatch → InMempool → Confirmed → Finalized → Evicted,
+/// with monitor-news assertions at every transition.
 ///
-/// Once a valid transaction is dispatched, mining a confirming block and
-/// ticking the coordinator must advance the coordinator's state from
-/// `InMempool` to `Confirmed`.
-/// TODO: when indexer is fixed and state can reach `Finalized`, extend this test to cover that final transition as well.
+/// Settings: `max_monitoring_confirmations = 2`, `max_tracking_confirmations = 1`
+/// so the whole sequence completes in 3 regtest blocks.
 #[test]
 fn test_full_lifecycle() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let coordinator = create_coordinator(&setup);
+    let settings = BitcoinSettings {
+        monitor: MonitorSettingsConfig {
+            max_monitoring_confirmations: Some(2),
+            ..Default::default()
+        },
+        storage: CoordinatorStorageSettings {
+            max_tracking_confirmations: 1,
+        },
+        ..Default::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
+    let coord_storage = get_coord_storage(&setup);
 
     let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let txid = tx.compute_txid();
@@ -109,22 +141,19 @@ fn test_full_lifecycle() {
     tick_until_ready(&coordinator).unwrap();
 
     coordinator
-        .dispatch_without_speedup(tx, ctx("lifecycle"), None, None, None)
+        .dispatch_without_speedup(tx, ctx("lifecycle"), None, Some(1), None)
         .unwrap();
 
-    // Dispatch.
+    // ── ToDispatch → InMempool ────────────────────────────────────────────────
     coordinator.tick().unwrap();
-    let coord_storage = get_coord_storage(&setup);
     assert_eq!(
         coord_storage.get_tx_by_id(txid).unwrap().unwrap().state,
         TransactionState::InMempool,
-        "tx should be InMempool after dispatch"
+        "tx must be InMempool after dispatch tick"
     );
 
-    // Mine a confirming block.
+    // ── InMempool → Confirmed (1 block) ──────────────────────────────────────
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
-
-    // Tick until the coordinator sees the confirmation.
     let reached = tick_until_state(
         &coordinator,
         &coord_storage,
@@ -133,20 +162,57 @@ fn test_full_lifecycle() {
         10,
     )
     .unwrap();
+    assert!(reached, "tx must reach Confirmed after 1 block");
 
+    let news = coordinator.get_news().unwrap();
     assert!(
-        reached,
-        "tx should have transitioned to Confirmed after mining 1 block"
+        news.monitor_news.iter().any(|n| {
+            matches!(n, MonitorNews::Transaction(id, status, _) if *id == txid && status.is_confirmed())
+        }),
+        "expected Confirmed monitor news for {txid}; got {:?}",
+        news.monitor_news
     );
-
-    let final_state = coord_storage.get_tx_by_id(txid).unwrap().unwrap().state;
-    assert_eq!(final_state, TransactionState::Confirmed);
-
-    info!(
-        "News after confirmation: {:?}",
-        coordinator.get_news().unwrap()
+    assert!(
+        news.coordinator_news.is_empty(),
+        "no coordinator news expected at Confirmed"
     );
-    assert!(coordinator.get_news().unwrap().coordinator_news.is_empty()); // Monitor news is expected, because tx confirmation triggers monitor news
+    ack_all_news(&coordinator, &news);
+
+    // ── Confirmed → Finalized (2nd block, max_monitoring_confirmations = 2) ──
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        txid,
+        TransactionState::Finalized,
+        10,
+    )
+    .unwrap();
+    assert!(reached, "tx must reach Finalized after 2 confirmations");
+
+    // ── Finalized → Evicted (1 more block, max_tracking_confirmations = 1) ───
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let mut evicted = false;
+    for _ in 0..10 {
+        coordinator.tick().unwrap();
+        let news = coordinator.get_news().unwrap();
+        if news.coordinator_news.iter().any(
+            |n| matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == txid),
+        ) {
+            evicted = true;
+            ack_all_news(&coordinator, &news);
+            break;
+        }
+        ack_all_news(&coordinator, &news);
+    }
+    assert!(
+        evicted,
+        "TransactionEvicted news must fire after max_tracking_confirmations blocks"
+    );
+    assert!(
+        coord_storage.get_tx_by_id(txid).unwrap().is_none(),
+        "tx must be removed from storage after eviction"
+    );
 
     drop(coordinator);
     drop(coord_storage);

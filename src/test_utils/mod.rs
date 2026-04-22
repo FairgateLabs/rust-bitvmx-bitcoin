@@ -25,7 +25,6 @@ pub fn init_trace() {
         "libp2p=off",
         "bitvmx_transaction_monitor=debug",
         "bitcoin_indexer=debug",
-        "bitcoin_coordinator=debug",
         "bitcoin_rpc=debug",
         "bitcoin_client=debug",
         "p2p_protocol=off",
