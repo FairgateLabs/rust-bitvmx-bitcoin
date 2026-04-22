@@ -107,7 +107,9 @@ impl Dispatcher {
 
 /// Map a raw Bitcoin RPC error message to a [`DispatchOutcome`].
 fn classify_error(msg: &str) -> DispatchOutcome {
-    if msg.contains("already in mempool") || msg.contains("Transaction outputs already in utxo set")
+    if msg.contains("already in mempool")
+        || msg.contains("Transaction outputs already in utxo set")
+        || msg.contains("already in block chain")
     {
         return DispatchOutcome::AlreadyKnown;
     }
@@ -116,6 +118,7 @@ fn classify_error(msg: &str) -> DispatchOutcome {
         || msg.contains("insufficient priority")
         || msg.contains("min relay fee")
         || msg.contains("mempool min fee not met")
+        || msg.contains("too-long-mempool-chain")
         || msg.contains("network")
         || msg.contains("connection")
         || msg.contains("timeout")

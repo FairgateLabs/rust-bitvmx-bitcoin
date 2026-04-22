@@ -283,7 +283,19 @@ impl BitcoinCoordinator {
             let status = self.monitor.get_tx_status(&tx.txid, search_in_mempool)?;
 
             if status.is_in_mempool() {
-                if tx.is_stuck_in_mempool(current_height) {
+                if tx.state == TransactionState::Confirmed {
+                    // Tx was reorged out of a block and is back in the mempool.
+                    // Reset to InMempool and refresh the broadcast height so the
+                    // stuck-in-mempool timer does not fire immediately.
+                    debug!(
+                        "Transaction({}) reorged back to mempool — resetting to InMempool",
+                        tx.txid
+                    );
+                    let mut updated = tx.clone();
+                    updated.state = TransactionState::InMempool;
+                    updated.broadcast_block_height = Some(current_height);
+                    self.storage.update_tx(&updated)?;
+                } else if tx.is_stuck_in_mempool(current_height) {
                     warn!(
                         "Transaction({}) stuck in mempool for {} blocks (threshold: {})",
                         tx.txid,
