@@ -19,6 +19,7 @@ pub struct CoordinatorStorage {
 enum StoreKey {
     Tx(Txid),
     News,
+    SpeedupList,
 }
 
 impl CoordinatorStorage {
@@ -292,11 +293,66 @@ impl CoordinatorStorage {
         format!("{TX_PREFIX}/txs/")
     }
 
+    /// Insert a speedup transaction and append its txid to the ordered SpeedupList.
+    /// Use this instead of `insert_tx` for all CPFP/RBF transactions so that
+    /// `get_speedups_ordered` returns them in creation order.
+    pub fn insert_speedup(&self, tx: CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
+        let txid = tx.txid;
+        self.insert_tx(tx)?;
+        let key = self.get_key(StoreKey::SpeedupList);
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        if !list.contains(&txid) {
+            list.push(txid);
+            self.storage.set(&key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    /// Return in-flight speedups (`InMempool` or `Confirmed`) in creation order.
+    pub fn get_active_speedups(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        Ok(self
+            .get_speedups_ordered()?
+            .into_iter()
+            .filter(|tx| {
+                matches!(
+                    tx.state,
+                    TransactionState::InMempool | TransactionState::Confirmed
+                )
+            })
+            .collect())
+    }
+
+    /// Return unconfirmed speedups (`InMempool`) in creation order.
+    pub fn get_unconfirmed_speedups(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        Ok(self
+            .get_speedups_ordered()?
+            .into_iter()
+            .filter(|tx| tx.state == TransactionState::InMempool)
+            .collect())
+    }
+
+    /// Return speedup transactions in creation order (oldest first).
+    /// Txids that no longer exist in storage are silently skipped (lazy cleanup).
+    pub fn get_speedups_ordered(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::SpeedupList);
+        let list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let mut result = Vec::new();
+        for txid in list {
+            if let Some(tx) = self.get_tx_by_id(txid)? {
+                result.push(tx);
+            }
+        }
+        Ok(result)
+    }
+
+    // TODO: if want to remove from SpeedupList when a speedup is finalized/failed, need to implement remove_speedup
+
     fn get_key(&self, key: StoreKey) -> String {
         let prefix = TX_PREFIX;
         match key {
             StoreKey::Tx(tx_id) => format!("{prefix}/txs/{tx_id}"),
             StoreKey::News => format!("{prefix}/news"),
+            StoreKey::SpeedupList => format!("{prefix}/speedup/list"),
         }
     }
 }

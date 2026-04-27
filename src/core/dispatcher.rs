@@ -29,6 +29,10 @@ impl Dispatcher {
         }
     }
 
+    pub fn max_tx_weight(&self) -> u64 {
+        self.settings.max_tx_weight
+    }
+
     /// Broadcast `txs` to the Bitcoin node.
     pub fn dispatch(&self, txs: Vec<Transaction>) -> Vec<(Txid, DispatchOutcome)> {
         let (valid_txs, mut results) = self.validate_and_partition(txs);
@@ -53,6 +57,7 @@ impl Dispatcher {
     /// Oversized transactions receive a `Fatal` outcome immediately; valid ones
     /// are returned for batching.
     fn validate_and_partition(
+        //TODO: remove
         &self,
         txs: Vec<Transaction>,
     ) -> (Vec<Transaction>, Vec<(Txid, DispatchOutcome)>) {

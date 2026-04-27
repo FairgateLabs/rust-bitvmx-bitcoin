@@ -29,7 +29,7 @@ impl FundingManager {
     ) -> Result<Option<CoordinatorNews>, BitcoinCoordinatorError> {
         match self.validate(&utxo) {
             Ok(()) => {
-                self.storage.set(FUNDING_KEY, &utxo, None)?;
+                self.update_funding(utxo)?;
                 Ok(None)
             }
             Err(news) => {
@@ -45,6 +45,15 @@ impl FundingManager {
     /// Load the current funding UTXO from storage.
     pub fn get_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
         Ok(self.storage.get(FUNDING_KEY, None)?)
+    }
+
+    /// Overwrite the funding UTXO without validation.
+    ///
+    /// Used for change outputs after a CPFP is built, and for reorg restoration
+    /// where the caller has already determined the correct UTXO.
+    pub fn update_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
+        self.storage.set(FUNDING_KEY, &utxo, None)?;
+        Ok(())
     }
 
     /// Remove the funding UTXO from storage.
@@ -147,6 +156,24 @@ mod tests {
         assert!(!mgr.has_funding().unwrap());
         mgr.set_funding(utxo(MIN)).unwrap();
         assert!(mgr.has_funding().unwrap());
+
+        drop(mgr);
+        config.remove().unwrap();
+    }
+
+    #[test]
+    fn test_update_funding_overwrites_without_validation() {
+        let (mgr, config) = make_manager();
+
+        // Below-minimum amount is accepted by update_funding (no validation).
+        mgr.update_funding(utxo(MIN - 1)).unwrap();
+        let stored = mgr.get_funding().unwrap().unwrap();
+        assert_eq!(stored.amount, MIN - 1);
+
+        // Overwrite with a different UTXO.
+        mgr.update_funding(utxo(MIN * 3)).unwrap();
+        let stored = mgr.get_funding().unwrap().unwrap();
+        assert_eq!(stored.amount, MIN * 3);
 
         drop(mgr);
         config.remove().unwrap();

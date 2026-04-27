@@ -101,6 +101,7 @@ pub fn create_coordinator(setup: &TestSetup) -> BitcoinCoordinator {
     BitcoinCoordinator::new_with_paths(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
+        dummy_key_manager(),
         None,
     )
     .expect("Failed to create BitcoinCoordinator")
@@ -114,6 +115,7 @@ pub fn create_coordinator_with_settings(
     BitcoinCoordinator::new_with_paths(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
+        dummy_key_manager(),
         Some(settings),
     )
     .expect("Failed to create BitcoinCoordinator with settings")

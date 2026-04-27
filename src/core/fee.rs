@@ -9,7 +9,7 @@ use bitvmx_transaction_monitor::monitor::Monitor;
 use tracing::warn;
 
 pub struct FeeEngine {
-    settings: FeeSettings,
+    pub settings: FeeSettings,
 }
 
 impl FeeEngine {
@@ -53,31 +53,87 @@ impl FeeEngine {
         Ok((network_fee_rate, news))
     }
 
-    // pub fn get_diff_fee_for_unconfirmed_chain(
-    //     &self,
-    //     new_network_fee_rate: u64,
-    //     chain: &[CoordinatedTx],
-    // ) -> Result<(u64, usize), BitcoinCoordinatorError> {
-    //     if chain.is_empty() {
-    //         return Ok((0, 0));
-    //     }
+    /// Returns the base fee multiplier (used as the first `bump_fee` for a new speedup).
+    pub fn base_fee_multiplier(&self) -> f64 {
+        self.settings.base_fee_multiplier
+    }
 
-    //     // Assumes all previous speedups used the same fee rate
-    //     let last_fee_rate_used = chain.last().unwrap().fee_info.fee_rate;
+    /// Compute the extra fee needed to bring all `unconfirmed_speedups` up to
+    /// `new_fee_rate`, along with the total virtual size of that chain.
+    pub fn chain_fee_diff(
+        &self,
+        new_fee_rate: u64,
+        unconfirmed_speedups: &[CoordinatedTx],
+    ) -> (u64, usize) {
+        if unconfirmed_speedups.is_empty() {
+            return (0, 0);
+        }
 
-    //     let mut fee_chain_difference = 0; // total missing fee to bring chain to current fee rate
-    //     let mut chain_vsize = 0; // total virtual size of the unconfirmed chain
+        // All previous speedups in the chain are assumed to have used the same fee rate
+        // (the last one's fee_rate is representative).
+        let last_fee_rate_used = unconfirmed_speedups.last().unwrap().fee_info.fee_rate;
 
-    //     for tx in chain {
-    //         let fee_rate_to_pay = new_network_fee_rate.saturating_sub(last_fee_rate_used);
-    //         let vsize = tx.tx.vsize();
-    //         let expected_fee = vsize as u64 * fee_rate_to_pay;
-    //         fee_chain_difference += expected_fee;
-    //         chain_vsize += vsize;
-    //     }
+        let mut fee_diff = 0u64;
+        let mut chain_vsize = 0usize;
 
-    //     Ok((fee_chain_difference, chain_vsize))
-    // }
+        for tx in unconfirmed_speedups {
+            let vsize = tx.tx.vsize();
+            let rate_diff = new_fee_rate.saturating_sub(last_fee_rate_used);
+            fee_diff += vsize as u64 * rate_diff;
+            chain_vsize += vsize;
+        }
+
+        (fee_diff, chain_vsize)
+    }
+
+    /// Compute the total fee (in sats) required for a CPFP/RBF speedup transaction.
+    ///
+    /// `parent_entries` is a slice of `(output_amount_sats, parent_vsize)` pairs —
+    /// one per parent transaction being included in this speedup.
+    pub fn compute_speedup_fee(
+        &self,
+        parent_entries: &[(u64, usize)],
+        child_vsize: usize,
+        bump_fee: f64,
+        fee_rate: u64,
+        is_rbf: bool,
+        chain_diff_fee: u64,
+        chain_vsize: usize,
+    ) -> u64 {
+        // Minimum relay fee that each parent already paid (1 sat/vB).
+        let min_relay_fee_rate: usize = 1; //ASK: why 1 sat/vB? Cant assume a constant value for this
+
+        let mut parent_amount_outputs: usize = 0;
+        let mut parent_vbytes: usize = 0;
+
+        for (amount, vsize) in parent_entries {
+            parent_amount_outputs += *amount as usize;
+            parent_vbytes += vsize;
+        }
+
+        let parent_total_sats = parent_vbytes * fee_rate as usize;
+        let child_total_sats = child_vsize * fee_rate as usize;
+        let total_sats = parent_total_sats + child_total_sats;
+
+        let mut total_fee = total_sats
+            .saturating_sub(parent_amount_outputs)
+            .saturating_sub(parent_vbytes * min_relay_fee_rate);
+
+        // Bitcoin RBF policy: replacement must pay at least the bandwidth cost.
+        // (https://github.com/bitcoin/bitcoin/blob/master/doc/policy/mempool-replacements.md?plain=1#L32)
+        if is_rbf && total_fee < child_total_sats * 2 {
+            total_fee = child_total_sats * 2;
+        }
+
+        total_fee += chain_diff_fee as usize;
+
+        // If we're bumping above the base multiplier, add chain vsize as extra incentive. //ASK: why? is this necessary?
+        if chain_vsize > 0 && bump_fee > self.settings.base_fee_multiplier {
+            total_fee += chain_vsize * min_relay_fee_rate;
+        }
+
+        (total_fee as f64 * bump_fee).ceil() as u64
+    }
 }
 
 #[cfg(test)]

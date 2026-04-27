@@ -11,6 +11,7 @@ use bitcoind::{
 };
 use bitvmx_bitcoin_rpc::rpc_config::RpcConfig;
 use bitvmx_transaction_monitor::monitor::Monitor;
+use key_manager::key_manager::KeyManager;
 use protocol_builder::types::Utxo;
 use rand::Rng;
 use std::{default, fs, path, rc::Rc, sync::Mutex};
@@ -70,6 +71,17 @@ pub fn dummy_pubkey() -> PublicKey {
         &secp,
         &secret_key,
     ))
+}
+
+/// A `KeyManager` backed by temporary storage. Suitable for unit / integration
+/// tests that do not perform real signing and do not need mnemonic persistence.
+pub fn dummy_key_manager() -> Rc<KeyManager> {
+    let path = format!("temp-runs/km_{}", Uuid::new_v4());
+    let config = StorageConfig {
+        path,
+        password: None,
+    };
+    Rc::new(KeyManager::new(Network::Regtest, None, None, &config).unwrap())
 }
 
 /// A UTXO with the given `amount` that satisfies the coordinator's default

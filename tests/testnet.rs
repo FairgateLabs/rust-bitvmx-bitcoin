@@ -374,6 +374,7 @@ fn test_coordinator_connects_and_syncs() {
     let coordinator = BitcoinCoordinator::new_with_paths(
         &testnet_rpc_config(),
         storage.get_raw_storage(),
+        dummy_key_manager(),
         Some(testnet_settings_near_tip()),
     )
     .expect("Failed to create coordinator");
@@ -421,6 +422,7 @@ fn test_dispatch_transaction() {
     let coordinator = BitcoinCoordinator::new_with_paths(
         &testnet_rpc_config(),
         storage.get_raw_storage(),
+        dummy_key_manager(),
         Some(testnet_settings_near_tip()),
     )
     .expect("Failed to create coordinator");
@@ -487,6 +489,7 @@ fn test_coordinator_full_lifecycle() {
     let coordinator = BitcoinCoordinator::new_with_paths(
         &testnet_rpc_config(),
         storage_cfg.get_raw_storage(),
+        dummy_key_manager(),
         Some(testnet_lifecycle_settings()),
     )
     .expect("failed to create coordinator");

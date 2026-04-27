@@ -5,7 +5,8 @@ use bitvmx_bitcoin_rpc::{
     bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
 };
 use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor, TransactionStatus};
-use protocol_builder::types::Utxo;
+use key_manager::key_manager::KeyManager;
+use protocol_builder::types::{output::SpeedupData, Utxo};
 use storage_backend::storage::Storage;
 use tracing::{debug, error, info, warn};
 
@@ -25,9 +26,6 @@ use crate::{
 
 pub struct BitcoinCoordinator {
     monitor: Monitor,
-
-    // key_manager: Rc<KeyManager>,
-    // _network: Network,
     storage: CoordinatorStorage,
     dispatcher: Dispatcher,
     fee_engine: FeeEngine,
@@ -42,7 +40,7 @@ impl BitcoinCoordinator {
     pub fn new_with_paths(
         rpc_config: &RpcConfig,
         storage: Rc<Storage>,
-        // key_manager: Rc<KeyManager>,
+        key_manager: Rc<KeyManager>,
         settings: Option<BitcoinSettings>,
     ) -> Result<Self, BitcoinCoordinatorError> {
         let settings = settings.unwrap_or_default();
@@ -56,7 +54,7 @@ impl BitcoinCoordinator {
         let coordinator_storage = CoordinatorStorage::new(storage, settings.storage);
         let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client);
         let fee_engine = FeeEngine::new(settings.fee);
-        let speedup_engine = SpeedupEngine::new(settings.speedup);
+        let speedup_engine = SpeedupEngine::new(settings.speedup, key_manager);
         let coordinator_settings = settings.coordinator;
 
         Ok(Self {
@@ -90,7 +88,19 @@ impl BitcoinCoordinator {
             return Ok(());
         }
 
+        let current_height = self.monitor.get_monitor_height()?;
+
+        self.review_and_dispatch_speedups(current_height)?;
         self.process_active_transactions()?;
+        self.speedup_engine.boost_if_stale(
+            &self.storage,
+            &self.fee_engine,
+            &self.monitor,
+            &self.funding_manager,
+            &self.dispatcher,
+            current_height,
+            self.settings.retry_attempts_sending_tx,
+        )?;
 
         Ok(())
     }
@@ -116,37 +126,41 @@ impl BitcoinCoordinator {
         stuck_in_mempool_blocks: Option<u32>,
     ) -> Result<(), BitcoinCoordinatorError> {
         let txid = tx.compute_txid();
-        let current_height = self.monitor.get_monitor_height()?;
-        let target_height = target_block_height.unwrap_or(current_height);
-
-        let (fee_rate, _) = self.fee_engine.get_network_fee_rate(&self.monitor)?;
-        let fee_info = self.fee_engine.compute_fee_for_tx(&tx, fee_rate);
-
-        // Register for confirmation tracking (mempool search disabled until after
-        // the tx is actually broadcast, to avoid false positives).
-        self.monitor.monitor(
-            TypesToMonitor::Transactions(vec![txid], context.clone(), confirmation_trigger),
-            false,
-        )?;
-
-        let coordinated_tx = CoordinatedTx {
-            txid,
+        self.register_tx(
             tx,
-            kind: TxKind::Normal,
-            state: TransactionState::ToDispatch,
-            broadcast_block_height: None,
-            target_block_height: target_height,
-            stuck_in_mempool_blocks,
-            confirmation_trigger,
-            settled_block_height: None,
-            retry_count: 0,
-            fee_info,
+            TxKind::Normal,
             context,
-        };
-
-        self.storage.insert_tx(coordinated_tx)?;
+            target_block_height,
+            confirmation_trigger,
+            stuck_in_mempool_blocks,
+        )?;
         info!("Transaction({}) registered for dispatch", txid);
+        Ok(())
+    }
 
+    /// Register a transaction for dispatch and enable CPFP speedup support.
+    ///
+    /// `speedup_data` contains the signing/UTXO metadata needed by the protocol
+    /// builder to construct a CPFP child transaction when required.
+    pub fn dispatch_with_speedup(
+        &self,
+        tx: Transaction,
+        speedup_data: SpeedupData,
+        context: String,
+        target_block_height: Option<BlockHeight>,
+        confirmation_trigger: Option<u32>,
+        stuck_in_mempool_blocks: Option<u32>,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let txid = tx.compute_txid();
+        self.register_tx(
+            tx,
+            TxKind::NeedsSpeedup(speedup_data),
+            context,
+            target_block_height,
+            confirmation_trigger,
+            stuck_in_mempool_blocks,
+        )?;
+        info!("Transaction({}) registered for dispatch with speedup", txid);
         Ok(())
     }
 
@@ -189,16 +203,6 @@ impl BitcoinCoordinator {
         Ok(self.monitor.get_tx_status(&txid, true)?)
     }
 
-    // /// Registers a type of data to be monitored by the coordinator
-    // /// The data will be tracked for confirmations and status changes, and updates will be reported through the news.
-    // ///
-    // /// # Arguments
-    // /// * `data` - The data to monitor
-    // pub fn monitor(&self, data: TypesToMonitor) -> Result<(), BitcoinCoordinatorError> {
-    //     self.monitor.monitor(data, true)?; //ASK: why true or false?
-    //     Ok(())
-    // }
-
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
         let monitor_news = self.monitor.get_news()?;
         let coordinator_news = self.storage.get_news()?;
@@ -217,11 +221,22 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
+    /// Registers a type of data to be monitored by the coordinator
+    /// The data will be tracked for confirmations and status changes, and updates will be reported through the news.
+    ///
+    /// # Arguments
+    /// * `data` - The data to monitor
+    pub fn monitor(&self, data: TypesToMonitor) -> Result<(), BitcoinCoordinatorError> {
+        self.monitor.monitor(data, true)?; //ASK: why true or false?
+        Ok(())
+    }
+
     // =========================================================================
     // Private helpers
     // =========================================================================
 
     /// Main processing loop: review active txs, then dispatch pending ones.
+    /// After dispatching, any newly-dispatched `NeedsSpeedup` parents trigger CPFP creation.
     fn process_active_transactions(&self) -> Result<(), BitcoinCoordinatorError> {
         let current_height = self.monitor.get_monitor_height()?;
 
@@ -239,6 +254,10 @@ impl BitcoinCoordinator {
         let mut to_review: Vec<CoordinatedTx> = Vec::new();
 
         for tx in active_txs {
+            // Skip speedup txs — handled by review_and_dispatch_speedups.
+            if matches!(tx.kind, TxKind::Speedup(_)) {
+                continue;
+            }
             match tx.state {
                 TransactionState::ToDispatch => {
                     if tx.is_ready_to_dispatch(current_height) {
@@ -250,7 +269,7 @@ impl BitcoinCoordinator {
                 }
                 _ => {
                     error!(
-                        " Inconsistent error: transaction {} in unexpected state {:?}",
+                        "Inconsistent error: transaction {} in unexpected state {:?}",
                         tx.txid, tx.state
                     );
                 }
@@ -261,14 +280,89 @@ impl BitcoinCoordinator {
         self.review_transactions(to_review, &mut to_dispatch, current_height)?;
 
         if !to_dispatch.is_empty() {
-            self.dispatch_pending(to_dispatch, current_height)?;
+            let dispatched = self.dispatch_pending(to_dispatch, current_height)?;
+
+            // Create CPFPs for parents that were just dispatched and need one.
+            let speedup_parents: Vec<CoordinatedTx> = dispatched
+                .into_iter()
+                .filter(|tx| matches!(tx.kind, TxKind::NeedsSpeedup(_)))
+                .collect();
+
+            if !speedup_parents.is_empty() {
+                self.speedup_engine.create_cpfps_for_parents(
+                    &speedup_parents,
+                    &self.storage,
+                    &self.fee_engine,
+                    &self.monitor,
+                    &self.funding_manager,
+                    &self.dispatcher,
+                    self.dispatcher.max_tx_weight(),
+                    current_height,
+                    self.settings.retry_attempts_sending_tx,
+                )?;
+            }
         }
 
         Ok(())
     }
 
+    fn review_and_dispatch_speedups(
+        &self,
+        current_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        self.speedup_engine.review_in_flight(
+            &self.storage,
+            &self.monitor,
+            &self.funding_manager,
+            &self.dispatcher,
+            current_height,
+            self.settings.retry_attempts_sending_tx,
+        )
+    }
+
+    /// Shared path for `dispatch_without_speedup` and `dispatch_with_speedup`.
+    fn register_tx(
+        &self,
+        tx: Transaction,
+        kind: TxKind,
+        context: String,
+        target_block_height: Option<BlockHeight>,
+        confirmation_trigger: Option<u32>,
+        stuck_in_mempool_blocks: Option<u32>,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let txid = tx.compute_txid();
+        let current_height = self.monitor.get_monitor_height()?;
+        let target_height = target_block_height.unwrap_or(current_height);
+
+        let (fee_rate, _) = self.fee_engine.get_network_fee_rate(&self.monitor)?;
+        let fee_info = self.fee_engine.compute_fee_for_tx(&tx, fee_rate);
+
+        // Mempool search disabled until after broadcast to avoid false positives.
+        self.monitor.monitor(
+            TypesToMonitor::Transactions(vec![txid], context.clone(), confirmation_trigger),
+            false,
+        )?;
+
+        self.storage.insert_tx(CoordinatedTx {
+            txid,
+            tx,
+            kind,
+            state: TransactionState::ToDispatch,
+            broadcast_block_height: None,
+            target_block_height: target_height,
+            stuck_in_mempool_blocks,
+            confirmation_trigger,
+            settled_block_height: None,
+            retry_count: 0,
+            fee_info,
+            context,
+        })?;
+
+        Ok(())
+    }
+
     /// Check the chain/mempool status of each `InMempool` or `Confirmed`
-    /// transaction and transition its state accordingly.
+    /// normal transaction and transition its state accordingly.
     fn review_transactions(
         &self,
         txs: Vec<CoordinatedTx>,
@@ -356,70 +450,63 @@ impl BitcoinCoordinator {
     }
 
     /// Broadcast a batch of `ToDispatch` transactions and update their states.
+    /// Returns the list of successfully dispatched transactions.
     fn dispatch_pending(
         &self,
         txs: Vec<CoordinatedTx>,
         current_height: BlockHeight,
-    ) -> Result<(), BitcoinCoordinatorError> {
+    ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
         let (fee_rate, fee_news) = self.fee_engine.get_network_fee_rate(&self.monitor)?;
         if let Some(news) = fee_news {
             self.storage.add_news(news)?;
         }
 
         let txs = self.apply_retry_rate_limit(txs);
-
         let raw_txs: Vec<Transaction> = txs.iter().map(|t| t.tx.clone()).collect();
         let results = self.dispatcher.dispatch(raw_txs);
+        let mut dispatched = Vec::new();
 
         for (txid, outcome) in results {
             let tx = match txs.iter().find(|t| t.txid == txid) {
                 Some(t) => t,
                 None => continue,
             };
+            if self.apply_dispatch_outcome(tx, txid, outcome, fee_rate, current_height)? {
+                dispatched.push(tx.clone());
+            }
+        }
 
-            match outcome {
-                DispatchOutcome::Success => {
-                    self.on_dispatch_success(tx, txid, current_height, fee_rate)?;
-                }
+        Ok(dispatched)
+    }
 
-                DispatchOutcome::AlreadyKnown => {
+    /// Handle a single dispatch outcome for a normal (non-speedup) transaction.
+    fn apply_dispatch_outcome(
+        &self,
+        tx: &CoordinatedTx,
+        txid: Txid,
+        outcome: DispatchOutcome,
+        fee_rate: u64,
+        current_height: BlockHeight,
+    ) -> Result<bool, BitcoinCoordinatorError> {
+        match outcome {
+            DispatchOutcome::Success | DispatchOutcome::AlreadyKnown => {
+                if matches!(outcome, DispatchOutcome::AlreadyKnown) {
                     warn!(
-                        "Transaction({}) already known by node — treating as in-mempool",
+                        "Transaction({}) already known — treating as in-mempool",
                         txid
                     );
-                    self.on_dispatch_success(tx, txid, current_height, fee_rate)?;
                 }
+                self.on_dispatch_success(tx, txid, current_height, fee_rate)?;
+                Ok(true)
+            }
 
-                DispatchOutcome::Retryable(msg) => {
-                    if tx.retry_count + 1 >= self.settings.retry_attempts_sending_tx {
-                        warn!(
-                            "Transaction({}) failed after {} attempts: {}",
-                            txid,
-                            tx.retry_count + 1,
-                            msg
-                        );
-                        self.storage
-                            .settle_tx(txid, TransactionState::Failed, current_height)?;
-                        self.storage.add_news(CoordinatorNews::DispatchError {
-                            txid,
-                            context: tx.context.clone(),
-                        })?;
-                    } else {
-                        debug!(
-                            "Transaction({}) dispatch failed (attempt {}/{}) — will retry: {}",
-                            txid,
-                            tx.retry_count + 1,
-                            self.settings.retry_attempts_sending_tx,
-                            msg
-                        );
-                        self.storage.mark_as_retry(txid)?;
-                    }
-                }
-
-                DispatchOutcome::Fatal(msg) => {
+            DispatchOutcome::Retryable(msg) => {
+                if tx.retry_count + 1 >= self.settings.retry_attempts_sending_tx {
                     warn!(
-                        "Transaction({}) failed with fatal dispatch error: {}",
-                        txid, msg
+                        "Transaction({}) failed after {} attempts: {}",
+                        txid,
+                        tx.retry_count + 1,
+                        msg
                     );
                     self.storage
                         .settle_tx(txid, TransactionState::Failed, current_height)?;
@@ -427,11 +514,30 @@ impl BitcoinCoordinator {
                         txid,
                         context: tx.context.clone(),
                     })?;
+                } else {
+                    debug!(
+                        "Transaction({}) dispatch failed (attempt {}/{}) — will retry: {}",
+                        txid,
+                        tx.retry_count + 1,
+                        self.settings.retry_attempts_sending_tx,
+                        msg
+                    );
+                    self.storage.mark_as_retry(txid)?;
                 }
+                Ok(false)
+            }
+
+            DispatchOutcome::Fatal(msg) => {
+                warn!("Transaction({}) fatal dispatch error: {}", txid, msg);
+                self.storage
+                    .settle_tx(txid, TransactionState::Failed, current_height)?;
+                self.storage.add_news(CoordinatorNews::DispatchError {
+                    txid,
+                    context: tx.context.clone(),
+                })?;
+                Ok(false)
             }
         }
-
-        Ok(())
     }
 
     /// Shared success path for both a clean broadcast and an `AlreadyKnown` response.
@@ -450,8 +556,6 @@ impl BitcoinCoordinator {
         updated.fee_info = fee_info;
         self.storage.update_tx(&updated)?;
 
-        // Re-register with mempool search enabled so the monitor tracks the tx
-        // while it waits for inclusion in a block.
         let trigger = tx.confirmation_trigger;
         self.monitor.monitor(
             TypesToMonitor::Transactions(vec![txid], tx.context.clone(), trigger),
