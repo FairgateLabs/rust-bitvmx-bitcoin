@@ -476,8 +476,8 @@ fn test_news_ack() {
 }
 
 /// Dispatching a transaction that is already in the mempool is treated as a
-/// success (`AlreadyKnown` → `on_dispatch_success`).  The coordinator sets the
-/// state to `InMempool` without generating any error news.
+/// success (`AlreadyKnown`).  The coordinator sets the state to `InMempool`
+///  without generating any error news.
 #[test]
 fn test_dispatch_already_in_mempool() {
     init_trace();

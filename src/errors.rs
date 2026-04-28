@@ -1,6 +1,5 @@
-use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::errors::BitcoinClientError;
-use bitvmx_transaction_monitor::{errors::MonitorError, IndexerError};
+use bitvmx_transaction_monitor::errors::MonitorError;
 use key_manager::errors::KeyManagerError;
 use protocol_builder::errors::ProtocolBuilderError;
 use storage_backend::error::StorageError;

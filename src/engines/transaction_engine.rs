@@ -1,12 +1,11 @@
 use std::rc::Rc;
 
 use crate::{
-    core::dispatcher::DispatchOutcome,
     engines::common::EngineContext,
     errors::BitcoinCoordinatorError,
     types::{CoordinatedTx, CoordinatorNews, TransactionState, TxKind},
 };
-use bitcoin::{Transaction, Txid};
+use bitcoin::Transaction;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use tracing::{debug, error, warn};
 
@@ -61,11 +60,9 @@ impl TransactionEngine {
         }
 
         self.review_transactions(to_review, &mut to_dispatch, current_height)?;
-
         if to_dispatch.is_empty() {
             return Ok(vec![]);
         }
-
         let dispatched = self.dispatch_pending(to_dispatch, current_height)?;
 
         let speedup_parents: Vec<CoordinatedTx> = dispatched
@@ -76,7 +73,9 @@ impl TransactionEngine {
         Ok(speedup_parents)
     }
 
-    // ── Private helpers ───────────────────────────────────────────────────────
+    // =========================================================================
+    // Private helpers
+    // =========================================================================
 
     fn review_transactions(
         &self,
@@ -87,6 +86,7 @@ impl TransactionEngine {
         let max_confs = self.ctx.monitor.settings.max_monitoring_confirmations;
 
         for tx in txs {
+            // Only search the mempool after the tx has been broadcast.
             let search_in_mempool = tx.broadcast_block_height.is_some();
             let status = self
                 .ctx
@@ -163,10 +163,10 @@ impl TransactionEngine {
         txs: Vec<CoordinatedTx>,
         current_height: BlockHeight,
     ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
-        // Update fee rates before dispatching to ensure we're using the latest network conditions.
+        // Update fee rates before dispatching to ensure we are using the latest network conditions.
         let (fee_rate, fee_news) = self
             .ctx
-            .fee_engine
+            .fee_manager
             .get_network_fee_rate(&self.ctx.monitor)?;
         if let Some(news) = fee_news {
             self.ctx.storage.add_news(news)?;
@@ -180,26 +180,17 @@ impl TransactionEngine {
         for (txid, outcome) in results {
             let tx = match txs.iter().find(|t| t.txid == txid) {
                 Some(t) => t,
-                None => continue,
+                None => continue, //TODO: handle this error case more robustly
             };
-            if self.apply_dispatch_outcome(tx, txid, outcome, fee_rate, current_height)? {
+            let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&tx.tx, fee_rate);
+            if self
+                .ctx
+                .handle_dispatch_result(tx, txid, outcome, current_height, fee_info)?
+            {
                 dispatched.push(tx.clone());
             }
         }
 
         Ok(dispatched)
-    }
-
-    fn apply_dispatch_outcome(
-        &self,
-        tx: &CoordinatedTx,
-        txid: Txid,
-        outcome: DispatchOutcome,
-        fee_rate: u64,
-        current_height: BlockHeight,
-    ) -> Result<bool, BitcoinCoordinatorError> {
-        let fee_info = self.ctx.fee_engine.compute_fee_for_tx(&tx.tx, fee_rate);
-        self.ctx
-            .handle_dispatch_result(tx, txid, outcome, current_height, fee_info)
     }
 }

@@ -8,11 +8,11 @@ use bitcoin::Transaction;
 use bitvmx_transaction_monitor::monitor::Monitor;
 use tracing::warn;
 
-pub struct FeeEngine {
+pub struct FeeManager {
     pub settings: FeeSettings,
 }
 
-impl FeeEngine {
+impl FeeManager {
     pub fn new(settings: FeeSettings) -> Self {
         Self { settings }
     }
@@ -154,10 +154,10 @@ mod tests {
 
     #[test]
     fn test_compute_fee_for_tx() {
-        let engine = FeeEngine::new(settings(1, 1000));
+        let manager = FeeManager::new(settings(1, 1000));
         let tx = dummy_tx();
         let vsize = tx.vsize() as u64;
-        let fee_info = engine.compute_fee_for_tx(&tx, 10);
+        let fee_info = manager.compute_fee_for_tx(&tx, 10);
         assert_eq!(fee_info.fee, vsize * 10);
         assert_eq!(fee_info.fee_rate, 10);
         assert_eq!(fee_info.weight, tx.weight().to_wu() as u64);
@@ -165,12 +165,12 @@ mod tests {
 
     #[test]
     fn test_get_network_fee_rate() {
-        let engine = FeeEngine::new(settings(10, 100));
+        let manager = FeeManager::new(settings(10, 100));
         let storage = StorageTestConfig::new();
         let bitcoind = TestBitcoind::default();
         let monitor = bitcoind.create_monitor(storage.get_raw_storage());
 
-        let (fee_rate, news) = engine.get_network_fee_rate(&monitor).unwrap();
+        let (fee_rate, news) = manager.get_network_fee_rate(&monitor).unwrap();
         assert!(fee_rate <= 100);
         assert!(news.is_none());
 

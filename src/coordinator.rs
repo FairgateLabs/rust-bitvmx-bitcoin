@@ -8,18 +8,16 @@ use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor, Transa
 use key_manager::key_manager::KeyManager;
 use protocol_builder::types::{output::SpeedupData, Utxo};
 use storage_backend::storage::Storage;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     config::config::BitcoinSettings,
     core::{
-        dispatcher::Dispatcher, fee::FeeEngine, funding::FundingManager,
+        dispatcher::Dispatcher, fee::FeeManager, funding::FundingManager,
         storage::CoordinatorStorage,
     },
     engines::{
-        common::{DispatchConfig, EngineContext},
-        speedup_engine::SpeedupEngine,
-        transaction_engine::TransactionEngine,
+        common::EngineContext, speedup_engine::SpeedupEngine, transaction_engine::TransactionEngine,
     },
     errors::BitcoinCoordinatorError,
     types::{AckNews, CoordinatedTx, News, TransactionState, TxKind},
@@ -41,28 +39,21 @@ impl BitcoinCoordinator {
         settings.validate()?;
 
         let bitcoin_client = Rc::new(BitcoinClient::new_from_config(rpc_config)?);
-        let monitor = Rc::new(Monitor::new_with_paths(
-            rpc_config,
-            storage.clone(),
-            Some(settings.monitor),
-        )?);
+        let monitor = Monitor::new_with_paths(rpc_config, storage.clone(), Some(settings.monitor))?;
 
         let funding_manager = FundingManager::new(settings.funding, storage.clone());
         let coordinator_storage = CoordinatorStorage::new(storage, settings.storage);
         let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client);
-        let fee_engine = FeeEngine::new(settings.fee);
-        let dispatch_config = DispatchConfig {
-            retry_attempts_sending_tx: settings.coordinator.retry_attempts_sending_tx,
-            retry_interval_seconds: settings.coordinator.retry_interval_seconds,
-        };
+        let fee_manager = FeeManager::new(settings.fee);
+        let coordinator_config = settings.coordinator;
 
         let ctx = Rc::new(EngineContext::new(
-            coordinator_storage,
-            fee_engine,
-            Rc::clone(&monitor),
+            monitor,
+            fee_manager,
             funding_manager,
             dispatcher,
-            dispatch_config,
+            coordinator_storage,
+            coordinator_config,
         ));
 
         let speedup_engine = SpeedupEngine::new(Rc::clone(&ctx), key_manager, settings.speedup);
@@ -89,6 +80,7 @@ impl BitcoinCoordinator {
         self.tx_engine.ctx.monitor.tick()?;
 
         if !self.is_ready()? {
+            debug!("Coordinator not ready, skipping tick");
             return Ok(());
         }
 
@@ -201,6 +193,10 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
+    // =========================================================================
+    // Private helpers
+    // =========================================================================
+
     /// Persist a transaction and register it with the monitor.
     fn register_tx(
         &self,
@@ -214,18 +210,13 @@ impl BitcoinCoordinator {
         let txid = tx.compute_txid();
         let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
         let target_height = target_block_height.unwrap_or(current_height);
+        let fee_manager = &self.tx_engine.ctx.fee_manager;
 
-        let (fee_rate, _) = self
-            .tx_engine
-            .ctx
-            .fee_engine
-            .get_network_fee_rate(&self.tx_engine.ctx.monitor)?;
-        let fee_info = self
-            .tx_engine
-            .ctx
-            .fee_engine
-            .compute_fee_for_tx(&tx, fee_rate);
+        let (fee_rate, _) = fee_manager.get_network_fee_rate(&self.tx_engine.ctx.monitor)?;
+        let fee_info = fee_manager.compute_fee_for_tx(&tx, fee_rate);
 
+        // Register for confirmation tracking (mempool search disabled until after
+        // the tx is actually broadcast).
         self.tx_engine.ctx.monitor.monitor(
             TypesToMonitor::Transactions(vec![txid], context.clone(), confirmation_trigger),
             false,

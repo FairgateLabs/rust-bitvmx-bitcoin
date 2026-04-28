@@ -70,7 +70,7 @@ impl SpeedupEngine {
 
         let (fee_rate, fee_news) = self
             .ctx
-            .fee_engine
+            .fee_manager
             .get_network_fee_rate(&self.ctx.monitor)?;
         if let Some(news) = fee_news {
             self.ctx.storage.add_news(news)?;
@@ -87,8 +87,8 @@ impl SpeedupEngine {
         };
 
         let (chain_diff_fee, chain_vsize) =
-            self.ctx.fee_engine.chain_fee_diff(fee_rate, &unconfirmed);
-        let bump_fee = self.ctx.fee_engine.base_fee_multiplier();
+            self.ctx.fee_manager.chain_fee_diff(fee_rate, &unconfirmed);
+        let bump_fee = self.ctx.fee_manager.base_fee_multiplier();
         let batches = self
             .ctx
             .dispatcher
@@ -123,7 +123,7 @@ impl SpeedupEngine {
             )?;
 
             let context = Self::make_speedup_context(&funding, bump_fee, &parent_entries);
-            let fee_info = self.ctx.fee_engine.compute_fee_for_tx(&cpfp_tx, fee_rate);
+            let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&cpfp_tx, fee_rate);
             let kind = SpeedupKind::CPFP {
                 parents: parent_txids,
                 context,
@@ -199,7 +199,7 @@ impl SpeedupEngine {
 
         let (fee_rate, fee_news) = self
             .ctx
-            .fee_engine
+            .fee_manager
             .get_network_fee_rate(&self.ctx.monitor)?;
         if let Some(news) = fee_news {
             self.ctx.storage.add_news(news)?;
@@ -226,7 +226,7 @@ impl SpeedupEngine {
 
         let use_rbf = (unconfirmed.len() as u32) >= self.settings.max_unconfirmed_speedups;
         let (chain_diff_fee, chain_vsize) =
-            self.ctx.fee_engine.chain_fee_diff(fee_rate, &unconfirmed);
+            self.ctx.fee_manager.chain_fee_diff(fee_rate, &unconfirmed);
 
         let parent_entries: Vec<(SpeedupData, usize)> = if use_rbf {
             last_context
@@ -249,7 +249,7 @@ impl SpeedupEngine {
         )?;
 
         let context = Self::make_speedup_context(&funding, next_bump, &parent_entries);
-        let fee_info = self.ctx.fee_engine.compute_fee_for_tx(&new_tx, fee_rate);
+        let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&new_tx, fee_rate);
         let kind = if use_rbf {
             SpeedupKind::RBF {
                 replaces: last_txid,
@@ -413,7 +413,7 @@ impl SpeedupEngine {
                 child_vsize = dummy_vsize;
             }
 
-            let fee = self.ctx.fee_engine.compute_speedup_fee(
+            let fee = self.ctx.fee_manager.compute_speedup_fee(
                 &fee_entries,
                 child_vsize,
                 bump_fee,

@@ -1,14 +1,14 @@
-use std::{cell::Cell, rc::Rc};
-
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor};
+use std::cell::Cell;
 use tracing::{debug, info, warn};
 
 use crate::{
+    config::config::CoordinatorSettings,
     core::{
         dispatcher::{DispatchOutcome, Dispatcher},
-        fee::FeeEngine,
+        fee::FeeManager,
         funding::FundingManager,
         storage::CoordinatorStorage,
     },
@@ -17,48 +17,41 @@ use crate::{
     types::{CoordinatedTx, CoordinatorNews, FeeInfo, SpeedupKind, TransactionState, TxKind},
 };
 
-/// Retry and dispatch settings shared by both engines.
-#[derive(Debug, Clone)]
-pub struct DispatchConfig {
-    pub retry_attempts_sending_tx: u32,
-    pub retry_interval_seconds: u64,
-}
-
 /// Shared service bundle held by both `SpeedupEngine` and `TransactionEngine`.
 ///
 /// Both engines receive an `Rc<EngineContext>` so they share exactly the same
 /// underlying storage, funding state, dispatcher, and fee engine — no copies.
 pub struct EngineContext {
-    pub storage: CoordinatorStorage,
-    pub fee_engine: FeeEngine,
-    pub monitor: Rc<Monitor>,
+    pub monitor: Monitor,
+
+    pub fee_manager: FeeManager,
     pub funding_manager: FundingManager,
+    pub storage: CoordinatorStorage,
     pub dispatcher: Dispatcher,
-    pub dispatch_config: DispatchConfig,
+
+    pub coordinator_config: CoordinatorSettings,
     last_retry_at: Cell<Option<u64>>,
 }
 
 impl EngineContext {
     pub fn new(
-        storage: CoordinatorStorage,
-        fee_engine: FeeEngine,
-        monitor: Rc<Monitor>,
+        monitor: Monitor,
+        fee_manager: FeeManager,
         funding_manager: FundingManager,
         dispatcher: Dispatcher,
-        dispatch_config: DispatchConfig,
+        storage: CoordinatorStorage,
+        coordinator_config: CoordinatorSettings,
     ) -> Self {
         Self {
             storage,
-            fee_engine,
+            fee_manager,
             monitor,
             funding_manager,
             dispatcher,
-            dispatch_config,
+            coordinator_config,
             last_retry_at: Cell::new(None),
         }
     }
-
-    // ── Shared state-transition helpers ──────────────────────────────────────
 
     /// Transition a successfully-dispatched tx to `InMempool` and enable
     /// monitor mempool search.
@@ -129,7 +122,7 @@ impl EngineContext {
         let retry_ready = match self.last_retry_at.get() {
             None => true,
             Some(last) => {
-                now_secs().saturating_sub(last) >= self.dispatch_config.retry_interval_seconds
+                now_secs().saturating_sub(last) >= self.coordinator_config.retry_interval_seconds
             }
         };
         let mut has_retries = false;
@@ -168,11 +161,20 @@ impl EngineContext {
                 if matches!(outcome, DispatchOutcome::AlreadyKnown) {
                     warn!("tx({}) already known — treating as in-mempool", txid);
                 }
-                self.on_dispatch_success(tx, txid, current_height, fee_info)?;
+                if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
+                    if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
+                        if let TxKind::Speedup(ref mut k) = replaced.kind {
+                            k.context_mut().replaced_by = Some(txid);
+                        }
+                        self.storage.update_tx(&replaced)?;
+                    }
+                }
+                self.mark_dispatched(tx, current_height, fee_info)?;
+                info!("tx({}) dispatched at block height {}", txid, current_height);
                 Ok(true)
             }
             DispatchOutcome::Retryable(msg) => {
-                if tx.retry_count + 1 >= self.dispatch_config.retry_attempts_sending_tx {
+                if tx.retry_count + 1 >= self.coordinator_config.retry_attempts_sending_tx {
                     warn!(
                         "tx({}) failed after {} attempts: {}",
                         txid,
@@ -187,7 +189,7 @@ impl EngineContext {
                         "tx({}) dispatch failed (attempt {}/{}) — will retry: {}",
                         txid,
                         tx.retry_count + 1,
-                        self.dispatch_config.retry_attempts_sending_tx,
+                        self.coordinator_config.retry_attempts_sending_tx,
                         msg
                     );
                     self.storage.mark_as_retry(txid)?;
@@ -202,26 +204,6 @@ impl EngineContext {
                 Ok(false)
             }
         }
-    }
-
-    fn on_dispatch_success(
-        &self,
-        tx: &CoordinatedTx,
-        txid: Txid,
-        current_height: BlockHeight,
-        fee_info: FeeInfo,
-    ) -> Result<(), BitcoinCoordinatorError> {
-        if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
-            if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
-                if let TxKind::Speedup(ref mut k) = replaced.kind {
-                    k.context_mut().replaced_by = Some(txid);
-                }
-                self.storage.update_tx(&replaced)?;
-            }
-        }
-        self.mark_dispatched(tx, current_height, fee_info)?;
-        info!("tx({}) dispatched at block height {}", txid, current_height);
-        Ok(())
     }
 
     fn dispatch_error_news(tx: &CoordinatedTx, txid: Txid) -> CoordinatorNews {
