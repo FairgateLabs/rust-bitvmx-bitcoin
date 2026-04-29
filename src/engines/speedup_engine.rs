@@ -41,8 +41,6 @@ impl SpeedupEngine {
         }
     }
 
-    // ── CPFP creation ─────────────────────────────────────────────────────────
-
     /// Build and store CPFP transactions for a batch of newly-dispatched parent
     /// transactions.  Parents are batched by weight up to the available ancestor
     /// slots; each CPFP spends the change output of the previous one.
@@ -59,6 +57,17 @@ impl SpeedupEngine {
             return Ok(());
         }
         let current_height = self.ctx.monitor.get_monitor_height()?;
+
+        // Don't create new CPFPs while evicted speedups are pending re-dispatch —
+        // their pre-built txs already claim the UTXOs in the funding chain.
+        let all_speedups = self.ctx.storage.get_speedups_ordered()?;
+        if all_speedups
+            .iter()
+            .any(|tx| tx.state == TransactionState::ToDispatch)
+        {
+            return Ok(());
+        }
+
         let unconfirmed = self.ctx.storage.get_unconfirmed_speedups()?;
         let available_slots = self
             .settings
@@ -76,7 +85,7 @@ impl SpeedupEngine {
             self.ctx.storage.add_news(news)?;
         }
 
-        let mut funding = match self.ctx.funding_manager.get_funding()? {
+        let mut funding = match self.ctx.funding_manager.get_funding(&all_speedups)? {
             Some(f) => f,
             None => {
                 self.ctx
@@ -147,8 +156,6 @@ impl SpeedupEngine {
         Ok(())
     }
 
-    // ── Periodic processing ───────────────────────────────────────────────────
-
     pub fn process_active_transactions(&self) -> Result<(), BitcoinCoordinatorError> {
         let current_height = self.ctx.monitor.get_monitor_height()?;
         self.review_in_flight(current_height)?;
@@ -156,7 +163,9 @@ impl SpeedupEngine {
         Ok(())
     }
 
-    // ── Boost (CPFP) / RBF ───────────────────────────────────────────────────
+    // =========================================================================
+    // Private helpers
+    // =========================================================================
 
     /// Build and store a boost CPFP or RBF transaction if the latest in-mempool
     /// speedup is stale and no other speedup is pending dispatch.
@@ -205,7 +214,7 @@ impl SpeedupEngine {
             self.ctx.storage.add_news(news)?;
         }
 
-        let funding = match self.ctx.funding_manager.get_funding()? {
+        let funding = match self.ctx.funding_manager.get_funding(&all_speedups)? {
             Some(f) => f,
             None => {
                 self.ctx
@@ -277,8 +286,6 @@ impl SpeedupEngine {
         Ok(())
     }
 
-    // ── Review + dispatch in-flight speedups ──────────────────────────────────
-
     /// Review in-flight speedups and dispatch any that are pending.
     ///
     /// Phase 1 — review active (`InMempool`/`Confirmed`) speedups:
@@ -294,7 +301,6 @@ impl SpeedupEngine {
         }
 
         let max_confs = self.ctx.monitor.settings.max_monitoring_confirmations;
-        let mut funding_restored = false;
 
         for tx in &all_speedups {
             if !matches!(
@@ -310,13 +316,14 @@ impl SpeedupEngine {
                 if tx.state == TransactionState::Confirmed {
                     self.ctx.handle_reorg(tx, current_height)?;
                 }
+                // Already live in the mempool — stale detection is handled by boost_if_stale.
                 continue;
             }
 
             let context = match &tx.kind {
                 TxKind::Speedup(k) => k.context(),
                 _ => {
-                    tracing::warn!(txid = %tx.txid, "non-speedup tx in speedup list; skipping");
+                    tracing::warn!(txid = %tx.txid, "non-speedup tx in speedup list; skipping"); //TODO: handle this error case more robustly
                     continue;
                 }
             };
@@ -328,12 +335,6 @@ impl SpeedupEngine {
                 self.ctx
                     .storage
                     .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
-                if !funding_restored {
-                    self.ctx
-                        .funding_manager
-                        .update_funding(context.funding_input.clone())?;
-                    funding_restored = true;
-                }
                 continue;
             }
 
@@ -345,6 +346,20 @@ impl SpeedupEngine {
                         tx.context.clone(),
                         None,
                     ))?;
+                }
+                // Advance base funding to the last finalized on-chain change output.
+                // Only updated at Finalized (not InMempool) so get_base_funding() always
+                // holds a confirmed UTXO and is resilient to mempool evictions/reorgs.
+                if let TxKind::Speedup(k) = &tx.kind {
+                    if let Some(out) = tx.tx.output.last() {
+                        let vout = tx.tx.output.len().saturating_sub(1) as u32;
+                        self.ctx.funding_manager.update_funding(Utxo::new(
+                            tx.txid,
+                            vout,
+                            out.value.to_sat(),
+                            &k.context().funding_input.pub_key,
+                        ))?;
+                    }
                 }
                 continue;
             }
@@ -375,8 +390,6 @@ impl SpeedupEngine {
 
         Ok(())
     }
-
-    // ── Private helpers ───────────────────────────────────────────────────────
 
     /// Build a CPFP (or RBF) transaction via the fee convergence loop.
     fn build_cpfp(
@@ -510,10 +523,6 @@ impl SpeedupEngine {
             false,
         )?;
         self.dispatch_speedup(&record, current_height)?;
-        self.ctx
-            .funding_manager
-            .update_funding(change_utxo.clone())?;
-
         Ok(Some(change_utxo))
     }
 
