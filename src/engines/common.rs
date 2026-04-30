@@ -163,9 +163,7 @@ impl EngineContext {
                 }
                 if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
                     if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
-                        if let TxKind::Speedup(ref mut k) = replaced.kind {
-                            k.context_mut().replaced_by = Some(txid);
-                        }
+                        replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
                         self.storage.update_tx(&replaced)?;
                     }
                 }

@@ -92,31 +92,6 @@ pub enum SpeedupKind {
     },
 }
 
-impl SpeedupKind {
-    //TODO: move to helper.rs
-    pub fn context(&self) -> &SpeedupContext {
-        match self {
-            SpeedupKind::CPFP { context, .. } | SpeedupKind::RBF { context, .. } => context,
-        }
-    }
-
-    pub fn context_mut(&mut self) -> &mut SpeedupContext {
-        match self {
-            SpeedupKind::CPFP { context, .. } | SpeedupKind::RBF { context, .. } => context,
-        }
-    }
-
-    pub fn is_rbf(&self) -> bool {
-        matches!(self, SpeedupKind::RBF { .. })
-    }
-
-    pub fn parents(&self) -> &[Txid] {
-        match self {
-            SpeedupKind::CPFP { parents, .. } => parents,
-            SpeedupKind::RBF { .. } => &[],
-        }
-    }
-}
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum CoordinatorNews {

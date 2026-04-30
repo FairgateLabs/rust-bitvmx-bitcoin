@@ -27,4 +27,7 @@ pub enum BitcoinCoordinatorError {
 
     #[error("Internal error (programmer bug): {0}")]
     Internal(String),
+
+    #[error("Invariant violation: {0}")]
+    InvariantViolation(String),
 }

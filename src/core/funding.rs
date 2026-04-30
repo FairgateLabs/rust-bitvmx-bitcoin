@@ -6,7 +6,7 @@ use tracing::warn;
 use crate::{
     config::config::FundingSettings,
     errors::BitcoinCoordinatorError,
-    types::{CoordinatedTx, CoordinatorNews, TransactionState, TxKind},
+    types::{CoordinatedTx, CoordinatorNews, TransactionState},
 };
 
 const FUNDING_KEY: &str = "bitcoin_coordinator/funding/utxo";
@@ -67,23 +67,22 @@ impl FundingManager {
             ) {
                 continue;
             }
-            if let TxKind::Speedup(k) = &tx.kind {
-                if let Some(out) = tx.tx.output.last() {
-                    let amount = out.value.to_sat();
-                    if amount >= self.settings.min_funding_amount_sats {
-                        let vout = tx.tx.output.len().saturating_sub(1) as u32;
-                        return Ok(Some(Utxo::new(
-                            tx.txid,
-                            vout,
-                            amount,
-                            &k.context().funding_input.pub_key,
-                        )));
-                    }
+            let k = tx.speedup_kind()?;
+            if let Some(out) = tx.tx.output.last() {
+                let amount = out.value.to_sat();
+                if amount >= self.settings.min_funding_amount_sats {
+                    let vout = tx.tx.output.len().saturating_sub(1) as u32;
+                    return Ok(Some(Utxo::new(
+                        tx.txid,
+                        vout,
+                        amount,
+                        &k.context().funding_input.pub_key,
+                    )));
                 }
-                // Chain tip is live but unusable (amount too small or no output).
-                // Older live txs are already spent — stop Pass 1.
-                break;
             }
+            // Chain tip is live but unusable (amount too small or no output).
+            // Older live txs are already spent — stop Pass 1.
+            break;
         }
         // Pass 2: stored UTXO (last finalized chain output, or user-provided funding)
         self.get_base_funding()
@@ -96,8 +95,8 @@ impl FundingManager {
 
     /// Overwrite the funding UTXO without validation. Just for 'Finalized' txs.
     ///
-    /// Used to update the last 'Finalized' speedup UTXO, so if the transaction is
-    /// evicted after finalization, the coordinator can fall back to this UTXO
+    // Only updated at Finalized (not InMempool) so get_base_funding() always
+    // holds a confirmed UTXO and is resilient to mempool evictions/reorgs.
     pub fn update_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
         self.storage.set(FUNDING_KEY, &utxo, None)?;
         Ok(())

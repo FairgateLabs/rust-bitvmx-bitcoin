@@ -1,8 +1,110 @@
-use crate::types::{
-    CoordinatedTx, News,
-    TransactionState::{self, *},
+use crate::{
+    core::dispatcher::DispatchOutcome,
+    errors::BitcoinCoordinatorError,
+    types::{
+        CoordinatedTx, News, SpeedupContext, SpeedupKind,
+        TransactionState::{self, *},
+        TxKind,
+    },
 };
+use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
+
+impl SpeedupKind {
+    pub fn context(&self) -> &SpeedupContext {
+        match self {
+            SpeedupKind::CPFP { context, .. } | SpeedupKind::RBF { context, .. } => context,
+        }
+    }
+
+    pub fn context_mut(&mut self) -> &mut SpeedupContext {
+        match self {
+            SpeedupKind::CPFP { context, .. } | SpeedupKind::RBF { context, .. } => context,
+        }
+    }
+
+    pub fn is_rbf(&self) -> bool {
+        matches!(self, SpeedupKind::RBF { .. })
+    }
+
+    pub fn parents(&self) -> &[Txid] {
+        match self {
+            SpeedupKind::CPFP { parents, .. } => parents,
+            SpeedupKind::RBF { .. } => &[],
+        }
+    }
+}
+
+impl CoordinatedTx {
+    /// Returns `&SpeedupKind` or `InvariantViolation` if this tx is not a Speedup.
+    pub fn speedup_kind(&self) -> Result<&SpeedupKind, BitcoinCoordinatorError> {
+        match &self.kind {
+            TxKind::Speedup(k) => Ok(k),
+            _ => Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "expected Speedup, got {:?} for tx {}",
+                self.kind, self.txid
+            ))),
+        }
+    }
+
+    /// Mutable variant of `speedup_kind`.
+    pub fn speedup_kind_mut(&mut self) -> Result<&mut SpeedupKind, BitcoinCoordinatorError> {
+        let txid = self.txid;
+        match &mut self.kind {
+            TxKind::Speedup(k) => Ok(k),
+            _ => Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "expected Speedup (mut) for tx {}",
+                txid
+            ))),
+        }
+    }
+
+    /// Returns the last output and its vout index, or `InvariantViolation` if there are no outputs.
+    pub fn last_output(&self) -> Result<(&bitcoin::TxOut, u32), BitcoinCoordinatorError> {
+        match self.tx.output.last() {
+            Some(out) => Ok((out, (self.tx.output.len() - 1) as u32)),
+            None => Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "tx {} has no outputs",
+                self.txid
+            ))),
+        }
+    }
+}
+
+/// Validates that `results` contains exactly one entry with a txid matching `expected_txid`.
+pub fn verify_single_dispatch_result(
+    expected_txid: Txid,
+    results: Vec<(Txid, DispatchOutcome)>,
+) -> Result<(Txid, DispatchOutcome), BitcoinCoordinatorError> {
+    if results.len() != 1 {
+        return Err(BitcoinCoordinatorError::InvariantViolation(format!(
+            "dispatch returned {} results for single tx {}",
+            results.len(),
+            expected_txid
+        )));
+    }
+    let result = results.into_iter().next().unwrap();
+    if result.0 != expected_txid {
+        return Err(BitcoinCoordinatorError::InvariantViolation(format!(
+            "dispatch returned txid {} but expected {}",
+            result.0, expected_txid
+        )));
+    }
+    Ok(result)
+}
+
+/// Finds a tx by txid in a dispatch batch, or returns `InvariantViolation`.
+pub fn find_tx_in_batch<'a>(
+    txs: &'a [CoordinatedTx],
+    txid: Txid,
+) -> Result<&'a CoordinatedTx, BitcoinCoordinatorError> {
+    txs.iter().find(|t| t.txid == txid).ok_or_else(|| {
+        BitcoinCoordinatorError::InvariantViolation(format!(
+            "dispatcher returned txid {} not present in dispatch batch",
+            txid
+        ))
+    })
+}
 
 impl TransactionState {
     /// Returns `true` when transitioning from `self` to `next` is a valid

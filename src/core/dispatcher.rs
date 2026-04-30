@@ -109,33 +109,6 @@ impl Dispatcher {
 
         (valid, failures)
     }
-
-    //     /// Group `txs` (already weight-validated) into batches whose cumulative
-    //     /// weight stays within `max_tx_weight`.
-    //     fn build_batches(&self, txs: Vec<Transaction>) -> Vec<Vec<Transaction>> {
-    //         let mut batches = Vec::new();
-    //         let mut current_batch = Vec::new();
-    //         let mut current_weight = 0u64;
-
-    //         for tx in txs {
-    //             let weight = tx.weight().to_wu();
-
-    //             if current_weight + weight > self.settings.max_tx_weight {
-    //                 batches.push(current_batch);
-    //                 current_batch = Vec::new();
-    //                 current_weight = 0;
-    //             }
-
-    //             current_weight += weight;
-    //             current_batch.push(tx);
-    //         }
-
-    //         if !current_batch.is_empty() {
-    //             batches.push(current_batch);
-    //         }
-
-    //         batches
-    //     }
 }
 
 /// Map a raw Bitcoin RPC error message to a [`DispatchOutcome`].

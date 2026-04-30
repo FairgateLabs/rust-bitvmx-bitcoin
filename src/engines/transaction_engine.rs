@@ -3,6 +3,7 @@ use std::rc::Rc;
 use crate::{
     engines::common::EngineContext,
     errors::BitcoinCoordinatorError,
+    helper::find_tx_in_batch,
     types::{CoordinatedTx, CoordinatorNews, TransactionState, TxKind},
 };
 use bitcoin::Transaction;
@@ -178,10 +179,7 @@ impl TransactionEngine {
         let mut dispatched = Vec::new();
 
         for (txid, outcome) in results {
-            let tx = match txs.iter().find(|t| t.txid == txid) {
-                Some(t) => t,
-                None => continue, //TODO: handle this error case more robustly
-            };
+            let tx = find_tx_in_batch(&txs, txid)?;
             let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&tx.tx, fee_rate);
             if self
                 .ctx

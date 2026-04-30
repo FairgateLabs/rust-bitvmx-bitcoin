@@ -16,6 +16,7 @@ use crate::{
     },
     engines::common::EngineContext,
     errors::BitcoinCoordinatorError,
+    helper::verify_single_dispatch_result,
     types::{
         CoordinatedTx, CoordinatorNews, FeeInfo, SpeedupContext, SpeedupKind, TransactionState,
         TxKind,
@@ -307,6 +308,7 @@ impl SpeedupEngine {
                 tx.state,
                 TransactionState::InMempool | TransactionState::Confirmed
             ) {
+                // Nothing to review until the tx is broadcast, finalized, or evicted.
                 continue;
             }
 
@@ -320,13 +322,7 @@ impl SpeedupEngine {
                 continue;
             }
 
-            let context = match &tx.kind {
-                TxKind::Speedup(k) => k.context(),
-                _ => {
-                    tracing::warn!(txid = %tx.txid, "non-speedup tx in speedup list; skipping"); //TODO: handle this error case more robustly
-                    continue;
-                }
-            };
+            let context = tx.speedup_kind()?.context();
 
             if status.is_not_found() {
                 if context.is_being_replaced() {
@@ -340,27 +336,17 @@ impl SpeedupEngine {
 
             if status.is_finalized(max_confs) {
                 self.ctx.handle_finalized(tx.txid, current_height)?;
-                if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
-                    self.ctx.monitor.cancel(TypesToMonitor::Transactions(
-                        vec![*replaces],
-                        tx.context.clone(),
-                        None,
-                    ))?;
-                }
+                self.remove_replaced_rbf(tx, current_height)?;
+
                 // Advance base funding to the last finalized on-chain change output.
-                // Only updated at Finalized (not InMempool) so get_base_funding() always
-                // holds a confirmed UTXO and is resilient to mempool evictions/reorgs.
-                if let TxKind::Speedup(k) = &tx.kind {
-                    if let Some(out) = tx.tx.output.last() {
-                        let vout = tx.tx.output.len().saturating_sub(1) as u32;
-                        self.ctx.funding_manager.update_funding(Utxo::new(
-                            tx.txid,
-                            vout,
-                            out.value.to_sat(),
-                            &k.context().funding_input.pub_key,
-                        ))?;
-                    }
-                }
+                let k = tx.speedup_kind()?;
+                let (out, vout) = tx.last_output()?;
+                self.ctx.funding_manager.update_funding(Utxo::new(
+                    tx.txid,
+                    vout,
+                    out.value.to_sat(),
+                    &k.context().funding_input.pub_key,
+                ))?;
                 continue;
             }
 
@@ -536,17 +522,45 @@ impl SpeedupEngine {
         current_height: BlockHeight,
     ) -> Result<bool, BitcoinCoordinatorError> {
         let results = self.ctx.dispatcher.dispatch(vec![tx.tx.clone()]);
-        // TODO: check that vec length is 1 and txid matches expected: if not unexpected error
-        for (txid, outcome) in results {
-            return self.ctx.handle_dispatch_result(
-                tx,
-                txid,
-                outcome,
-                current_height,
-                tx.fee_info.clone(),
-            );
+        let (txid, outcome) = verify_single_dispatch_result(tx.txid, results)?;
+        self.ctx
+            .handle_dispatch_result(tx, txid, outcome, current_height, tx.fee_info.clone())
+    }
+
+    /// Remove any replaced by RBF transactions from monitoring and mark them as failed
+    fn remove_replaced_rbf(
+        &self,
+        tx: &CoordinatedTx,
+        current_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
+            let mut current_id = *replaces;
+            loop {
+                let next_id =
+                    self.ctx
+                        .storage
+                        .get_tx_by_id(current_id)?
+                        .and_then(|prev| match &prev.kind {
+                            TxKind::Speedup(SpeedupKind::RBF {
+                                replaces: older, ..
+                            }) => Some(*older),
+                            _ => None,
+                        });
+                self.ctx.monitor.cancel(TypesToMonitor::Transactions(
+                    vec![current_id],
+                    tx.context.clone(),
+                    None,
+                ))?;
+                self.ctx
+                    .storage
+                    .settle_tx(current_id, TransactionState::Failed, current_height)?;
+                match next_id {
+                    Some(older) => current_id = older,
+                    None => break,
+                }
+            }
         }
-        Ok(false)
+        Ok(())
     }
 }
 
