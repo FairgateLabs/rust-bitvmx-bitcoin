@@ -69,6 +69,16 @@ impl CoordinatedTx {
             ))),
         }
     }
+
+    pub fn verify_tx_id(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        if self.txid != txid {
+            return Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "expected txid {}, got {}",
+                txid, self.txid
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// Validates that `results` contains exactly one entry with a txid matching `expected_txid`.

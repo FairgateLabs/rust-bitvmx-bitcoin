@@ -156,6 +156,7 @@ impl EngineContext {
         current_height: BlockHeight,
         fee_info: FeeInfo,
     ) -> Result<bool, BitcoinCoordinatorError> {
+        tx.verify_tx_id(txid)?; // sanity check
         match outcome {
             DispatchOutcome::Success | DispatchOutcome::AlreadyKnown => {
                 if matches!(outcome, DispatchOutcome::AlreadyKnown) {

@@ -360,6 +360,7 @@ impl SpeedupEngine {
             }
         }
 
+        // Phase 2: dispatch all pending `ToDispatch` speedups in order.
         let pending: Vec<CoordinatedTx> = self
             .ctx
             .storage
@@ -370,7 +371,7 @@ impl SpeedupEngine {
         let pending = self.ctx.apply_retry_rate_limit(pending);
         for tx in &pending {
             if !self.dispatch_speedup(tx, current_height)? {
-                break;
+                break; // stop on first failure to preserve funding-UTXO chain ordering
             }
         }
 
