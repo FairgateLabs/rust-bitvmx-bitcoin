@@ -5,41 +5,13 @@ use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
-    types::{AckMonitorNews, MonitorNews, TypesToMonitor},
+    types::{MonitorNews, TypesToMonitor},
 };
 use rust_bitvmx_bitcoin::{
     config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
-    types::{AckNews, CoordinatorNews, News, TransactionState},
+    types::{AckNews, CoordinatorNews, TransactionState},
 };
 use tracing::info;
-
-// =============================================================================
-// Helper: context string for tests
-// =============================================================================
-
-fn ctx(label: &str) -> String {
-    format!("test_ctx:{}", label)
-}
-
-/// Ack every item in `news` so it is not returned again.
-fn ack_all_news(coordinator: &rust_bitvmx_bitcoin::coordinator::BitcoinCoordinator, news: &News) {
-    for n in &news.monitor_news {
-        let ack = match n {
-            MonitorNews::Transaction(t, _, ctx) => AckMonitorNews::Transaction(*t, ctx.clone()),
-            MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
-            MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
-                AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
-            }
-            MonitorNews::RskPeginTransaction(t, _) => AckMonitorNews::RskPeginTransaction(*t),
-        };
-        coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
-    }
-    for n in &news.coordinator_news {
-        coordinator
-            .ack_news(AckNews::Coordinator(n.clone()))
-            .unwrap();
-    }
-}
 
 // =============================================================================
 // HAPPY PATH TESTS

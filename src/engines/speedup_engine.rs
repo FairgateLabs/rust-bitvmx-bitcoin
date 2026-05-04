@@ -8,6 +8,7 @@ use protocol_builder::{
     builder::ProtocolBuilder,
     types::{output::SpeedupData, Utxo},
 };
+use tracing::info;
 
 use crate::{
     config::{
@@ -505,6 +506,15 @@ impl SpeedupEngine {
         };
 
         self.ctx.storage.insert_speedup(record.clone())?;
+        match record.speedup_kind()? {
+            SpeedupKind::RBF { replaces, .. } => {
+                info!("Built RBF replacing {} | Txid({})", replaces, record.txid)
+            }
+            SpeedupKind::CPFP { parents, .. } => info!(
+                "Built CPFP for parents {:?} | Txid({})",
+                parents, record.txid
+            ),
+        }
         self.ctx.monitor.monitor(
             TypesToMonitor::Transactions(vec![txid], ctx_str.to_string(), None),
             false,

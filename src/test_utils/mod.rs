@@ -1,3 +1,4 @@
+use super::types::{CoordinatedTx, FeeInfo, SpeedupContext, SpeedupKind, TransactionState, TxKind};
 use bitcoin::{
     absolute::LockTime,
     hashes::{sha256d, Hash},
@@ -89,6 +90,49 @@ pub fn dummy_key_manager() -> Rc<KeyManager> {
 pub fn utxo(amount: u64) -> Utxo {
     let txid = Txid::from_raw_hash(sha256d::Hash::hash(amount.to_le_bytes().as_ref()));
     Utxo::new(txid, 0, amount, &dummy_pubkey())
+}
+
+/// Minimal `CoordinatedTx` with `TxKind::Normal` and `ToDispatch` state.
+/// `seed` determines a unique deterministic txid.
+pub fn normal_coordinated_tx(seed: u8) -> CoordinatedTx {
+    let txid = Txid::from_raw_hash(sha256d::Hash::hash(&[seed; 32]));
+    CoordinatedTx {
+        txid,
+        tx: dummy_tx(),
+        kind: TxKind::Normal,
+        state: TransactionState::ToDispatch,
+        broadcast_block_height: None,
+        target_block_height: 0,
+        stuck_in_mempool_blocks: None,
+        confirmation_trigger: None,
+        settled_block_height: None,
+        retry_count: 0,
+        fee_info: FeeInfo {
+            fee: 0,
+            fee_rate: 1,
+            weight: 0,
+        },
+        context: String::new(),
+    }
+}
+
+/// `CoordinatedTx` with `TxKind::Speedup(CPFP)` and `InMempool` state.
+/// `fee_rate` is stored in `fee_info` so callers can drive fee-diff tests.
+pub fn cpfp_coordinated_tx(seed: u8, fee_rate: u64) -> CoordinatedTx {
+    let txid = Txid::from_raw_hash(sha256d::Hash::hash(&[seed; 32]));
+    let mut tx = normal_coordinated_tx(seed);
+    tx.kind = TxKind::Speedup(SpeedupKind::CPFP {
+        parents: vec![],
+        context: SpeedupContext {
+            funding_input: Utxo::new(txid, 0, 100_000, &dummy_pubkey()),
+            replaced_by: None,
+            bump_fee_used: 1.0,
+            parent_data: vec![],
+        },
+    });
+    tx.state = TransactionState::InMempool;
+    tx.fee_info.fee_rate = fee_rate;
+    tx
 }
 
 // =============================================================================

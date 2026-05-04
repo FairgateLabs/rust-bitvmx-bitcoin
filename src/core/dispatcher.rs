@@ -2,6 +2,7 @@ use crate::{config::config::DispatcherSettings, types::CoordinatedTx};
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use std::rc::Rc;
+use tracing::info;
 
 /// Typed outcome returned per-transaction by [`Dispatcher::dispatch`].
 #[derive(Debug)]
@@ -68,7 +69,10 @@ impl Dispatcher {
         for tx in valid_txs {
             let txid = tx.compute_txid();
             let outcome = match self.bitcoin_client.send_transaction(&tx) {
-                Ok(_) => DispatchOutcome::Success,
+                Ok(_) => {
+                    info!("Successfully dispatched transaction {}", txid);
+                    DispatchOutcome::Success
+                }
                 Err(e) => classify_error(&e.to_string()),
             };
             results.push((txid, outcome));
@@ -228,44 +232,4 @@ mod tests {
 
         bitcoind.stop().unwrap();
     }
-
-    // -- build_batches --------------------------------------------------------
-
-    // #[test]
-    // fn test_build_batches_single_tx() {
-    //     let tx = empty_tx();
-    //     let weight = tx.weight().to_wu();
-    //     let (d, bitcoind) = dispatcher(weight * 10);
-    //     let batches = d.build_batches(vec![tx]);
-    //     assert_eq!(batches.len(), 1);
-    //     assert_eq!(batches[0].len(), 1);
-
-    //     drop(d);
-    //     bitcoind.stop().unwrap();
-    // }
-
-    // #[test]
-    // fn test_build_batches_splits_when_overweight() {
-    //     let tx1 = empty_tx();
-    //     let tx2 = empty_tx();
-    //     let weight = tx1.weight().to_wu();
-    //     let (d, bitcoind) = dispatcher(weight); // max fits exactly one tx per batch
-    //     let batches = d.build_batches(vec![tx1, tx2]);
-    //     assert_eq!(batches.len(), 2);
-    //     assert_eq!(batches[0].len(), 1);
-    //     assert_eq!(batches[1].len(), 1);
-
-    //     drop(d);
-    //     bitcoind.stop().unwrap();
-    // }
-
-    // #[test]
-    // fn test_build_batches_empty_input() {
-    //     let (d, bitcoind) = dispatcher(400_000);
-    //     let batches = d.build_batches(vec![]);
-    //     assert!(batches.is_empty());
-
-    //     drop(d);
-    //     bitcoind.stop().unwrap();
-    // }
 }
