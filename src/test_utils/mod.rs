@@ -22,28 +22,28 @@ use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
 pub fn init_trace() {
-    let default_modules = [
-        "info",
-        "libp2p=off",
-        "bitvmx_transaction_monitor=debug",
-        "bitcoin_indexer=debug",
-        "bitcoin_rpc=debug",
-        "bitcoin_client=debug",
-        "p2p_protocol=off",
-        "p2p_handler=off",
-        "tarpc=off",
-        "key_manager=off",
-        "memory=off",
-    ];
+    // let default_modules = [
+    //     "info",
+    //     "libp2p=off",
+    //     "bitvmx_transaction_monitor=debug",
+    //     "bitcoin_indexer=debug",
+    //     "bitcoin_rpc=debug",
+    //     "bitcoin_client=debug",
+    //     "p2p_protocol=off",
+    //     "p2p_handler=off",
+    //     "tarpc=off",
+    //     "key_manager=off",
+    //     "memory=off",
+    // ];
 
-    let filter = EnvFilter::builder()
-        .parse(default_modules.join(","))
-        .expect("Invalid filter");
+    // let filter = EnvFilter::builder()
+    //     .parse(default_modules.join(","))
+    //     .expect("Invalid filter");
 
-    let _ = tracing_subscriber::fmt()
-        .with_target(true)
-        .with_env_filter(filter)
-        .try_init();
+    // let _ = tracing_subscriber::fmt()
+    //     .with_target(true)
+    //     .with_env_filter(filter)
+    //     .try_init();
 }
 
 pub fn generate_random_string() -> String {

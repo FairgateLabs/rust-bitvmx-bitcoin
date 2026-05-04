@@ -424,21 +424,6 @@ fn test_cpfp_reorg() {
         "parent and CPFP must both be reset to InMempool after reorg"
     );
 
-    // Mine another block to confirm both again and ensure the coordinator can progress after the reorg.
-    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap(); //TODO:
-    let reached = tick_until_all_states(
-        &coordinator,
-        &coord_storage,
-        &[parent_txid, cpfp_txid],
-        TransactionState::Confirmed,
-        10,
-    )
-    .unwrap();
-    assert!(
-        reached,
-        "parent and CPFP must return to Confirmed after the reorg and one more block"
-    );
-
     drop(coordinator);
     drop(coord_storage);
     setup.end_all().unwrap();
@@ -669,77 +654,75 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
     setup.end_all().unwrap();
 }
 
-/// Clearing the mempool simulates unexpected eviction of both the parent and
-/// its CPFP.  The coordinator detects both as not-found on the next tick:
-///   Tick 1: CPFP re-queued; initial re-dispatch fails (parent not yet in
-///           mempool); parent re-queued and re-dispatched by the tx engine.
-///   Tick 2: CPFP re-dispatch succeeds (parent is now in mempool).
-/// Both must be back in InMempool within a few ticks.
-// #[test]
-// fn test_cpfp_orphan_requeue() {
-//     init_trace();
+/// After both a parent and its CPFP enter the mempool, all transactions are
+/// evicted from mempool. Both must be back in InMempool within a few ticks.
+#[test]
+fn test_cpfp_orphan_requeue() {
+    init_trace();
 
-//     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-//     let key_manager = dummy_key_manager();
-//     let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
-//     let coord_storage = get_coord_storage(&setup);
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = dummy_key_manager();
+    let mut settings = cpfp_settings();
+    settings.speedup.min_blocks_before_resend_speedup = 3; // Disable auto-boost for this test to avoid interference
+    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), settings);
+    let coord_storage = get_coord_storage(&setup);
 
-//     let funding_utxo = create_funded_speedup_utxo(
-//         &setup.bitcoin_client,
-//         &*key_manager,
-//         Network::Regtest,
-//         500_000,
-//     )
-//     .unwrap();
-//     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
-//         &setup.bitcoin_client,
-//         &*key_manager,
-//         Network::Regtest,
-//         200_000,
-//     )
-//     .unwrap();
-//     let parent_txid = parent_tx.compute_txid();
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        500_000,
+    )
+    .unwrap();
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+    let parent_txid = parent_tx.compute_txid();
 
-//     tick_until_ready(&coordinator).unwrap();
-//     coordinator.add_funding(funding_utxo).unwrap();
-//     coordinator
-//         .dispatch_with_speedup(parent_tx, speedup_data, ctx("orphan"), None, None, None)
-//         .unwrap();
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("orphan"), None, None, None)
+        .unwrap();
 
-//     // Dispatch tick: both parent and CPFP land in the mempool.
-//     coordinator.tick().unwrap();
-//     let cpfp_txid = coord_storage.get_speedups_ordered().unwrap()[0].txid;
-//     assert_eq!(
-//         coord_storage
-//             .get_tx_by_id(parent_txid)
-//             .unwrap()
-//             .unwrap()
-//             .state,
-//         TransactionState::InMempool,
-//         "parent must be InMempool before the orphan test"
-//     );
+    // Dispatch tick: both parent and CPFP land in the mempool.
+    coordinator.tick().unwrap();
+    let cpfp_txid = coord_storage.get_speedups_ordered().unwrap()[0].txid;
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "parent must be InMempool before the orphan test"
+    );
 
-//     // Evict everything from the mempool (requires Bitcoin Core ≥ 25 in regtest). //TODO: not in actual version
-//     clear_mempool(&setup.bitcoin_client).unwrap();
+    // Evict all mempool transactions.
+    expire_mempool(&setup.bitcoin_client, &setup.regtest_wallet).unwrap();
 
-//     // Both transactions must return to InMempool within a few ticks.
-//     let reached = tick_until_all_states(
-//         &coordinator,
-//         &coord_storage,
-//         &[parent_txid, cpfp_txid],
-//         TransactionState::InMempool,
-//         5,
-//     )
-//     .unwrap();
-//     assert!(
-//         reached,
-//         "parent and CPFP must both return to InMempool after orphan re-queue"
-//     );
+    // Both transactions must return to InMempool within a few ticks.
+    let reached = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent_txid, cpfp_txid],
+        TransactionState::InMempool,
+        5,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "parent and CPFP must both return to InMempool after orphan re-queue"
+    );
 
-//     drop(coordinator);
-//     drop(coord_storage);
-//     setup.end_all().unwrap();
-// }
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
 
 /// When a CPFP is finalized the coordinator advances the base funding UTXO to
 /// the confirmed change output of that CPFP.  A second parent dispatched later

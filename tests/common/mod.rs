@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 include!("../../src/test_utils/mod.rs");
 use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
 pub use rust_bitvmx_bitcoin::types;
@@ -402,6 +403,30 @@ pub fn tick_until_all_states(
     Ok(false)
 }
 
+/// Evict all transactions from the mempool by advancing the node's mock clock
+/// past the default 336-hour mempool expiry window
+pub fn expire_mempool(bitcoin_client: &BitcoinClient, address: &Address) -> anyhow::Result<()> {
+    let best_hash = bitcoin_client
+        .client
+        .get_best_block_hash()
+        .map_err(|e| anyhow::anyhow!("get_best_block_hash failed: {:?}", e))?;
+    let header = bitcoin_client
+        .client
+        .get_block_header_info(&best_hash)
+        .map_err(|e| anyhow::anyhow!("get_block_header_info failed: {:?}", e))?;
+    // Jump past the Bitcoin Core default mempoolexpiry of 336 hours.
+    let eviction_time = header.time as i64 + 336 * 3600 + 1;
+    bitcoin_client
+        .client
+        .call::<serde_json::Value>(
+            "setmocktime", //TODO: abstract this behind a `set_mock_time` method on `BitcoinClient`
+            &[serde_json::Value::Number(eviction_time.into())],
+        )
+        .map_err(|e| anyhow::anyhow!("setmocktime failed: {:?}", e))?;
+    // Connecting a new block triggers expiry.
+    mine_empty_blocks(bitcoin_client, 1, address)
+}
+
 /// Mine `n` blocks that contain no mempool transactions.
 pub fn mine_empty_blocks(
     bitcoin_client: &BitcoinClient,
@@ -423,17 +448,6 @@ pub fn mine_empty_blocks(
     }
     Ok(())
 }
-
-//TODO: not in actual version
-// /// Remove all transactions from the node's mempool (requires Bitcoin Core ≥ 25,
-// /// regtest only).  Used to simulate mempool eviction / orphan scenarios.
-// pub fn clear_mempool(bitcoin_client: &BitcoinClient) -> anyhow::Result<()> {
-//     bitcoin_client
-//         .client
-//         .call::<serde_json::Value>("clearmempool", &[])
-//         .map_err(|e| anyhow::anyhow!("clearmempool failed: {:?}", e))?;
-//     Ok(())
-// }
 
 pub fn ctx(label: &str) -> String {
     format!("test_ctx:{}", label)
