@@ -334,6 +334,19 @@ fn build_signed_p2wpkh_tx(
 // Tests
 // =============================================================================
 
+#[test]
+#[ignore]
+fn test_rpc_connection() {
+    init_trace();
+    let client = BitcoinClient::new_from_config(&testnet_rpc_config())
+        .expect("failed to connect to testnet RPC");
+    let block_count = client
+        .client
+        .get_block_count()
+        .expect("failed to get block count");
+    info!("Successfully connected to testnet RPC. Current block count: {block_count}");
+}
+
 /// Generates a fresh P2WPKH key and writes `tests/testnet_local.yaml` with the
 /// secret pre-filled. Fund the printed address via a faucet, then edit the
 /// txid/vout/amount_sats fields and run `test_dispatch_transaction`.
