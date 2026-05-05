@@ -59,3 +59,6 @@ pub const DEFAULT_MIN_NETWORK_FEE_RATE: u64 = 1;
 
 // Maximum RBF fee percentage
 pub const MAX_RBF_FEE_PERCENTAGE: f64 = 3.0;
+
+// Maximum block confirmations to track after reaching finalized or failed state
+pub const MAX_TRACKING_CONFIRMATIONS: u32 = 10;

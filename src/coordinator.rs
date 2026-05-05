@@ -1,11 +1,13 @@
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use bitcoin::{Transaction, Txid};
-use bitvmx_bitcoin_rpc::{rpc_config::RpcConfig, types::BlockHeight};
+use bitvmx_bitcoin_rpc::{
+    bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
+};
 use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor, TransactionStatus};
 use protocol_builder::types::Utxo;
 use storage_backend::storage::Storage;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::config::{BitcoinSettings, CoordinatorSettings},
@@ -17,6 +19,7 @@ use crate::{
         storage::CoordinatorStorage,
     },
     errors::BitcoinCoordinatorError,
+    helper::now_secs,
     types::{AckNews, CoordinatedTx, CoordinatorNews, News, TransactionState, TxKind},
 };
 
@@ -32,6 +35,7 @@ pub struct BitcoinCoordinator {
     funding_manager: FundingManager,
 
     settings: CoordinatorSettings,
+    last_retry_at: Cell<Option<u64>>, // Timestamp of last retry attempt, for rate-limiting retries
 }
 
 impl BitcoinCoordinator {
@@ -44,12 +48,13 @@ impl BitcoinCoordinator {
         let settings = settings.unwrap_or_default();
         settings.validate()?;
 
+        let bitcoin_client = Rc::new(BitcoinClient::new_from_config(rpc_config)?);
+
         // All modules share the same underlying Storage via Rc clones.
         let monitor = Monitor::new_with_paths(rpc_config, storage.clone(), Some(settings.monitor))?;
         let funding_manager = FundingManager::new(settings.funding, storage.clone());
-        let coordinator_storage = CoordinatorStorage::new(storage);
-
-        let dispatcher = Dispatcher::new(settings.dispatcher);
+        let coordinator_storage = CoordinatorStorage::new(storage, settings.storage);
+        let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client);
         let fee_engine = FeeEngine::new(settings.fee);
         let speedup_engine = SpeedupEngine::new(settings.speedup);
         let coordinator_settings = settings.coordinator;
@@ -62,6 +67,7 @@ impl BitcoinCoordinator {
             speedup_engine,
             funding_manager,
             settings: coordinator_settings,
+            last_retry_at: Cell::new(None),
         })
     }
 
@@ -100,14 +106,14 @@ impl BitcoinCoordinator {
     /// * `confirmation_trigger` – generate monitor news once the tx reaches
     ///   exactly this many confirmations; `None` for every confirmation.
     /// * `stuck_in_mempool_blocks` – generate `TransactionStuckInMempool` news
-    ///   if the tx has been in the mempool for this many blocks; `0` disables.
+    ///   if the tx has been in the mempool for this many blocks.
     pub fn dispatch_without_speedup(
         &self,
         tx: Transaction,
         context: String,
         target_block_height: Option<BlockHeight>,
         confirmation_trigger: Option<u32>,
-        stuck_in_mempool_blocks: u32,
+        stuck_in_mempool_blocks: Option<u32>,
     ) -> Result<(), BitcoinCoordinatorError> {
         let txid = tx.compute_txid();
         let current_height = self.monitor.get_monitor_height()?;
@@ -118,9 +124,8 @@ impl BitcoinCoordinator {
 
         // Register for confirmation tracking (mempool search disabled until after
         // the tx is actually broadcast, to avoid false positives).
-        let trigger = confirmation_trigger.filter(|&t| t > 0);
         self.monitor.monitor(
-            TypesToMonitor::Transactions(vec![txid], context.clone(), trigger),
+            TypesToMonitor::Transactions(vec![txid], context.clone(), confirmation_trigger),
             false,
         )?;
 
@@ -129,10 +134,11 @@ impl BitcoinCoordinator {
             tx,
             kind: TxKind::Normal,
             state: TransactionState::ToDispatch,
-            broadcast_block_height: 0,
+            broadcast_block_height: None,
             target_block_height: target_height,
             stuck_in_mempool_blocks,
-            confirmation_trigger: confirmation_trigger.unwrap_or(0),
+            confirmation_trigger,
+            settled_block_height: None,
             retry_count: 0,
             fee_info,
             context,
@@ -217,6 +223,10 @@ impl BitcoinCoordinator {
 
     /// Main processing loop: review active txs, then dispatch pending ones.
     fn process_active_transactions(&self) -> Result<(), BitcoinCoordinatorError> {
+        let current_height = self.monitor.get_monitor_height()?;
+
+        self.storage.evict_stale_txs(current_height)?;
+
         let active_txs = self.storage.get_active_txs()?;
 
         if active_txs.is_empty() {
@@ -224,8 +234,6 @@ impl BitcoinCoordinator {
         }
 
         debug!("Processing {} active transactions", active_txs.len());
-
-        let current_height = self.monitor.get_monitor_height()?;
 
         let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
         let mut to_review: Vec<CoordinatedTx> = Vec::new();
@@ -240,7 +248,12 @@ impl BitcoinCoordinator {
                 TransactionState::InMempool | TransactionState::Confirmed => {
                     to_review.push(tx);
                 }
-                _ => {} //TODO: notify error via news, it should never reach here. And remove it?
+                _ => {
+                    error!(
+                        " Inconsistent error: transaction {} in unexpected state {:?}",
+                        tx.txid, tx.state
+                    );
+                }
             }
         }
 
@@ -266,16 +279,30 @@ impl BitcoinCoordinator {
 
         for tx in txs {
             // Only search the mempool after the tx has been broadcast.
-            let search_in_mempool = tx.broadcast_block_height > 0;
+            let search_in_mempool = tx.broadcast_block_height.is_some();
             let status = self.monitor.get_tx_status(&tx.txid, search_in_mempool)?;
 
             if status.is_in_mempool() {
-                if tx.is_stuck_in_mempool(current_height) {
+                if tx.state == TransactionState::Confirmed {
+                    // Tx was reorged out of a block and is back in the mempool.
+                    // Reset to InMempool and refresh the broadcast height so the
+                    // stuck-in-mempool timer does not fire immediately.
+                    debug!(
+                        "Transaction({}) reorged back to mempool — resetting to InMempool",
+                        tx.txid
+                    );
+                    let mut updated = tx.clone();
+                    updated.state = TransactionState::InMempool;
+                    updated.broadcast_block_height = Some(current_height);
+                    self.storage.update_tx(&updated)?;
+                } else if tx.is_stuck_in_mempool(current_height) {
                     warn!(
                         "Transaction({}) stuck in mempool for {} blocks (threshold: {})",
                         tx.txid,
-                        current_height.saturating_sub(tx.broadcast_block_height),
-                        tx.stuck_in_mempool_blocks,
+                        tx.broadcast_block_height
+                            .map(|h| current_height.saturating_sub(h))
+                            .unwrap_or(0),
+                        tx.stuck_in_mempool_blocks.unwrap_or(0),
                     );
                     self.storage
                         .add_news(CoordinatorNews::TransactionStuckInMempool {
@@ -303,7 +330,7 @@ impl BitcoinCoordinator {
                     tx.txid, status.confirmations
                 );
                 self.storage
-                    .update_tx_state(tx.txid, TransactionState::Finalized)?;
+                    .settle_tx(tx.txid, TransactionState::Finalized, current_height)?;
                 continue;
             }
 
@@ -321,6 +348,7 @@ impl BitcoinCoordinator {
                 debug!("Transaction({}) orphaned — keeping InMempool", tx.txid);
                 self.storage
                     .update_tx_state(tx.txid, TransactionState::InMempool)?;
+                continue;
             }
         }
 
@@ -338,8 +366,10 @@ impl BitcoinCoordinator {
             self.storage.add_news(news)?;
         }
 
+        let txs = self.apply_retry_rate_limit(txs);
+
         let raw_txs: Vec<Transaction> = txs.iter().map(|t| t.tx.clone()).collect();
-        let results = self.dispatcher.dispatch(&self.monitor, raw_txs);
+        let results = self.dispatcher.dispatch(raw_txs);
 
         for (txid, outcome) in results {
             let tx = match txs.iter().find(|t| t.txid == txid) {
@@ -369,7 +399,7 @@ impl BitcoinCoordinator {
                             msg
                         );
                         self.storage
-                            .update_tx_state(txid, TransactionState::Failed)?;
+                            .settle_tx(txid, TransactionState::Failed, current_height)?;
                         self.storage.add_news(CoordinatorNews::DispatchError {
                             txid,
                             context: tx.context.clone(),
@@ -392,7 +422,7 @@ impl BitcoinCoordinator {
                         txid, msg
                     );
                     self.storage
-                        .update_tx_state(txid, TransactionState::Failed)?;
+                        .settle_tx(txid, TransactionState::Failed, current_height)?;
                     self.storage.add_news(CoordinatorNews::DispatchError {
                         txid,
                         context: tx.context.clone(),
@@ -416,13 +446,13 @@ impl BitcoinCoordinator {
 
         let mut updated = tx.clone();
         updated.state = TransactionState::InMempool;
-        updated.broadcast_block_height = current_height;
+        updated.broadcast_block_height = Some(current_height);
         updated.fee_info = fee_info;
         self.storage.update_tx(&updated)?;
 
         // Re-register with mempool search enabled so the monitor tracks the tx
         // while it waits for inclusion in a block.
-        let trigger = (tx.confirmation_trigger > 0).then_some(tx.confirmation_trigger);
+        let trigger = tx.confirmation_trigger;
         self.monitor.monitor(
             TypesToMonitor::Transactions(vec![txid], tx.context.clone(), trigger),
             true,
@@ -433,5 +463,31 @@ impl BitcoinCoordinator {
             txid, current_height
         );
         Ok(())
+    }
+
+    /// Filter out retry transactions if the retry interval has not elapsed.
+    fn apply_retry_rate_limit(&self, txs: Vec<CoordinatedTx>) -> Vec<CoordinatedTx> {
+        let retry_ready = match self.last_retry_at.get() {
+            None => true,
+            Some(last) => now_secs().saturating_sub(last) >= self.settings.retry_interval_seconds,
+        };
+        let mut has_retries = false;
+        let filtered: Vec<CoordinatedTx> = txs
+            .into_iter()
+            .filter(|t| {
+                if t.retry_count > 0 {
+                    has_retries = true;
+                    retry_ready
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if has_retries && retry_ready {
+            self.last_retry_at.set(Some(now_secs()));
+        } else if has_retries {
+            debug!("Skipping retry txs — retry interval not elapsed");
+        }
+        filtered
     }
 }

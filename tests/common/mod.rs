@@ -1,17 +1,15 @@
-use bitcoin::{Address, Amount, CompressedPublicKey, Network, PublicKey, Transaction};
+include!("../../src/test_utils/mod.rs");
+
+use bitcoin::{Address, Amount, CompressedPublicKey};
 use bitcoincore_rpc::RpcApi as _;
-use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use rust_bitvmx_bitcoin::{
-    config::config::BitcoinSettings,
+    config::config::{BitcoinSettings, CoordinatorStorageSettings},
     coordinator::BitcoinCoordinator,
     core::storage::CoordinatorStorage,
     errors::BitcoinCoordinatorError,
-    test_utils::{dummy_pubkey, StorageTestConfig, TestBitcoind},
     types::TransactionState,
 };
-use std::rc::Rc;
-use tracing::info;
 
 /// Configuration for creating a test setup
 pub struct TestSetupConfig {
@@ -123,7 +121,10 @@ pub fn create_coordinator_with_settings(
 
 /// Returns a `CoordinatorStorage` view over the test setup's shared storage.
 pub fn get_coord_storage(setup: &TestSetup) -> CoordinatorStorage {
-    setup.storage.get_coordinator_storage()
+    CoordinatorStorage::new(
+        setup.storage.get_raw_storage(),
+        CoordinatorStorageSettings::default(),
+    )
 }
 
 // =============================================================================
@@ -187,7 +188,70 @@ pub fn create_signed_tx_to_dispatch(bitcoin_client: &BitcoinClient) -> anyhow::R
         signed.errors
     );
 
+    //TODO: check if nedded:
+    // Lock the funding UTXO so that subsequent wallet operations (e.g. a
+    // second call to `fund_address`) do not select it as an input while this
+    // transaction is still unbroadcast.  Without this, the wallet sees the
+    // UTXO as available and may spend it in the next `send_to_address` call,
+    // causing this signed-but-unbroadcast transaction to fail with
+    // "bad-txns-inputs-missingorspent" when it is later submitted.
+    bitcoin_client
+        .client
+        .lock_unspent(&[bitcoin::OutPoint::new(funding_txid, funding_vout)])
+        .map_err(|e| anyhow::anyhow!("lock_unspent failed: {:?}", e))?;
+
     // Decode to a `Transaction` (still unbroadcast).
+    let tx = bitcoin::consensus::Decodable::consensus_decode(&mut &signed.hex[..])
+        .map_err(|e| anyhow::anyhow!("consensus_decode failed: {:?}", e))?;
+    Ok(tx)
+}
+
+/// Creates a funded, signed Bitcoin transaction with zero fee.
+/// Identical to [`create_signed_tx_to_dispatch`] except that the full 1 000 000 sat
+/// input is forwarded as output (leaving 0 sats for miners).  
+pub fn create_zero_fee_tx(bitcoin_client: &BitcoinClient) -> anyhow::Result<Transaction> {
+    let wallet_address = bitcoin_client
+        .init_wallet("test_wallet")
+        .map_err(|e| anyhow::anyhow!("init_wallet failed: {:?}", e))?;
+
+    let (funding_tx, funding_vout) = bitcoin_client
+        .fund_address(&wallet_address, Amount::from_sat(1_000_000))
+        .map_err(|e| anyhow::anyhow!("fund_address failed: {:?}", e))?;
+    let funding_txid = funding_tx.compute_txid();
+
+    let recipient = bitcoin_client
+        .client
+        .get_new_address(None, Some(bitcoincore_rpc::json::AddressType::Bech32))
+        .map_err(|e| anyhow::anyhow!("get_new_address failed: {:?}", e))?;
+
+    let inputs = vec![bitcoincore_rpc::json::CreateRawTransactionInput {
+        txid: funding_txid,
+        vout: funding_vout,
+        sequence: None,
+    }];
+    let mut outputs = std::collections::HashMap::new();
+    // Output equals input — leaves exactly 0 sats as fee.
+    outputs.insert(
+        format!("{}", recipient.assume_checked()),
+        Amount::from_sat(1_000_000),
+    );
+
+    let raw_tx = bitcoin_client
+        .client
+        .create_raw_transaction(&inputs, &outputs, None, None)
+        .map_err(|e| anyhow::anyhow!("create_raw_transaction failed: {:?}", e))?;
+
+    let signed = bitcoin_client
+        .client
+        .sign_raw_transaction_with_wallet(&raw_tx, None, None)
+        .map_err(|e| anyhow::anyhow!("sign_raw_transaction_with_wallet failed: {:?}", e))?;
+    anyhow::ensure!(signed.complete, "signing incomplete: {:?}", signed.errors);
+
+    bitcoin_client
+        .client
+        .lock_unspent(&[bitcoin::OutPoint::new(funding_txid, funding_vout)])
+        .map_err(|e| anyhow::anyhow!("lock_unspent failed: {:?}", e))?;
+
     let tx = bitcoin::consensus::Decodable::consensus_decode(&mut &signed.hex[..])
         .map_err(|e| anyhow::anyhow!("consensus_decode failed: {:?}", e))?;
     Ok(tx)

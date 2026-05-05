@@ -36,18 +36,6 @@ impl TransactionState {
     }
 }
 
-impl std::fmt::Display for TransactionState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ToDispatch => write!(f, "ToDispatch"),
-            InMempool => write!(f, "InMempool"),
-            Confirmed => write!(f, "Confirmed"),
-            Finalized => write!(f, "Finalized"),
-            Failed => write!(f, "Failed"),
-        }
-    }
-}
-
 impl CoordinatedTx {
     /// Returns `true` when the transaction is due to be dispatched at `current_height`.
     pub fn is_ready_to_dispatch(&self, current_height: BlockHeight) -> bool {
@@ -57,14 +45,16 @@ impl CoordinatedTx {
     /// Returns `true` when the transaction has been waiting in the mempool for
     /// longer than its `stuck_in_mempool_blocks` threshold.
     ///
-    /// Returns `false` if the threshold is disabled (`stuck_in_mempool_blocks
-    /// == 0`) or if the transaction has not been broadcast yet
-    /// (`broadcast_block_height == 0`).
+    /// Returns `false` if the threshold is disabled (`stuck_in_mempool_blocks`
+    /// is `None`) or if the transaction has not been broadcast yet
+    /// (`broadcast_block_height` is `None`).
     pub fn is_stuck_in_mempool(&self, current_height: BlockHeight) -> bool {
-        self.stuck_in_mempool_blocks > 0
-            && self.broadcast_block_height > 0
-            && current_height.saturating_sub(self.broadcast_block_height)
-                >= self.stuck_in_mempool_blocks
+        match (self.stuck_in_mempool_blocks, self.broadcast_block_height) {
+            (Some(threshold), Some(broadcast)) => {
+                current_height.saturating_sub(broadcast) >= threshold
+            }
+            _ => false,
+        }
     }
 }
 
@@ -73,6 +63,13 @@ impl News {
     pub fn is_empty(&self) -> bool {
         self.monitor_news.is_empty() && self.coordinator_news.is_empty()
     }
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 #[cfg(test)]
@@ -94,10 +91,11 @@ mod tests {
             },
             kind: TxKind::Normal,
             state: ToDispatch,
-            broadcast_block_height: 0,
+            broadcast_block_height: None,
             target_block_height: target,
-            stuck_in_mempool_blocks: 0,
-            confirmation_trigger: 0,
+            stuck_in_mempool_blocks: None,
+            confirmation_trigger: None,
+            settled_block_height: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,
@@ -114,7 +112,7 @@ mod tests {
 
     #[test]
     fn test_is_stuck_in_mempool() {
-        let make_tx = |broadcast: BlockHeight, threshold: u32| CoordinatedTx {
+        let make_tx = |broadcast: Option<BlockHeight>, threshold: Option<u32>| CoordinatedTx {
             txid: Txid::from_raw_hash(sha256d::Hash::hash(&[1u8; 32])),
             tx: Transaction {
                 version: Version::TWO,
@@ -127,7 +125,8 @@ mod tests {
             broadcast_block_height: broadcast,
             target_block_height: 0,
             stuck_in_mempool_blocks: threshold,
-            confirmation_trigger: 0,
+            confirmation_trigger: None,
+            settled_block_height: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,
@@ -138,14 +137,14 @@ mod tests {
         };
 
         // threshold disabled
-        assert!(!make_tx(100, 0).is_stuck_in_mempool(200));
+        assert!(!make_tx(Some(100), None).is_stuck_in_mempool(200));
         // not yet broadcast
-        assert!(!make_tx(0, 10).is_stuck_in_mempool(200));
+        assert!(!make_tx(None, Some(10)).is_stuck_in_mempool(200));
         // below threshold
-        assert!(!make_tx(100, 10).is_stuck_in_mempool(109));
+        assert!(!make_tx(Some(100), Some(10)).is_stuck_in_mempool(109));
         // exactly at threshold
-        assert!(make_tx(100, 10).is_stuck_in_mempool(110));
+        assert!(make_tx(Some(100), Some(10)).is_stuck_in_mempool(110));
         // above threshold
-        assert!(make_tx(100, 10).is_stuck_in_mempool(200));
+        assert!(make_tx(Some(100), Some(10)).is_stuck_in_mempool(200));
     }
 }

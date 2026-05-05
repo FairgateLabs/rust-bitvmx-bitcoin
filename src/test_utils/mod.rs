@@ -1,4 +1,3 @@
-use crate::core::storage::CoordinatorStorage;
 use bitcoin::{
     absolute::LockTime,
     hashes::{sha256d, Hash},
@@ -23,14 +22,10 @@ use uuid::Uuid;
 pub fn init_trace() {
     let default_modules = [
         "info",
-        "libp2p=off",
         "bitvmx_transaction_monitor=debug",
         "bitcoin_indexer=debug",
-        "bitcoin_coordinator=debug",
         "bitcoin_rpc=debug",
         "bitcoin_client=debug",
-        "p2p_protocol=off",
-        "p2p_handler=off",
         "tarpc=off",
         "key_manager=off",
         "memory=off",
@@ -171,10 +166,6 @@ impl StorageTestConfig {
         info!("Initialized test storage at: {}", path);
 
         Self { path, storage }
-    }
-
-    pub fn get_coordinator_storage(&self) -> CoordinatorStorage {
-        CoordinatorStorage::new(Rc::clone(&self.storage))
     }
 
     pub fn get_raw_storage(&self) -> Rc<Storage> {

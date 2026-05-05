@@ -1,8 +1,10 @@
 use bitcoin::Txid;
+use bitvmx_bitcoin_rpc::types::BlockHeight;
 use std::rc::Rc;
 use storage_backend::storage::{KeyValueStore, Storage};
 
 use crate::{
+    config::config::CoordinatorStorageSettings,
     errors::BitcoinCoordinatorError,
     types::{CoordinatedTx, CoordinatorNews, TransactionState},
 };
@@ -11,6 +13,7 @@ const TX_PREFIX: &str = "bitcoin_coordinator";
 
 pub struct CoordinatorStorage {
     pub storage: Rc<Storage>,
+    settings: CoordinatorStorageSettings,
 }
 
 enum StoreKey {
@@ -19,8 +22,8 @@ enum StoreKey {
 }
 
 impl CoordinatorStorage {
-    pub fn new(storage: Rc<Storage>) -> Self {
-        Self { storage }
+    pub fn new(storage: Rc<Storage>, settings: CoordinatorStorageSettings) -> Self {
+        Self { storage, settings }
     }
 
     pub fn insert_tx(&self, tx: CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
@@ -44,7 +47,7 @@ impl CoordinatorStorage {
 
     pub fn remove_tx(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::Tx(tx_id));
-        self.storage.delete(&key)?;
+        self.storage.remove(&key, None)?;
         Ok(())
     }
 
@@ -53,14 +56,14 @@ impl CoordinatorStorage {
         tx_id: Txid,
     ) -> Result<Option<CoordinatedTx>, BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::Tx(tx_id));
-        Ok(self.storage.get(&key)?)
+        Ok(self.storage.get(&key, None)?)
     }
 
     /// Get all the txs, but not in insertion order
     pub fn get_all_txs(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
         let prefix = self.tx_prefix();
 
-        let entries = self.storage.partial_compare(&prefix)?;
+        let entries = self.storage.partial_compare(&prefix, None)?;
 
         let mut txs = Vec::with_capacity(entries.len());
 
@@ -106,11 +109,23 @@ impl CoordinatorStorage {
         Ok(self.get_tx_by_id(tx_id)?.is_some())
     }
 
-    pub fn update_tx_state(
+    fn update_tx_state_impl(
         &self,
         tx_id: Txid,
         new_state: TransactionState,
+        block_height: Option<BlockHeight>,
     ) -> Result<(), BitcoinCoordinatorError> {
+        let is_terminal = matches!(
+            new_state,
+            TransactionState::Finalized | TransactionState::Failed
+        );
+
+        if is_terminal && block_height.is_none() {
+            return Err(BitcoinCoordinatorError::Internal(
+                "settle_tx must be used for terminal states (Finalized/Failed)".to_string(),
+            ));
+        }
+
         let mut tx = match self.get_tx_by_id(tx_id)? {
             Some(tx) => tx,
             None => {
@@ -128,10 +143,44 @@ impl CoordinatorStorage {
             return Ok(());
         }
 
+        if is_terminal {
+            tx.settled_block_height = block_height;
+        }
+
         tx.state = new_state;
         self.update_tx(&tx)?;
 
         Ok(())
+    }
+
+    /// Transition a tx to a non-terminal state (`ToDispatch`, `InMempool`, `Confirmed`).
+    /// Returns an error if called with a terminal state — use `settle_tx` instead.
+    pub fn update_tx_state(
+        &self,
+        tx_id: Txid,
+        new_state: TransactionState,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        self.update_tx_state_impl(tx_id, new_state, None)
+    }
+
+    /// Transition a tx to a terminal state (`Finalized` or `Failed`) and record
+    /// the block height at which it settled.
+    /// Returns an error if called with a non-terminal state — use `update_tx_state` instead.
+    pub fn settle_tx(
+        &self,
+        tx_id: Txid,
+        new_state: TransactionState,
+        block_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        if !matches!(
+            new_state,
+            TransactionState::Finalized | TransactionState::Failed
+        ) {
+            return Err(BitcoinCoordinatorError::Internal(
+                "settle_tx must only be called with Finalized or Failed".to_string(),
+            ));
+        }
+        self.update_tx_state_impl(tx_id, new_state, Some(block_height))
     }
 
     pub fn mark_as_retry(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
@@ -159,39 +208,78 @@ impl CoordinatorStorage {
         Ok(())
     }
 
+    /// Return all transactions that have reached a terminal state (`Finalized` or `Failed`).
+    pub fn get_settled_txs(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        let txs = self.get_all_txs()?;
+        Ok(txs
+            .into_iter()
+            .filter(|tx| {
+                matches!(
+                    tx.state,
+                    TransactionState::Finalized | TransactionState::Failed
+                )
+            })
+            .collect())
+    }
+
+    /// Remove transactions that have been in a terminal state for at least
+    /// `max_tracking_confirmations` blocks, emitting a `TransactionEvicted`
+    /// news item for each one.
+    pub fn evict_stale_txs(
+        &self,
+        current_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let settled = self.get_settled_txs()?;
+        for tx in settled {
+            if let Some(settled_height) = tx.settled_block_height {
+                if current_height.saturating_sub(settled_height)
+                    >= self.settings.max_tracking_confirmations
+                {
+                    self.remove_tx(tx.txid)?;
+                    self.add_news(CoordinatorNews::TransactionEvicted {
+                        txid: tx.txid,
+                        context: tx.context.clone(),
+                    })?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ================================
     //  NEWS
     // ================================
 
+    /// Store `news` if an identical item is not already present.
     pub fn add_news(&self, news: CoordinatorNews) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
+        let mut all: Vec<CoordinatorNews> = self.storage.get(&key, None)?.unwrap_or_default();
 
-        let mut all: Vec<CoordinatorNews> = self.storage.get(&key)?.unwrap_or_default();
+        if all.contains(&news) {
+            return Ok(()); // exact duplicate already stored
+        }
 
         all.push(news);
-
         self.storage.set(&key, &all, None)?;
         Ok(())
     }
 
+    /// Return all pending news items.
     pub fn get_news(&self) -> Result<Vec<CoordinatorNews>, BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        Ok(self.storage.get(&key)?.unwrap_or_default())
+        Ok(self.storage.get(&key, None)?.unwrap_or_default())
     }
 
     pub fn clear_news(&self) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        self.storage.delete(&key)?;
+        self.storage.remove(&key, None)?;
         Ok(())
     }
 
     pub fn ack_news(&self, news: CoordinatorNews) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-
-        let mut all: Vec<CoordinatorNews> = self.storage.get(&key)?.unwrap_or_default();
-
+        let mut all: Vec<CoordinatorNews> = self.storage.get(&key, None)?.unwrap_or_default();
         all.retain(|n| n != &news);
-
         self.storage.set(&key, &all, None)?;
         Ok(())
     }
@@ -217,6 +305,7 @@ impl CoordinatorStorage {
 mod tests {
     use super::*;
     use crate::{
+        config::config::CoordinatorStorageSettings,
         test_utils::StorageTestConfig,
         types::{FeeInfo, TxKind},
     };
@@ -235,10 +324,11 @@ mod tests {
             },
             kind: TxKind::Normal,
             state,
-            broadcast_block_height: 0,
+            broadcast_block_height: None,
             target_block_height: 0,
-            stuck_in_mempool_blocks: 0,
-            confirmation_trigger: 0,
+            stuck_in_mempool_blocks: None,
+            confirmation_trigger: None,
+            settled_block_height: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 1000,
@@ -249,6 +339,13 @@ mod tests {
         }
     }
 
+    fn new_storage(storage_backend: &StorageTestConfig) -> CoordinatorStorage {
+        CoordinatorStorage::new(
+            storage_backend.get_raw_storage(),
+            CoordinatorStorageSettings::default(),
+        )
+    }
+
     fn random_txid() -> Txid {
         use bitcoin::hashes::{sha256d, Hash};
         Txid::from_raw_hash(sha256d::Hash::hash(&rand::random::<[u8; 32]>()))
@@ -257,7 +354,7 @@ mod tests {
     #[test]
     fn test_insert_get_remove_tx() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::ToDispatch);
@@ -278,7 +375,7 @@ mod tests {
     #[test]
     fn test_get_all_txs() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
         let tx1 = dummy_tx(random_txid(), TransactionState::ToDispatch);
         let tx2 = dummy_tx(random_txid(), TransactionState::InMempool);
@@ -296,7 +393,7 @@ mod tests {
     #[test]
     fn test_update_tx_state() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::ToDispatch);
@@ -340,7 +437,7 @@ mod tests {
     #[test]
     fn test_crash_recovery_state_transitions() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
         // InMempool -> Finalized (fast confirmation, skipped Confirmed)
         let txid1 = random_txid();
@@ -348,7 +445,7 @@ mod tests {
             .insert_tx(dummy_tx(txid1, TransactionState::InMempool))
             .unwrap();
         storage
-            .update_tx_state(txid1, TransactionState::Finalized)
+            .settle_tx(txid1, TransactionState::Finalized, 0)
             .unwrap();
         assert!(storage.get_news().unwrap().is_empty());
 
@@ -368,7 +465,7 @@ mod tests {
             .insert_tx(dummy_tx(txid3, TransactionState::ToDispatch))
             .unwrap();
         storage
-            .update_tx_state(txid3, TransactionState::Finalized)
+            .settle_tx(txid3, TransactionState::Finalized, 0)
             .unwrap();
         assert!(storage.get_news().unwrap().is_empty());
 
@@ -379,7 +476,7 @@ mod tests {
     #[test]
     fn test_update_tx_state_not_found() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
         let txid = random_txid();
 
@@ -398,7 +495,7 @@ mod tests {
     #[test]
     fn test_mark_as_retry_success() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
         let txid = random_txid();
         let tx = dummy_tx(txid, TransactionState::InMempool);
@@ -419,7 +516,7 @@ mod tests {
     #[test]
     fn test_add_get_clear_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
         let news_item = CoordinatorNews::TxNotFound {
             txid: random_txid(),
@@ -432,8 +529,7 @@ mod tests {
         assert_eq!(news[0], news_item);
 
         storage.clear_news().unwrap();
-        let news = storage.get_news().unwrap();
-        assert!(news.is_empty());
+        assert!(storage.get_news().unwrap().is_empty());
 
         drop(storage);
         storage_backend.remove().unwrap();
@@ -442,17 +538,16 @@ mod tests {
     #[test]
     fn test_clear_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
-        let news_item = CoordinatorNews::TxNotFound {
-            txid: random_txid(),
-        };
-
-        storage.add_news(news_item).unwrap();
+        storage
+            .add_news(CoordinatorNews::TxNotFound {
+                txid: random_txid(),
+            })
+            .unwrap();
         storage.clear_news().unwrap();
 
-        let news = storage.get_news().unwrap();
-        assert!(news.is_empty());
+        assert!(storage.get_news().unwrap().is_empty());
 
         drop(storage);
         storage_backend.remove().unwrap();
@@ -461,7 +556,7 @@ mod tests {
     #[test]
     fn test_ack_news() {
         let storage_backend = StorageTestConfig::new();
-        let storage = storage_backend.get_coordinator_storage();
+        let storage = new_storage(&storage_backend);
 
         let news_item1 = CoordinatorNews::TxNotFound {
             txid: random_txid(),
@@ -480,6 +575,138 @@ mod tests {
         let news = storage.get_news().unwrap();
         assert_eq!(news.len(), 1);
         assert_eq!(news[0], news_item2);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    // -- add_news dedup -----------------------------------------------------------
+
+    /// Adding the same item multiple times stores it only once.
+    #[test]
+    fn test_add_news_dedup() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let news = CoordinatorNews::FundingNotAvailable;
+
+        storage.add_news(news.clone()).unwrap();
+        storage.add_news(news.clone()).unwrap();
+        storage.add_news(news.clone()).unwrap();
+
+        let returned = storage.get_news().unwrap();
+        assert_eq!(returned.len(), 1);
+
+        // get_news is idempotent — calling it again returns the same items.
+        let returned_again = storage.get_news().unwrap();
+        assert_eq!(returned_again.len(), 1);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// Two distinct items are both stored and always returned together.
+    #[test]
+    fn test_add_news_distinct_items_both_stored() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let item1 = CoordinatorNews::FundingNotAvailable;
+        let item2 = CoordinatorNews::EstimateFeerateTooHigh {
+            estimated_fee_rate: 50,
+            max_fee_rate: 10,
+        };
+
+        storage.add_news(item1.clone()).unwrap();
+        storage.add_news(item2.clone()).unwrap();
+
+        let returned = storage.get_news().unwrap();
+        assert_eq!(returned.len(), 2);
+        assert!(returned.contains(&item1));
+        assert!(returned.contains(&item2));
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// After ack the item is removed; re-adding it makes it visible again.
+    #[test]
+    fn test_ack_then_readd_is_visible() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let news = CoordinatorNews::FundingNotAvailable;
+        storage.add_news(news.clone()).unwrap();
+        assert_eq!(storage.get_news().unwrap().len(), 1);
+
+        storage.ack_news(news.clone()).unwrap();
+        assert!(storage.get_news().unwrap().is_empty());
+
+        // Re-add: no longer a duplicate, so it is stored and returned.
+        storage.add_news(news.clone()).unwrap();
+        assert_eq!(storage.get_news().unwrap().len(), 1);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `settle_tx` records `settled_block_height` when transitioning to a terminal state.
+    #[test]
+    fn test_settle_tx_records_height() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid = random_txid();
+        storage
+            .insert_tx(dummy_tx(txid, TransactionState::InMempool))
+            .unwrap();
+
+        storage
+            .settle_tx(txid, TransactionState::Finalized, 42)
+            .unwrap();
+
+        let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
+        assert_eq!(updated.state, TransactionState::Finalized);
+        assert_eq!(updated.settled_block_height, Some(42));
+        assert!(storage.get_news().unwrap().is_empty());
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `evict_stale_txs` removes txs whose settled height exceeds the threshold
+    /// and emits `TransactionEvicted` news.
+    #[test]
+    fn test_evict_stale_txs() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid_stale = random_txid();
+        let txid_fresh = random_txid();
+
+        // stale: settled at height 5, current height = 16 → 11 blocks ago ≥ 10
+        let mut stale = dummy_tx(txid_stale, TransactionState::Finalized);
+        stale.settled_block_height = Some(5);
+        storage.insert_tx(stale).unwrap();
+
+        // fresh: settled at height 10, current height = 16 → 6 blocks ago < 10
+        let mut fresh = dummy_tx(txid_fresh, TransactionState::Finalized);
+        fresh.settled_block_height = Some(10);
+        storage.insert_tx(fresh).unwrap();
+
+        storage.evict_stale_txs(16).unwrap();
+
+        // Stale tx removed, fresh still present
+        assert!(storage.get_tx_by_id(txid_stale).unwrap().is_none());
+        assert!(storage.get_tx_by_id(txid_fresh).unwrap().is_some());
+
+        // One eviction news item for the stale tx
+        let news = storage.get_news().unwrap();
+        assert_eq!(news.len(), 1);
+        assert!(matches!(
+            &news[0],
+            CoordinatorNews::TransactionEvicted { txid, .. } if *txid == txid_stale
+        ));
 
         drop(storage);
         storage_backend.remove().unwrap();

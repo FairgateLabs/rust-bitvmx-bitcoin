@@ -15,4 +15,10 @@ pub enum BitcoinCoordinatorError {
 
     #[error("Storage Backend Error: {0}")]
     StorageBackendError(#[from] StorageError),
+
+    #[error("Bitcoin Client Error: {0}")]
+    BitcoinClientError(#[from] BitcoinClientError),
+
+    #[error("Internal error (programmer bug): {0}")]
+    Internal(String),
 }

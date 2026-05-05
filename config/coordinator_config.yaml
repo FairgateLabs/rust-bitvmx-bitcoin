@@ -12,9 +12,6 @@ key_manager:
     key_derivation_path: m/101/1/0/0/
     winternitz_seed: deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef
     network: regtest
-key_storage:
-    password: secret_password
-    path: data/key_manager
 
 # Each setting is optional and will use the default values if not provided
 settings:
@@ -35,6 +32,8 @@ settings:
     bump_fee_percentage: 1.5
   funding:
     min_funding_amount_sats: 10000
+  storage:
+    max_tracking_confirmations: 10
   monitor:
         max_monitoring_confirmations: 6
         indexer_settings:
