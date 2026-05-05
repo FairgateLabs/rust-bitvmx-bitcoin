@@ -1,7 +1,8 @@
-use crate::config::config::DispatcherSettings;
+use crate::{config::config::DispatcherSettings, types::CoordinatedTx};
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use std::rc::Rc;
+use tracing::info;
 
 /// Typed outcome returned per-transaction by [`Dispatcher::dispatch`].
 #[derive(Debug)]
@@ -29,6 +30,38 @@ impl Dispatcher {
         }
     }
 
+    /// Group `parents` into batches whose cumulative weight stays within
+    /// `max_tx_weight`, returning at most `max_batches` groups.
+    pub fn batch_by_weight<'a>(
+        &self,
+        parents: &'a [CoordinatedTx],
+        max_batches: u32,
+    ) -> Vec<Vec<&'a CoordinatedTx>> {
+        let mut batches: Vec<Vec<&CoordinatedTx>> = Vec::new();
+        let mut current_batch: Vec<&CoordinatedTx> = Vec::new();
+        let mut current_weight = 0u64;
+
+        for parent in parents {
+            if batches.len() as u32 >= max_batches {
+                break;
+            }
+            let weight = parent.tx.weight().to_wu();
+            if !current_batch.is_empty() && current_weight + weight > self.settings.max_tx_weight {
+                batches.push(current_batch);
+                current_batch = Vec::new();
+                current_weight = 0;
+            }
+            current_batch.push(parent);
+            current_weight += weight;
+        }
+
+        if !current_batch.is_empty() && (batches.len() as u32) < max_batches {
+            batches.push(current_batch);
+        }
+
+        batches
+    }
+
     /// Broadcast `txs` to the Bitcoin node.
     pub fn dispatch(&self, txs: Vec<Transaction>) -> Vec<(Txid, DispatchOutcome)> {
         let (valid_txs, mut results) = self.validate_and_partition(txs);
@@ -36,7 +69,10 @@ impl Dispatcher {
         for tx in valid_txs {
             let txid = tx.compute_txid();
             let outcome = match self.bitcoin_client.send_transaction(&tx) {
-                Ok(_) => DispatchOutcome::Success,
+                Ok(_) => {
+                    info!("Successfully dispatched transaction {}", txid);
+                    DispatchOutcome::Success
+                }
                 Err(e) => classify_error(&e.to_string()),
             };
             results.push((txid, outcome));
@@ -53,6 +89,7 @@ impl Dispatcher {
     /// Oversized transactions receive a `Fatal` outcome immediately; valid ones
     /// are returned for batching.
     fn validate_and_partition(
+        //TODO: remove
         &self,
         txs: Vec<Transaction>,
     ) -> (Vec<Transaction>, Vec<(Txid, DispatchOutcome)>) {
@@ -75,33 +112,6 @@ impl Dispatcher {
         }
 
         (valid, failures)
-    }
-
-    /// Group `txs` (already weight-validated) into batches whose cumulative
-    /// weight stays within `max_tx_weight`.
-    fn build_batches(&self, txs: Vec<Transaction>) -> Vec<Vec<Transaction>> {
-        let mut batches = Vec::new();
-        let mut current_batch = Vec::new();
-        let mut current_weight = 0u64;
-
-        for tx in txs {
-            let weight = tx.weight().to_wu();
-
-            if current_weight + weight > self.settings.max_tx_weight {
-                batches.push(current_batch);
-                current_batch = Vec::new();
-                current_weight = 0;
-            }
-
-            current_weight += weight;
-            current_batch.push(tx);
-        }
-
-        if !current_batch.is_empty() {
-            batches.push(current_batch);
-        }
-
-        batches
     }
 }
 
@@ -220,46 +230,6 @@ mod tests {
         assert!(failures.is_empty());
         drop(d);
 
-        bitcoind.stop().unwrap();
-    }
-
-    // -- build_batches --------------------------------------------------------
-
-    #[test]
-    fn test_build_batches_single_tx() {
-        let tx = empty_tx();
-        let weight = tx.weight().to_wu();
-        let (d, bitcoind) = dispatcher(weight * 10);
-        let batches = d.build_batches(vec![tx]);
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].len(), 1);
-
-        drop(d);
-        bitcoind.stop().unwrap();
-    }
-
-    #[test]
-    fn test_build_batches_splits_when_overweight() {
-        let tx1 = empty_tx();
-        let tx2 = empty_tx();
-        let weight = tx1.weight().to_wu();
-        let (d, bitcoind) = dispatcher(weight); // max fits exactly one tx per batch
-        let batches = d.build_batches(vec![tx1, tx2]);
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), 1);
-        assert_eq!(batches[1].len(), 1);
-
-        drop(d);
-        bitcoind.stop().unwrap();
-    }
-
-    #[test]
-    fn test_build_batches_empty_input() {
-        let (d, bitcoind) = dispatcher(400_000);
-        let batches = d.build_batches(vec![]);
-        assert!(batches.is_empty());
-
-        drop(d);
         bitcoind.stop().unwrap();
     }
 }

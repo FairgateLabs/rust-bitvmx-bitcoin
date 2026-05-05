@@ -19,6 +19,7 @@ pub struct CoordinatorStorage {
 enum StoreKey {
     Tx(Txid),
     News,
+    SpeedupList,
 }
 
 impl CoordinatorStorage {
@@ -48,6 +49,7 @@ impl CoordinatorStorage {
     pub fn remove_tx(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::Tx(tx_id));
         self.storage.remove(&key, None)?;
+        self.remove_speedup_from_list(tx_id)?;
         Ok(())
     }
 
@@ -247,6 +249,74 @@ impl CoordinatorStorage {
     }
 
     // ================================
+    //  Speedup
+    // ================================
+
+    /// Insert a speedup transaction and append its txid to the ordered SpeedupList.
+    /// Use this instead of `insert_tx` for all CPFP/RBF transactions so that
+    /// `get_speedups_ordered` returns them in creation order.
+    pub fn insert_speedup(&self, tx: CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
+        let txid = tx.txid;
+        self.insert_tx(tx)?;
+        let key = self.get_key(StoreKey::SpeedupList);
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        if !list.contains(&txid) {
+            list.push(txid);
+            self.storage.set(&key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    /// Return in-flight speedups (`InMempool` or `Confirmed`) in creation order.
+    pub fn get_active_speedups(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        Ok(self
+            .get_speedups_ordered()?
+            .into_iter()
+            .filter(|tx| {
+                matches!(
+                    tx.state,
+                    TransactionState::InMempool | TransactionState::Confirmed
+                )
+            })
+            .collect())
+    }
+
+    /// Return unconfirmed speedups (`InMempool`) in creation order.
+    pub fn get_unconfirmed_speedups(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        Ok(self
+            .get_speedups_ordered()?
+            .into_iter()
+            .filter(|tx| tx.state == TransactionState::InMempool)
+            .collect())
+    }
+
+    /// Return speedup transactions in creation order (oldest first).
+    /// Txids that no longer exist in storage are skipped as a safety net against
+    /// any inconsistency between the list and the tx store.
+    pub fn get_speedups_ordered(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::SpeedupList);
+        let list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let mut result = Vec::new();
+        for txid in list {
+            if let Some(tx) = self.get_tx_by_id(txid)? {
+                result.push(tx);
+            }
+        }
+        Ok(result)
+    }
+
+    fn remove_speedup_from_list(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        let list_key = self.get_key(StoreKey::SpeedupList);
+        let mut list: Vec<Txid> = self.storage.get(&list_key, None)?.unwrap_or_default();
+        let before = list.len();
+        list.retain(|id| id != &txid);
+        if list.len() != before {
+            self.storage.set(&list_key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    // ================================
     //  NEWS
     // ================================
 
@@ -297,6 +367,7 @@ impl CoordinatorStorage {
         match key {
             StoreKey::Tx(tx_id) => format!("{prefix}/txs/{tx_id}"),
             StoreKey::News => format!("{prefix}/news"),
+            StoreKey::SpeedupList => format!("{prefix}/speedup/list"),
         }
     }
 }
@@ -707,6 +778,88 @@ mod tests {
             &news[0],
             CoordinatorNews::TransactionEvicted { txid, .. } if *txid == txid_stale
         ));
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `remove_tx` removes the txid from the SpeedupList when the tx is a speedup.
+    #[test]
+    fn test_remove_tx_cleans_speedup_list() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid1 = random_txid();
+        let txid2 = random_txid();
+
+        storage
+            .insert_speedup(dummy_tx(txid1, TransactionState::InMempool))
+            .unwrap();
+        storage
+            .insert_speedup(dummy_tx(txid2, TransactionState::InMempool))
+            .unwrap();
+
+        assert_eq!(storage.get_speedups_ordered().unwrap().len(), 2);
+
+        storage.remove_tx(txid1).unwrap();
+
+        let remaining = storage.get_speedups_ordered().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].txid, txid2);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `evict_stale_txs` removes settled speedups from both the tx store and the SpeedupList.
+    #[test]
+    fn test_evict_speedup_removes_from_list() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid_stale = random_txid();
+        let txid_active = random_txid();
+
+        let mut stale = dummy_tx(txid_stale, TransactionState::Finalized);
+        stale.settled_block_height = Some(5);
+        storage.insert_speedup(stale).unwrap();
+
+        storage
+            .insert_speedup(dummy_tx(txid_active, TransactionState::InMempool))
+            .unwrap();
+
+        assert_eq!(storage.get_speedups_ordered().unwrap().len(), 2);
+
+        // current_height = 16: stale settled at 5 → 11 blocks ago ≥ max_tracking_confirmations(10)
+        storage.evict_stale_txs(16).unwrap();
+
+        let remaining = storage.get_speedups_ordered().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].txid, txid_active);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// After a reorg a speedup stays in the SpeedupList with its updated state.
+    #[test]
+    fn test_reorg_does_not_remove_from_speedup_list() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid = random_txid();
+        let mut tx = dummy_tx(txid, TransactionState::Confirmed);
+        tx.broadcast_block_height = Some(10);
+        storage.insert_speedup(tx.clone()).unwrap();
+
+        // Simulate reorg: update state back to InMempool
+        storage
+            .update_tx_state(txid, TransactionState::InMempool)
+            .unwrap();
+
+        let speedups = storage.get_speedups_ordered().unwrap();
+        assert_eq!(speedups.len(), 1);
+        assert_eq!(speedups[0].state, TransactionState::InMempool);
 
         drop(storage);
         storage_backend.remove().unwrap();

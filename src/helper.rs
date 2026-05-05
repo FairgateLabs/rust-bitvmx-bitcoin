@@ -1,8 +1,120 @@
-use crate::types::{
-    CoordinatedTx, News,
-    TransactionState::{self, *},
+use crate::{
+    core::dispatcher::DispatchOutcome,
+    errors::BitcoinCoordinatorError,
+    types::{
+        CoordinatedTx, News, SpeedupContext, SpeedupKind,
+        TransactionState::{self, *},
+        TxKind,
+    },
 };
+use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
+
+impl SpeedupKind {
+    pub fn context(&self) -> &SpeedupContext {
+        match self {
+            SpeedupKind::CPFP { context, .. } | SpeedupKind::RBF { context, .. } => context,
+        }
+    }
+
+    pub fn context_mut(&mut self) -> &mut SpeedupContext {
+        match self {
+            SpeedupKind::CPFP { context, .. } | SpeedupKind::RBF { context, .. } => context,
+        }
+    }
+
+    pub fn is_rbf(&self) -> bool {
+        matches!(self, SpeedupKind::RBF { .. })
+    }
+
+    pub fn parents(&self) -> &[Txid] {
+        match self {
+            SpeedupKind::CPFP { parents, .. } => parents,
+            SpeedupKind::RBF { .. } => &[],
+        }
+    }
+}
+
+impl CoordinatedTx {
+    /// Returns `&SpeedupKind` or `InvariantViolation` if this tx is not a Speedup.
+    pub fn speedup_kind(&self) -> Result<&SpeedupKind, BitcoinCoordinatorError> {
+        match &self.kind {
+            TxKind::Speedup(k) => Ok(k),
+            _ => Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "expected Speedup, got {:?} for tx {}",
+                self.kind, self.txid
+            ))),
+        }
+    }
+
+    /// Mutable variant of `speedup_kind`.
+    pub fn speedup_kind_mut(&mut self) -> Result<&mut SpeedupKind, BitcoinCoordinatorError> {
+        let txid = self.txid;
+        match &mut self.kind {
+            TxKind::Speedup(k) => Ok(k),
+            _ => Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "expected Speedup (mut) for tx {}",
+                txid
+            ))),
+        }
+    }
+
+    /// Returns the last output and its vout index, or `InvariantViolation` if there are no outputs.
+    pub fn last_output(&self) -> Result<(&bitcoin::TxOut, u32), BitcoinCoordinatorError> {
+        match self.tx.output.last() {
+            Some(out) => Ok((out, (self.tx.output.len() - 1) as u32)),
+            None => Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "tx {} has no outputs",
+                self.txid
+            ))),
+        }
+    }
+
+    pub fn verify_tx_id(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        if self.txid != txid {
+            return Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "expected txid {}, got {}",
+                txid, self.txid
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Validates that `results` contains exactly one entry with a txid matching `expected_txid`.
+pub fn verify_single_dispatch_result(
+    expected_txid: Txid,
+    results: Vec<(Txid, DispatchOutcome)>,
+) -> Result<(Txid, DispatchOutcome), BitcoinCoordinatorError> {
+    if results.len() != 1 {
+        return Err(BitcoinCoordinatorError::InvariantViolation(format!(
+            "dispatch returned {} results for single tx {}",
+            results.len(),
+            expected_txid
+        )));
+    }
+    let result = results.into_iter().next().unwrap();
+    if result.0 != expected_txid {
+        return Err(BitcoinCoordinatorError::InvariantViolation(format!(
+            "dispatch returned txid {} but expected {}",
+            result.0, expected_txid
+        )));
+    }
+    Ok(result)
+}
+
+/// Finds a tx by txid in a dispatch batch, or returns `InvariantViolation`.
+pub fn find_tx_in_batch<'a>(
+    txs: &'a [CoordinatedTx],
+    txid: Txid,
+) -> Result<&'a CoordinatedTx, BitcoinCoordinatorError> {
+    txs.iter().find(|t| t.txid == txid).ok_or_else(|| {
+        BitcoinCoordinatorError::InvariantViolation(format!(
+            "dispatcher returned txid {} not present in dispatch batch",
+            txid
+        ))
+    })
+}
 
 impl TransactionState {
     /// Returns `true` when transitioning from `self` to `next` is a valid
@@ -75,9 +187,17 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CoordinatedTx, FeeInfo, TxKind};
-    use bitcoin::hashes::{sha256d, Hash};
-    use bitcoin::{absolute::LockTime, transaction::Version, Transaction, Txid};
+    use crate::types::FeeInfo;
+    use crate::{
+        core::dispatcher::DispatchOutcome,
+        test_utils::{cpfp_coordinated_tx, normal_coordinated_tx},
+    };
+    use bitcoin::{
+        absolute::LockTime,
+        hashes::{sha256d, Hash},
+        transaction::Version,
+        Amount, ScriptBuf, Transaction, TxOut,
+    };
 
     #[test]
     fn test_is_ready_to_dispatch() {
@@ -146,5 +266,100 @@ mod tests {
         assert!(make_tx(Some(100), Some(10)).is_stuck_in_mempool(110));
         // above threshold
         assert!(make_tx(Some(100), Some(10)).is_stuck_in_mempool(200));
+    }
+
+    #[test]
+    fn test_speedup_kind_helpers() {
+        // Normal tx → Err for both variants
+        let normal = normal_coordinated_tx(1);
+        assert!(normal.speedup_kind().is_err());
+
+        let mut normal_mut = normal_coordinated_tx(2);
+        assert!(normal_mut.speedup_kind_mut().is_err());
+
+        // Speedup tx → Ok
+        let speedup = cpfp_coordinated_tx(3, 1);
+        assert!(speedup.speedup_kind().is_ok());
+
+        let mut speedup_mut = cpfp_coordinated_tx(4, 1);
+        let k = speedup_mut.speedup_kind_mut().unwrap();
+        assert!(!k.is_rbf());
+    }
+
+    #[test]
+    fn test_last_output() {
+        // No outputs → Err
+        let tx = normal_coordinated_tx(1);
+        assert!(tx.last_output().is_err());
+
+        // One output → vout = 0
+        let mut tx = normal_coordinated_tx(2);
+        tx.tx.output.push(TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        let (out, vout) = tx.last_output().unwrap();
+        assert_eq!(vout, 0);
+        assert_eq!(out.value.to_sat(), 1_000);
+
+        // Two outputs → vout = 1 (last)
+        tx.tx.output.push(TxOut {
+            value: Amount::from_sat(2_000),
+            script_pubkey: ScriptBuf::new(),
+        });
+        let (out, vout) = tx.last_output().unwrap();
+        assert_eq!(vout, 1);
+        assert_eq!(out.value.to_sat(), 2_000);
+    }
+
+    #[test]
+    fn test_verify_single_dispatch_result() {
+        let txid = Txid::from_raw_hash(sha256d::Hash::hash(&[1u8; 32]));
+        let other = Txid::from_raw_hash(sha256d::Hash::hash(&[2u8; 32]));
+
+        // Correct single result → Ok
+        assert!(
+            verify_single_dispatch_result(txid, vec![(txid, DispatchOutcome::Success)]).is_ok()
+        );
+
+        // Empty → Err
+        assert!(verify_single_dispatch_result(txid, vec![]).is_err());
+
+        // Two results → Err
+        assert!(verify_single_dispatch_result(
+            txid,
+            vec![
+                (txid, DispatchOutcome::Success),
+                (other, DispatchOutcome::Success)
+            ]
+        )
+        .is_err());
+
+        // Wrong txid → Err
+        assert!(
+            verify_single_dispatch_result(txid, vec![(other, DispatchOutcome::Success)]).is_err()
+        );
+    }
+
+    #[test]
+    fn test_find_tx_in_batch() {
+        let tx1 = normal_coordinated_tx(1);
+        let tx2 = normal_coordinated_tx(2);
+        let batch = vec![tx1.clone(), tx2.clone()];
+
+        assert!(find_tx_in_batch(&batch, tx1.txid).is_ok());
+        assert!(find_tx_in_batch(&batch, tx2.txid).is_ok());
+
+        let missing = Txid::from_raw_hash(sha256d::Hash::hash(&[99u8; 32]));
+        assert!(find_tx_in_batch(&batch, missing).is_err());
+    }
+
+    #[test]
+    fn test_verify_tx_id() {
+        let tx = normal_coordinated_tx(1);
+        assert!(tx.verify_tx_id(tx.txid).is_ok());
+
+        let other = Txid::from_raw_hash(sha256d::Hash::hash(&[99u8; 32]));
+        assert!(tx.verify_tx_id(other).is_err());
     }
 }
