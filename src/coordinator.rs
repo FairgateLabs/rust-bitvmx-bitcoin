@@ -122,7 +122,6 @@ impl BitcoinCoordinator {
         context: String,
         target_block_height: Option<u32>,
         confirmation_trigger: Option<u32>,
-        stuck_in_mempool_blocks: Option<u32>,
     ) -> Result<(), BitcoinCoordinatorError> {
         let txid = tx.compute_txid();
         self.register_tx(
@@ -131,10 +130,39 @@ impl BitcoinCoordinator {
             context,
             target_block_height,
             confirmation_trigger,
-            stuck_in_mempool_blocks,
+            None, // Stuck-in-mempool detection is not needed for speedup transactions
+                  // since the coordinator will create a boost if the parent is stuck
         )?;
         info!("Transaction({}) registered for dispatch with speedup", txid);
         Ok(())
+    }
+
+    /// Register a transaction for dispatch with optional speedup support based on the presence of `speedup_data`.
+    /// Default stuck-in-mempool detection is disabled for all transactions registered through this method
+    pub fn dispatch(
+        &self,
+        tx: Transaction,
+        speedup_data: Option<SpeedupData>,
+        context: String,
+        target_block_height: Option<u32>,
+        confirmation_trigger: Option<u32>,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        match speedup_data {
+            Some(data) => self.dispatch_with_speedup(
+                tx,
+                data,
+                context,
+                target_block_height,
+                confirmation_trigger,
+            ),
+            None => self.dispatch_without_speedup(
+                tx,
+                context,
+                target_block_height,
+                confirmation_trigger,
+                None,
+            ),
+        }
     }
 
     /// Cancel monitoring and remove a transaction from the coordinator.

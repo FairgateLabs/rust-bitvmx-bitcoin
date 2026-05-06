@@ -6,5 +6,10 @@ pub mod errors;
 pub mod helper;
 pub mod types;
 
+pub use bitvmx_transaction_monitor::{
+    types::{AckMonitorNews, FullBlock, MonitorNews, OutputPatternFilter, TypesToMonitor},
+    IndexerError, TransactionStatus,
+};
+
 #[cfg(test)]
 pub mod test_utils;

@@ -1,20 +1,20 @@
 #![allow(dead_code)]
 include!("../../src/test_utils/mod.rs");
+pub use bitcoin_coordinator::types;
 use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
-pub use rust_bitvmx_bitcoin::types;
 
 use bitcoin::{Address, Amount, CompressedPublicKey, OutPoint};
-use bitcoincore_rpc::{json::CreateRawTransactionInput, RpcApi as _};
-use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
-use key_manager::key_type::BitcoinKeyType;
-use protocol_builder::types::output::SpeedupData;
-use rust_bitvmx_bitcoin::{
+use bitcoin_coordinator::{
     config::config::{BitcoinSettings, CoordinatorStorageSettings},
     coordinator::BitcoinCoordinator,
     core::storage::CoordinatorStorage,
     errors::BitcoinCoordinatorError,
     types::{AckNews, News},
 };
+use bitcoincore_rpc::{json::CreateRawTransactionInput, RpcApi as _};
+use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
+use key_manager::key_type::BitcoinKeyType;
+use protocol_builder::types::output::SpeedupData;
 
 /// Configuration for creating a test setup
 pub struct TestSetupConfig {
@@ -454,10 +454,7 @@ pub fn ctx(label: &str) -> String {
 }
 
 /// Ack every item in `news` so it is not returned again.
-pub fn ack_all_news(
-    coordinator: &rust_bitvmx_bitcoin::coordinator::BitcoinCoordinator,
-    news: &News,
-) {
+pub fn ack_all_news(coordinator: &BitcoinCoordinator, news: &News) {
     for n in &news.monitor_news {
         let ack = match n {
             MonitorNews::Transaction(t, _, ctx) => AckMonitorNews::Transaction(*t, ctx.clone()),
@@ -465,7 +462,9 @@ pub fn ack_all_news(
             MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
                 AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
             }
-            MonitorNews::RskPeginTransaction(t, _) => AckMonitorNews::RskPeginTransaction(*t),
+            MonitorNews::OutputPatternTransaction(t, _, ctx) => {
+                AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
+            }
         };
         coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
     }

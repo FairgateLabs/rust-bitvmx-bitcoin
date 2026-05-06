@@ -1,5 +1,5 @@
 [package]
-name = "rust-bitvmx-bitcoin"
+name = "bitcoin-coordinator"
 version = "0.5.1"
 edition = "2021"
 

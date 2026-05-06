@@ -2,15 +2,15 @@ mod common;
 use common::*;
 
 use bitcoin::Network;
-use bitcoincore_rpc::RpcApi as _;
-use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
-use bitvmx_transaction_monitor::config::MonitorSettingsConfig;
-use rust_bitvmx_bitcoin::{
+use bitcoin_coordinator::{
     config::config::{
         BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings, SpeedupSettings,
     },
     types::{CoordinatorNews, TransactionState},
 };
+use bitcoincore_rpc::RpcApi as _;
+use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
+use bitvmx_transaction_monitor::config::MonitorSettingsConfig;
 use std::rc::Rc;
 
 // =============================================================================
@@ -90,7 +90,7 @@ fn test_cpfp_lifecycle() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("lifecycle"), None, None, None)
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("lifecycle"), None, None)
         .unwrap();
 
     // Dispatch tick: parent → InMempool, CPFP created and dispatched
@@ -228,10 +228,10 @@ fn test_cpfp_two_parents() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx1, speedup_data1, ctx("batch1"), None, None, None)
+        .dispatch_with_speedup(parent_tx1, speedup_data1, ctx("batch1"), None, None)
         .unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx2, speedup_data2, ctx("batch2"), None, None, None)
+        .dispatch_with_speedup(parent_tx2, speedup_data2, ctx("batch2"), None, None)
         .unwrap();
 
     // Single tick dispatches both parents and creates CPFPs for them.
@@ -306,7 +306,7 @@ fn test_cpfp_no_funding() {
 
     // Register without funding.
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("no_funding"), None, None, None)
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("no_funding"), None, None)
         .unwrap();
 
     // Tick: parent dispatched → InMempool; CPFP creation finds no funding.
@@ -371,7 +371,7 @@ fn test_cpfp_reorg() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("reorg"), None, None, None)
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("reorg"), None, None)
         .unwrap();
 
     // Dispatch tick.
@@ -460,7 +460,7 @@ fn test_cpfp_boost() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("boost"), None, None, None)
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("boost"), None, None)
         .unwrap();
 
     // Dispatch tick: parent → InMempool, CPFP1 created and dispatched.
@@ -528,7 +528,7 @@ fn test_cpfp_fee_escalates_across_boosts() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("escalate"), None, None, None)
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("escalate"), None, None)
         .unwrap();
 
     coordinator.tick().unwrap();
@@ -599,7 +599,6 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
             parent_tx.clone(),
             speedup_data,
             ctx("rbf_limit"),
-            None,
             None,
             None,
         )
@@ -686,7 +685,7 @@ fn test_cpfp_orphan_requeue() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("orphan"), None, None, None)
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("orphan"), None, None)
         .unwrap();
 
     // Dispatch tick: both parent and CPFP land in the mempool.
@@ -756,14 +755,7 @@ fn test_cpfp_funding_restored_after_finalization() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(
-            parent_tx1,
-            speedup_data1,
-            ctx("restore_p1"),
-            None,
-            None,
-            None,
-        )
+        .dispatch_with_speedup(parent_tx1, speedup_data1, ctx("restore_p1"), None, None)
         .unwrap();
 
     // Dispatch tick: parent1 → InMempool, CPFP1 created and dispatched.
@@ -807,14 +799,7 @@ fn test_cpfp_funding_restored_after_finalization() {
     .unwrap();
     let parent2_txid = parent_tx2.compute_txid();
     coordinator
-        .dispatch_with_speedup(
-            parent_tx2,
-            speedup_data2,
-            ctx("restore_p2"),
-            None,
-            None,
-            None,
-        )
+        .dispatch_with_speedup(parent_tx2, speedup_data2, ctx("restore_p2"), None, None)
         .unwrap();
 
     // Parent2 dispatched, CPFP2 built using CPFP1's confirmed change output as funding.

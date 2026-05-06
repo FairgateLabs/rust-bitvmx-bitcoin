@@ -28,6 +28,13 @@ use bitcoin::{
     Address, CompressedPublicKey, Network, OutPoint, PublicKey, ScriptBuf, Transaction, TxIn,
     TxOut, Txid, Witness,
 };
+use bitcoin_coordinator::{
+    config::config::{BitcoinSettings, CoordinatorStorageSettings},
+    coordinator::BitcoinCoordinator,
+    core::storage::CoordinatorStorage,
+    errors::BitcoinCoordinatorError,
+    types::{AckNews, CoordinatorNews, News, TransactionState},
+};
 use bitcoin_indexer::config::IndexerSettings;
 use bitcoincore_rpc::RpcApi as _;
 use bitvmx_bitcoin_rpc::{bitcoin_client::BitcoinClient, rpc_config::RpcConfig};
@@ -35,13 +42,6 @@ use bitvmx_settings::settings::load_config_file;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
     types::{AckMonitorNews, MonitorNews},
-};
-use rust_bitvmx_bitcoin::{
-    config::config::{BitcoinSettings, CoordinatorStorageSettings},
-    coordinator::BitcoinCoordinator,
-    core::storage::CoordinatorStorage,
-    errors::BitcoinCoordinatorError,
-    types::{AckNews, CoordinatorNews, News, TransactionState},
 };
 use serde::Deserialize;
 use std::time::{Duration, Instant};
@@ -152,7 +152,9 @@ fn drain_news(coordinator: &BitcoinCoordinator) -> News {
             MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
                 AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
             }
-            MonitorNews::RskPeginTransaction(t, _) => AckMonitorNews::RskPeginTransaction(*t),
+            MonitorNews::OutputPatternTransaction(t, _, ctx) => {
+                AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
+            }
         };
         coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
     }
@@ -190,8 +192,8 @@ fn poll_until_evicted(
                     MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
                         AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
                     }
-                    MonitorNews::RskPeginTransaction(t, _) => {
-                        AckMonitorNews::RskPeginTransaction(*t)
+                    MonitorNews::OutputPatternTransaction(t, _, ctx) => {
+                        AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
                     }
                 };
                 coordinator.ack_news(AckNews::Monitor(ack)).unwrap();

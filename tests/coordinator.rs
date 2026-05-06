@@ -1,15 +1,15 @@
 mod common;
 use common::*;
 
+use bitcoin_coordinator::{
+    config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
+    types::{AckNews, CoordinatorNews, TransactionState},
+};
 use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
     types::{MonitorNews, TypesToMonitor},
-};
-use rust_bitvmx_bitcoin::{
-    config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
-    types::{AckNews, CoordinatorNews, TransactionState},
 };
 use tracing::info;
 
