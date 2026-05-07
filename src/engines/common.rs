@@ -159,9 +159,6 @@ impl EngineContext {
         tx.verify_tx_id(txid)?; // sanity check
         match outcome {
             DispatchOutcome::Success | DispatchOutcome::AlreadyKnown => {
-                if matches!(outcome, DispatchOutcome::AlreadyKnown) {
-                    warn!("tx({}) already known — treating as in-mempool", txid);
-                }
                 if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
                     if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
                         replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
@@ -171,6 +168,15 @@ impl EngineContext {
                 self.mark_dispatched(tx, current_height, fee_info)?;
                 info!("tx({}) dispatched at block height {}", txid, current_height);
                 Ok(true)
+            }
+            DispatchOutcome::AlreadyConfirmed => {
+                // The node confirms the transaction is already on-chain
+                debug!(
+                    "tx({}) already confirmed on-chain — marking confirmed",
+                    txid
+                );
+                self.handle_confirmed(txid)?;
+                Ok(false)
             }
             DispatchOutcome::Retryable(msg) => {
                 if tx.retry_count + 1 >= self.coordinator_config.retry_attempts_sending_tx {

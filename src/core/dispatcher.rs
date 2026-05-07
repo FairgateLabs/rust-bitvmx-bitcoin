@@ -9,8 +9,11 @@ use tracing::info;
 pub enum DispatchOutcome {
     /// Transaction accepted by the node.
     Success,
-    /// Node already knows the transaction (mempool or confirmed). Treat as success.
+    /// Node already has the transaction in the mempool.
     AlreadyKnown,
+    /// Transaction is already confirmed on-chain (outputs already in UTXO set).
+    /// This is definitive: no indexer query needed.
+    AlreadyConfirmed,
     /// Transient error (fee/mempool policy, network). Coordinator may retry.
     Retryable(String),
     /// Permanent error (e.g. transaction too heavy, script invalid). Mark as failed.
@@ -117,10 +120,14 @@ impl Dispatcher {
 
 /// Map a raw Bitcoin RPC error message to a [`DispatchOutcome`].
 fn classify_error(msg: &str) -> DispatchOutcome {
-    if msg.contains("already in mempool")
-        || msg.contains("Transaction outputs already in utxo set")
+    // These mean the transaction is already confirmed on-chain — definitive, no indexer needed.
+    if msg.contains("Transaction outputs already in utxo set")
         || msg.contains("already in block chain")
     {
+        return DispatchOutcome::AlreadyConfirmed;
+    }
+
+    if msg.contains("already in mempool") {
         return DispatchOutcome::AlreadyKnown;
     }
 

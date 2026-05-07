@@ -11,7 +11,10 @@ use storage_backend::storage::Storage;
 use tracing::{debug, info};
 
 use crate::{
-    config::config::BitcoinSettings,
+    config::{
+        config::BitcoinSettings,
+        settings::{CPFP_TRANSACTION_CONTEXT, RBF_TRANSACTION_CONTEXT},
+    },
     core::{
         dispatcher::Dispatcher, fee::FeeManager, funding::FundingManager,
         storage::CoordinatorStorage,
@@ -198,7 +201,26 @@ impl BitcoinCoordinator {
     }
 
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
-        let monitor_news = self.tx_engine.ctx.monitor.get_news()?;
+        use bitvmx_transaction_monitor::types::MonitorNews;
+
+        let all_monitor_news = self.tx_engine.ctx.monitor.get_news()?;
+
+        //TODO: check
+        // Filter out internal coordinator transactions (CPFP/RBF speedups).
+        // These use non-JSON context strings that the client cannot parse,
+        // matching the same filtering behaviour of the previous coordinator.
+        let monitor_news: Vec<MonitorNews> = all_monitor_news
+            .into_iter()
+            .filter(|news| {
+                if let MonitorNews::Transaction(_, _, context) = news {
+                    !context.contains(CPFP_TRANSACTION_CONTEXT)
+                        && !context.contains(RBF_TRANSACTION_CONTEXT)
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         let coordinator_news = self.tx_engine.ctx.storage.get_news()?;
         Ok(News {
             monitor_news,
@@ -216,8 +238,10 @@ impl BitcoinCoordinator {
     }
 
     /// Register data to be monitored.
+    /// `search_in_mempool` is `false` here: mempool search is only enabled once a
+    /// transaction has actually been broadcast (done internally by `mark_dispatched`).
     pub fn monitor(&self, data: TypesToMonitor) -> Result<(), BitcoinCoordinatorError> {
-        self.tx_engine.ctx.monitor.monitor(data, true)?;
+        self.tx_engine.ctx.monitor.monitor(data, false)?;
         Ok(())
     }
 
