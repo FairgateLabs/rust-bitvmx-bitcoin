@@ -169,7 +169,6 @@ fn drain_news(coordinator: &BitcoinCoordinator) -> News {
 /// Tick + sleep until  `TransactionEvicted` coordinator news item is seen for it.
 fn poll_until_evicted(
     coordinator: &BitcoinCoordinator,
-    storage: &CoordinatorStorage,
     txid: Txid,
     timeout: Duration,
     interval: Duration,
@@ -585,7 +584,6 @@ fn test_coordinator_full_lifecycle() {
     info!("[lifecycle] phase 6: waiting for eviction (needs 3rd block, up to 30 min)...");
     let evicted = poll_until_evicted(
         &coordinator,
-        &coord_storage,
         txid,
         Duration::from_secs(30 * 60),
         Duration::from_secs(30),

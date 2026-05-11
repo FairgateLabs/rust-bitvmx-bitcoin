@@ -67,7 +67,7 @@ impl Dispatcher {
 
     /// Broadcast `txs` to the Bitcoin node.
     pub fn dispatch(&self, txs: Vec<Transaction>) -> Vec<(Txid, DispatchOutcome)> {
-        let (valid_txs, mut results) = self.validate_and_partition(txs);
+        let (valid_txs, mut results) = self.validate(txs);
 
         for tx in valid_txs {
             let txid = tx.compute_txid();
@@ -90,12 +90,8 @@ impl Dispatcher {
 
     /// Split `txs` into those that pass the weight limit and those that don't.
     /// Oversized transactions receive a `Fatal` outcome immediately; valid ones
-    /// are returned for batching.
-    fn validate_and_partition(
-        //TODO: remove
-        &self,
-        txs: Vec<Transaction>,
-    ) -> (Vec<Transaction>, Vec<(Txid, DispatchOutcome)>) {
+    /// are returned.
+    fn validate(&self, txs: Vec<Transaction>) -> (Vec<Transaction>, Vec<(Txid, DispatchOutcome)>) {
         let mut valid = Vec::new();
         let mut failures = Vec::new();
 
@@ -185,14 +181,14 @@ mod tests {
         )
     }
 
-    // -- validate_and_partition -----------------------------------------------
+    // -- validate -----------------------------------------------
 
     #[test]
     fn test_valid_tx_passes_partition() {
         let tx = empty_tx();
         let weight = tx.weight().to_wu();
         let (d, bitcoind) = dispatcher(weight + 100);
-        let (valid, failures) = d.validate_and_partition(vec![tx]);
+        let (valid, failures) = d.validate(vec![tx]);
         assert_eq!(valid.len(), 1);
         assert!(failures.is_empty());
 
@@ -205,7 +201,7 @@ mod tests {
         let tx = empty_tx();
         let weight = tx.weight().to_wu();
         let (d, bitcoind) = dispatcher(weight - 1);
-        let (valid, failures) = d.validate_and_partition(vec![tx]);
+        let (valid, failures) = d.validate(vec![tx]);
         assert!(valid.is_empty());
         assert_eq!(failures.len(), 1);
         assert!(matches!(failures[0].1, DispatchOutcome::Fatal(_)));
@@ -224,7 +220,7 @@ mod tests {
         let heavy_tx = empty_tx();
 
         let d2 = dispatcher_with_client(weight - 1, Rc::clone(&d.bitcoin_client)); // slightly under limit to test both cases in one go
-        let (valid, failures) = d2.validate_and_partition(vec![valid_tx, heavy_tx]);
+        let (valid, failures) = d2.validate(vec![valid_tx, heavy_tx]);
         assert!(valid.is_empty());
         assert_eq!(failures.len(), 2);
         drop(d2);
@@ -232,7 +228,7 @@ mod tests {
         // Now both fit exactly at the limit
         let tx1 = empty_tx();
         let tx2 = empty_tx();
-        let (valid, failures) = d.validate_and_partition(vec![tx1, tx2]);
+        let (valid, failures) = d.validate(vec![tx1, tx2]);
         assert_eq!(valid.len(), 2);
         assert!(failures.is_empty());
         drop(d);

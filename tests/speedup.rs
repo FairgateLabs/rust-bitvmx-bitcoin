@@ -30,7 +30,7 @@ fn cpfp_settings() -> BitcoinSettings {
             max_unconfirmed_speedups: 2, // A second boost creates RBF
             max_rbf_attempts: 10,
             min_blocks_before_resend_speedup: 1, // Enables boost after one block
-            rbf_fee_percentage: 1.5,
+            rbf_fee_multiplier: 1.5,
             bump_fee_percentage: 1.5,
         },
         coordinator: CoordinatorSettings {
@@ -48,7 +48,7 @@ fn boost_settings(max_unconfirmed: u32) -> BitcoinSettings {
             max_unconfirmed_speedups: max_unconfirmed,
             max_rbf_attempts: 10,
             min_blocks_before_resend_speedup: 1,
-            rbf_fee_percentage: 1.5,
+            rbf_fee_multiplier: 1.5,
             bump_fee_percentage: 2.0,
         },
         ..cpfp_settings()

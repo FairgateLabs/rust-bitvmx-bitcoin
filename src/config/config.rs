@@ -1,15 +1,4 @@
-use crate::{
-    config::settings::{
-        DEFAULT_BASE_FEE_MULTIPLIER, DEFAULT_BUMP_FEE_PERCENTAGE, DEFAULT_MAX_FEERATE_SAT_VB,
-        DEFAULT_MAX_RBF_ATTEMPTS, DEFAULT_MAX_TX_WEIGHT, DEFAULT_MAX_UNCONFIRMED_SPEEDUPS,
-        DEFAULT_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP, DEFAULT_MIN_FUNDING_AMOUNT_SATS,
-        DEFAULT_MIN_NETWORK_FEE_RATE, DEFAULT_RBF_FEE_MULTIPLIER,
-        DEFAULT_RETRY_ATTEMPTS_SENDING_TX, DEFAULT_RETRY_INTERVAL_SECONDS,
-        MAX_LIMIT_UNCONFIRMED_PARENTS, MAX_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP,
-        MAX_RBF_FEE_PERCENTAGE, MAX_TRACKING_CONFIRMATIONS,
-    },
-    errors::BitcoinCoordinatorError,
-};
+use crate::{config::settings::*, errors::BitcoinCoordinatorError};
 use bitvmx_bitcoin_rpc::rpc_config::RpcConfig;
 use bitvmx_settings::settings::load_config_file;
 use bitvmx_transaction_monitor::config::MonitorSettingsConfig;
@@ -122,7 +111,7 @@ pub struct SpeedupSettings {
     pub max_unconfirmed_speedups: u32,
     pub max_rbf_attempts: u32,
     pub min_blocks_before_resend_speedup: u32,
-    pub rbf_fee_percentage: f64,
+    pub rbf_fee_multiplier: f64,
     pub bump_fee_percentage: f64,
 }
 
@@ -132,7 +121,7 @@ impl Default for SpeedupSettings {
             max_unconfirmed_speedups: DEFAULT_MAX_UNCONFIRMED_SPEEDUPS,
             max_rbf_attempts: DEFAULT_MAX_RBF_ATTEMPTS,
             min_blocks_before_resend_speedup: DEFAULT_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP,
-            rbf_fee_percentage: DEFAULT_RBF_FEE_MULTIPLIER,
+            rbf_fee_multiplier: DEFAULT_RBF_FEE_MULTIPLIER,
             bump_fee_percentage: DEFAULT_BUMP_FEE_PERCENTAGE,
         }
     }
@@ -159,7 +148,7 @@ pub struct CoordinatorStorageSettings {
 impl Default for CoordinatorStorageSettings {
     fn default() -> Self {
         Self {
-            max_tracking_confirmations: MAX_TRACKING_CONFIRMATIONS,
+            max_tracking_confirmations: DEFAULT_MAX_TRACKING_CONFIRMATIONS,
         }
     }
 }
@@ -173,26 +162,25 @@ impl BitcoinSettings {
         );
 
         ensure!(
-            self.dispatcher.max_tx_weight > 0
-                && self.dispatcher.max_tx_weight <= DEFAULT_MAX_TX_WEIGHT,
+            self.dispatcher.max_tx_weight > 0 && self.dispatcher.max_tx_weight <= MAX_MAX_TX_WEIGHT,
             "invalid max_tx_weight"
         );
 
         ensure!(
             self.speedup.max_rbf_attempts > 0
-                && self.speedup.max_rbf_attempts <= DEFAULT_MAX_RBF_ATTEMPTS,
+                && self.speedup.max_rbf_attempts <= MAX_MAX_RBF_ATTEMPTS,
             "invalid max_rbf_attempts"
         );
 
         ensure!(
-            self.funding.min_funding_amount_sats >= DEFAULT_MIN_FUNDING_AMOUNT_SATS,
+            self.funding.min_funding_amount_sats >= MIN_MIN_FUNDING_AMOUNT_SATS,
             "funding below dust threshold"
         );
 
         ensure!(
-            self.speedup.rbf_fee_percentage >= 1.0
-                && self.speedup.rbf_fee_percentage <= MAX_RBF_FEE_PERCENTAGE,
-            "invalid rbf_fee_percentage"
+            self.speedup.rbf_fee_multiplier >= 1.0
+                && self.speedup.rbf_fee_multiplier <= MAX_RBF_FEE_MULTIPLIER,
+            "invalid rbf_fee_multiplier"
         );
 
         ensure!(
@@ -204,30 +192,26 @@ impl BitcoinSettings {
 
         ensure!(
             self.fee.max_feerate_sat_vb > 0
-                && self.fee.max_feerate_sat_vb <= DEFAULT_MAX_FEERATE_SAT_VB,
+                && self.fee.max_feerate_sat_vb <= MAX_MAX_FEERATE_SAT_VB,
             "invalid max_feerate_sat_vb"
         );
 
         ensure!(
-            self.fee.base_fee_multiplier > 0.0 && self.fee.base_fee_multiplier <= 100.0, //TODO: put constants in settings.rs
+            self.fee.base_fee_multiplier > 0.0
+                && self.fee.base_fee_multiplier <= MAX_BASE_FEE_MULTIPLIER,
             "invalid base_fee_multiplier"
         );
 
         ensure!(
-            self.speedup.bump_fee_percentage >= 1.0 && self.speedup.bump_fee_percentage <= 100.0,
+            self.speedup.bump_fee_percentage >= 1.0
+                && self.speedup.bump_fee_percentage <= MAX_BUMP_FEE_PERCENTAGE,
             "invalid bump_fee_percentage"
         );
 
         ensure!(
             self.coordinator.retry_interval_seconds > 0
-                && self.coordinator.retry_interval_seconds <= 300, // 5 minutes
+                && self.coordinator.retry_interval_seconds <= MAX_RETRY_INTERVAL_SECONDS,
             "invalid retry_interval_seconds"
-        );
-
-        ensure!(
-            self.coordinator.retry_attempts_sending_tx > 0
-                && self.coordinator.retry_attempts_sending_tx <= 10,
-            "invalid retry_attempts_sending_tx"
         );
 
         ensure!(
@@ -239,13 +223,6 @@ impl BitcoinSettings {
             self.fee.max_feerate_sat_vb >= self.fee.min_network_fee_rate,
             "max_feerate_sat_vb must be greater than min_network_fee_rate"
         );
-
-        ensure!(
-            self.storage.max_tracking_confirmations > 0
-                && self.storage.max_tracking_confirmations <= MAX_TRACKING_CONFIRMATIONS,
-            "invalid max_tracking_confirmations"
-        );
-
         Ok(())
     }
 }

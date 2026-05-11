@@ -4,7 +4,11 @@ use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::{
     bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
 };
-use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor, TransactionStatus};
+use bitvmx_transaction_monitor::{
+    monitor::Monitor,
+    types::{MonitorNews, TypesToMonitor},
+    TransactionStatus,
+};
 use key_manager::key_manager::KeyManager;
 use protocol_builder::types::{output::SpeedupData, Utxo};
 use storage_backend::storage::Storage;
@@ -201,15 +205,12 @@ impl BitcoinCoordinator {
     }
 
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
-        use bitvmx_transaction_monitor::types::MonitorNews;
+        let monitor_news = self.tx_engine.ctx.monitor.get_news()?;
+        let coordinator_news = self.tx_engine.ctx.storage.get_news()?;
 
-        let all_monitor_news = self.tx_engine.ctx.monitor.get_news()?;
-
-        //TODO: check
         // Filter out internal coordinator transactions (CPFP/RBF speedups).
-        // These use non-JSON context strings that the client cannot parse,
-        // matching the same filtering behaviour of the previous coordinator.
-        let monitor_news: Vec<MonitorNews> = all_monitor_news
+        // Because Context in the Client does not include the type of speedup
+        let monitor_news: Vec<MonitorNews> = monitor_news
             .into_iter()
             .filter(|news| {
                 if let MonitorNews::Transaction(_, _, context) = news {
@@ -221,7 +222,6 @@ impl BitcoinCoordinator {
             })
             .collect();
 
-        let coordinator_news = self.tx_engine.ctx.storage.get_news()?;
         Ok(News {
             monitor_news,
             coordinator_news,

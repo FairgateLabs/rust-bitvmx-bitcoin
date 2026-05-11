@@ -65,13 +65,12 @@ impl FeeManager {
         new_fee_rate: u64,
         unconfirmed_speedups: &[CoordinatedTx],
     ) -> (u64, usize) {
-        if unconfirmed_speedups.is_empty() {
-            return (0, 0);
-        }
-
-        // All previous speedups in the chain are assumed to have used the same fee rate
-        // (the last one's fee_rate is representative).
-        let last_fee_rate_used = unconfirmed_speedups.last().unwrap().fee_info.fee_rate; //TODO: dont use unwrap
+        let last_fee_rate_used = match unconfirmed_speedups.last() {
+            // All previous speedups in the chain are assumed to have used the same fee rate
+            // (the last one's fee_rate is representative).
+            Some(tx) => tx.fee_info.fee_rate,
+            None => return (0, 0),
+        };
 
         let mut fee_diff = 0u64;
         let mut chain_vsize = 0usize;

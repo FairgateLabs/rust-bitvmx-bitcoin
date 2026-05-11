@@ -590,10 +590,7 @@ fn test_add_funding_below_min() {
 }
 
 /// When a valid funding UTXO is in storage and a subsequent call replaces it
-/// with an invalid one, the invalid call must:
-/// 1. Generate an `InvalidFundingUtxo` news item.
-/// 2. Clear the previously valid UTXO from storage so it cannot be
-///    accidentally reused. //TODO: add this to the test when speedup logic is implemented
+/// with an invalid one, the invalid call must generate an `InvalidFundingUtxo` news item.
 #[test]
 fn test_invalid_funding_replaces() {
     init_trace();

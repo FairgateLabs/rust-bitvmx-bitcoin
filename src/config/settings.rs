@@ -7,6 +7,7 @@ pub const FUNDING_TRANSACTION_CONTEXT: &str = "FUNDING_TRANSACTION";
 
 // Bitcoin Core has a mempool policy called the "chain limit":
 // You can’t have more than 25 unconfirmed transactions chained together (i.e. one spending the other).
+pub const DEFAULT_MAX_UNCONFIRMED_SPEEDUPS: u32 = 10;
 pub const MAX_LIMIT_UNCONFIRMED_PARENTS: u32 = 25;
 
 // Minimum number of unconfirmed transactions required to dispatch a CPFP (Child Pays For Parent) transaction.
@@ -15,41 +16,37 @@ pub const MAX_LIMIT_UNCONFIRMED_PARENTS: u32 = 25;
 // This ensures that the CPFP transaction can be constructed and accepted by the mempool under Bitcoin's standardness rules.
 pub const MIN_UNCONFIRMED_TXS_FOR_CPFP: u32 = 2;
 
-// SETTINGS CONFIGURABLE:
-
-// Maximum number of unconfirmed speedup transactions allowed before triggering a replacement speedup.
-// If the number of unconfirmed speedups reaches this limit, the coordinator will attempt to replace them with a new speedup transaction.
-pub const DEFAULT_MAX_UNCONFIRMED_SPEEDUPS: u32 = 10;
-
 // Maximum transaction weight in bytes.
 pub const DEFAULT_MAX_TX_WEIGHT: u64 = 400_000;
+pub const MAX_MAX_TX_WEIGHT: u64 = 400_000;
 
 // Maximum number of RBF attempts for a single transaction
 pub const DEFAULT_MAX_RBF_ATTEMPTS: u32 = 10;
+pub const MAX_MAX_RBF_ATTEMPTS: u32 = 20;
 
 // Minimum funding amount in sats to ensure sufficient funds for speedups
 pub const DEFAULT_MIN_FUNDING_AMOUNT_SATS: u64 = 10_000;
-
-// Fee percentage increase for RBF (150% of original fee)
-pub const DEFAULT_RBF_FEE_MULTIPLIER: f64 = 1.5;
+pub const MIN_MIN_FUNDING_AMOUNT_SATS: u64 = 1_000;
 
 // Minimum blocks to wait before attempting to resend a speedup transaction (CPFP or RBF)
 pub const DEFAULT_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP: u32 = 1;
-
-// Maximum blocks to wait before attempting to resend a speedup transaction
 pub const MAX_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP: u32 = 3;
 
 // Maximum feerate sat/vbyte allowed for speedups
 pub const DEFAULT_MAX_FEERATE_SAT_VB: u64 = 1000;
+pub const MAX_MAX_FEERATE_SAT_VB: u64 = 1000;
 
 // Fee multiplier for base fee multiplier
 pub const DEFAULT_BASE_FEE_MULTIPLIER: f64 = 1.0;
+pub const MAX_BASE_FEE_MULTIPLIER: f64 = 100.0;
 
 // Bump fee percentage
 pub const DEFAULT_BUMP_FEE_PERCENTAGE: f64 = 1.5;
+pub const MAX_BUMP_FEE_PERCENTAGE: f64 = 100.0;
 
 // Retry interval seconds
 pub const DEFAULT_RETRY_INTERVAL_SECONDS: u64 = 5;
+pub const MAX_RETRY_INTERVAL_SECONDS: u64 = 300; // 5 minutes
 
 // Retry attempts sending tx after an error
 pub const DEFAULT_RETRY_ATTEMPTS_SENDING_TX: u32 = 3;
@@ -57,8 +54,9 @@ pub const DEFAULT_RETRY_ATTEMPTS_SENDING_TX: u32 = 3;
 // Minimum network fee rate
 pub const DEFAULT_MIN_NETWORK_FEE_RATE: u64 = 1;
 
-// Maximum RBF fee percentage
-pub const MAX_RBF_FEE_PERCENTAGE: f64 = 3.0;
+// Fee percentage increase for RBF (% of original fee)
+pub const DEFAULT_RBF_FEE_MULTIPLIER: f64 = 1.5;
+pub const MAX_RBF_FEE_MULTIPLIER: f64 = 3.0;
 
 // Maximum block confirmations to track after reaching finalized or failed state
-pub const MAX_TRACKING_CONFIRMATIONS: u32 = 10;
+pub const DEFAULT_MAX_TRACKING_CONFIRMATIONS: u32 = 10;

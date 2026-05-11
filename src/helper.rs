@@ -93,7 +93,12 @@ pub fn verify_single_dispatch_result(
             expected_txid
         )));
     }
-    let result = results.into_iter().next().unwrap();
+    let result = results.into_iter().next().ok_or_else(|| {
+        BitcoinCoordinatorError::InvariantViolation(format!(
+            "dispatch returned no results for tx {}",
+            expected_txid
+        ))
+    })?;
     if result.0 != expected_txid {
         return Err(BitcoinCoordinatorError::InvariantViolation(format!(
             "dispatch returned txid {} but expected {}",

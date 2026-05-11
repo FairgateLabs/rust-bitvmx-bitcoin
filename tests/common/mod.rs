@@ -179,6 +179,16 @@ fn create_signed_tx_to_dispatch_internal(
         .map_err(|e| anyhow::anyhow!("fund_address failed: {:?}", e))?;
     let funding_txid = funding_tx.compute_txid();
 
+    // Lock the funding output so a later `fund_address` call on the same wallet
+    // doesn't pick it as an input
+    bitcoin_client
+        .client
+        .lock_unspent(&[OutPoint {
+            txid: funding_txid,
+            vout: funding_vout,
+        }])
+        .map_err(|e| anyhow::anyhow!("lock_unspent failed: {:?}", e))?;
+
     // Pick a fresh recipient address.
     let recipient = bitcoin_client
         .client
