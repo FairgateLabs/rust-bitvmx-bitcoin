@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 include!("../../src/test_utils/mod.rs");
+use std::collections::HashMap;
+
 pub use bitcoin_coordinator::types;
 use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
 
-use bitcoin::{Address, Amount, CompressedPublicKey, OutPoint};
+use bitcoin::{consensus::Decodable, Address, Amount, CompressedPublicKey, OutPoint};
 use bitcoin_coordinator::{
     config::config::{BitcoinSettings, CoordinatorStorageSettings},
     coordinator::BitcoinCoordinator,
@@ -11,7 +13,7 @@ use bitcoin_coordinator::{
     errors::BitcoinCoordinatorError,
     types::{AckNews, News},
 };
-use bitcoincore_rpc::{json::CreateRawTransactionInput, RpcApi as _};
+use bitcoincore_rpc::{json::AddressType::Bech32, json::CreateRawTransactionInput, RpcApi as _};
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use key_manager::key_type::BitcoinKeyType;
 use protocol_builder::types::output::SpeedupData;
@@ -236,6 +238,109 @@ pub fn create_signed_tx_to_dispatch(bitcoin_client: &BitcoinClient) -> anyhow::R
 /// Creates a funded, signed Bitcoin transaction with zero fee.
 pub fn create_zero_fee_tx(bitcoin_client: &BitcoinClient) -> anyhow::Result<Transaction> {
     create_signed_tx_to_dispatch_internal(bitcoin_client, 1_000_000, 0)
+}
+
+/// Build a (parent, child) pair of signed, unbroadcast transactions where the
+/// child spends the parent's first output.  Both pay 100_000 sats in fees.
+pub fn create_parent_and_child_signed_txs(
+    bitcoin_client: &BitcoinClient,
+) -> (Transaction, Transaction) {
+    let wallet_address = bitcoin_client.init_wallet("test_wallet").unwrap();
+
+    // Fund 2_000_000 sats so the parent + child chain can each pay a 100_000 fee.
+    let (funding_tx, funding_vout) = bitcoin_client
+        .fund_address(&wallet_address, Amount::from_sat(2_000_000))
+        .unwrap();
+    let funding_txid = funding_tx.compute_txid();
+    bitcoin_client
+        .client
+        .lock_unspent(&[OutPoint {
+            txid: funding_txid,
+            vout: funding_vout,
+        }])
+        .unwrap();
+
+    // Parent: spends funded UTXO and sends 1_900_000 sats to a wallet-owned
+    // address so the wallet can sign the child.
+    let parent_dest = bitcoin_client
+        .client
+        .get_new_address(None, Some(Bech32))
+        .unwrap()
+        .assume_checked();
+    let mut parent_outputs = HashMap::new();
+    parent_outputs.insert(format!("{}", parent_dest), Amount::from_sat(1_900_000));
+    let parent_raw = bitcoin_client
+        .client
+        .create_raw_transaction(
+            &[CreateRawTransactionInput {
+                txid: funding_txid,
+                vout: funding_vout,
+                sequence: None,
+            }],
+            &parent_outputs,
+            None,
+            None,
+        )
+        .unwrap();
+    let parent_signed = bitcoin_client
+        .client
+        .sign_raw_transaction_with_wallet(&parent_raw, None, None)
+        .unwrap();
+    assert!(
+        parent_signed.complete,
+        "Parent transaction signing incomplete: {:?}",
+        parent_signed.errors
+    );
+    let parent: Transaction = Decodable::consensus_decode(&mut &parent_signed.hex[..]).unwrap();
+    let parent_txid = parent.compute_txid();
+
+    // Child: spends parent:0 and sends 1_800_000 sats to a fresh address.
+    let child_dest = bitcoin_client
+        .client
+        .get_new_address(None, Some(Bech32))
+        .unwrap()
+        .assume_checked();
+    let mut child_outputs = std::collections::HashMap::new();
+    child_outputs.insert(format!("{}", child_dest), Amount::from_sat(1_800_000));
+    let child_raw = bitcoin_client
+        .client
+        .create_raw_transaction(
+            &[CreateRawTransactionInput {
+                txid: parent_txid,
+                vout: 0,
+                sequence: None,
+            }],
+            &child_outputs,
+            None,
+            None,
+        )
+        .unwrap();
+
+    // The parent isn't on-chain yet, so signrawtransactionwithwallet can't
+    // auto-locate its prevout. Supply it explicitly.
+    let parent_out0 = &parent.output[0];
+    let child_signed = bitcoin_client
+        .client
+        .sign_raw_transaction_with_wallet(
+            &child_raw,
+            Some(&[bitcoincore_rpc::json::SignRawTransactionInput {
+                txid: parent_txid,
+                vout: 0,
+                script_pub_key: parent_out0.script_pubkey.clone(),
+                redeem_script: None,
+                amount: Some(parent_out0.value),
+            }]),
+            None,
+        )
+        .unwrap();
+    assert!(
+        child_signed.complete,
+        "Child transaction signing incomplete: {:?}",
+        child_signed.errors
+    );
+    let child: Transaction = Decodable::consensus_decode(&mut &child_signed.hex[..]).unwrap();
+
+    (parent, child)
 }
 
 /// Mines `n` blocks to `address` using `bitcoin_client`.

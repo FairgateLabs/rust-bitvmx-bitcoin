@@ -298,6 +298,54 @@ fn test_multiple_txs_dispatched_in_single_tick() {
     setup.end_all().unwrap();
 }
 
+/// Registering a parent transaction and a child transaction that spends the
+/// parent's first output, then ticking once, must dispatch both into the
+/// mempool.
+#[test]
+fn test_dispatch_parent_and_child_in_single_tick() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+
+    let (parent, child) = create_parent_and_child_signed_txs(&setup.bitcoin_client);
+    let parent_id = parent.compute_txid();
+    let child_id = child.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+
+    coordinator
+        .dispatch_without_speedup(parent, ctx("parent"), None, None, None)
+        .unwrap();
+    coordinator
+        .dispatch_without_speedup(child, ctx("child"), None, None, None)
+        .unwrap();
+
+    coordinator.tick().unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "parent {parent_id} must be InMempool after batch dispatch"
+    );
+    assert_eq!(
+        coord_storage.get_tx_by_id(child_id).unwrap().unwrap().state,
+        TransactionState::InMempool,
+        "child {child_id} must be InMempool after batch dispatch"
+    );
+
+    assert!(coordinator.get_news().unwrap().is_empty());
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
 /// Adding a valid funding UTXO (above the minimum threshold) must not
 /// generate any coordinator news.
 #[test]

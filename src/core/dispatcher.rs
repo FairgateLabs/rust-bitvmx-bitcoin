@@ -1,6 +1,7 @@
 use crate::{config::config::DispatcherSettings, types::CoordinatedTx};
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
+use std::collections::HashSet;
 use std::rc::Rc;
 use tracing::info;
 
@@ -65,11 +66,13 @@ impl Dispatcher {
         batches
     }
 
-    /// Broadcast `txs` to the Bitcoin node.
+    /// Broadcast `txs` to the Bitcoin node. Txs whose inputs spend other txs in the same
+    /// batch are sent after their parents so they can accept as in-mempool descendants.
     pub fn dispatch(&self, txs: Vec<Transaction>) -> Vec<(Txid, DispatchOutcome)> {
         let (valid_txs, mut results) = self.validate(txs);
+        let ordered = topological_sort(valid_txs);
 
-        for tx in valid_txs {
+        for tx in ordered {
             let txid = tx.compute_txid();
             let outcome = match self.bitcoin_client.send_transaction(&tx) {
                 Ok(_) => {
@@ -112,6 +115,58 @@ impl Dispatcher {
 
         (valid, failures)
     }
+}
+
+/// Order `txs` so that any tx whose input references another tx in the same
+/// batch appears after that referenced tx. Order between independent txs is
+/// preserved. Cycles cannot occur for valid Bitcoin txs, but if the
+/// algorithm gets stuck the remaining txs are appended in input order so
+/// bitcoind can reject them individually.
+/// If no input refers to another txid in the batch, returns `txs`
+/// unchanged after a single linear scan.
+fn topological_sort(txs: Vec<Transaction>) -> Vec<Transaction> {
+    if txs.len() < 2 {
+        return txs;
+    }
+
+    let batch: HashSet<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
+
+    let has_intra_batch_dep = txs.iter().any(|tx| {
+        tx.input
+            .iter()
+            .any(|i| batch.contains(&i.previous_output.txid))
+    });
+    if !has_intra_batch_dep {
+        return txs;
+    }
+
+    let mut ordered = Vec::with_capacity(txs.len());
+    let mut placed: HashSet<Txid> = HashSet::new();
+    let mut remaining = txs;
+
+    while !remaining.is_empty() {
+        let mut progressed = false;
+        let mut next = Vec::with_capacity(remaining.len());
+        for tx in remaining {
+            let deps_ready = tx.input.iter().all(|i| {
+                let prev = i.previous_output.txid;
+                !batch.contains(&prev) || placed.contains(&prev)
+            });
+            if deps_ready {
+                placed.insert(tx.compute_txid());
+                ordered.push(tx);
+                progressed = true;
+            } else {
+                next.push(tx);
+            }
+        }
+        if !progressed {
+            ordered.extend(next);
+            break;
+        }
+        remaining = next;
+    }
+    ordered
 }
 
 /// Map a raw Bitcoin RPC error message to a [`DispatchOutcome`].
@@ -181,7 +236,27 @@ mod tests {
         )
     }
 
-    // -- validate -----------------------------------------------
+    /// Build a one-input/one-output transaction spending `prev_txid:0`.
+    fn tx_spending(prev_txid: Txid, tag: u64) -> Transaction {
+        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
+        Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: prev_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(tag),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        }
+    }
 
     #[test]
     fn test_valid_tx_passes_partition() {
@@ -234,5 +309,36 @@ mod tests {
         drop(d);
 
         bitcoind.stop().unwrap();
+    }
+
+    #[test]
+    /// Topological sort orders child after parent
+    fn topological_sort_dependent() {
+        let external = Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros());
+        let parent = tx_spending(external, 1);
+        let parent_id = parent.compute_txid();
+        let child = tx_spending(parent_id, 2);
+        let child_id = child.compute_txid();
+
+        // Pass child first; sort must place parent before child.
+        let ordered = topological_sort(vec![child, parent]);
+        let ids: Vec<Txid> = ordered.iter().map(|t| t.compute_txid()).collect();
+        assert_eq!(ids, vec![parent_id, child_id]);
+    }
+
+    #[test]
+    /// Topological sort preserves order between independent txs
+    fn topological_sort_independent() {
+        let external = Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros());
+        let tx_a = tx_spending(external, 1);
+        let tx_b = tx_spending(external, 2);
+        let id_a = tx_a.compute_txid();
+        let id_b = tx_b.compute_txid();
+
+        // Neither input refers to the other tx's txid, so the fast path returns
+        // the input order unchanged.
+        let ordered = topological_sort(vec![tx_a, tx_b]);
+        let ids: Vec<Txid> = ordered.iter().map(|t| t.compute_txid()).collect();
+        assert_eq!(ids, vec![id_a, id_b]);
     }
 }
