@@ -87,7 +87,7 @@ impl FeeManager {
 
     /// Compute the total fee (in sats) required for a CPFP/RBF speedup transaction.
     ///
-    /// `parent_entries` is a slice of `(output_amount_sats, parent_vsize)` pairs —
+    /// `parent_entries` is a slice of `(output_amount_sats, parent_vsize)` pairs,
     /// one per parent transaction being included in this speedup.
     pub fn compute_speedup_fee(
         &self,
@@ -182,24 +182,24 @@ mod tests {
     fn test_chain_fee_diff() {
         let manager = FeeManager::new(settings(1, 1000));
 
-        // Empty → (0, 0)
+        // Empty input returns (0, 0).
         assert_eq!(manager.chain_fee_diff(10, &[]), (0, 0));
 
         let tx = cpfp_coordinated_tx(1, 10);
         let tx_vsize = tx.tx.vsize();
 
-        // Same rate → 0 fee diff, correct chain vsize
+        // Same rate: 0 fee diff, correct chain vsize.
         let (diff, vsize) = manager.chain_fee_diff(10, &[tx.clone()]);
         assert_eq!(diff, 0);
         assert_eq!(vsize, tx_vsize);
 
-        // Rate increase 5 → 10: diff = vsize * (10 - 5)
+        // Rate increase 5 to 10: diff = vsize * (10 - 5).
         let tx2 = cpfp_coordinated_tx(2, 5);
         let (diff, chain_vsize) = manager.chain_fee_diff(10, &[tx2]);
         assert_eq!(diff, tx_vsize as u64 * (10 - 5));
         assert_eq!(chain_vsize, tx_vsize);
 
-        // Two txs at old rate → cumulative diff and vsize
+        // Two txs at old rate: cumulative diff and vsize.
         let tx3 = cpfp_coordinated_tx(3, 5);
         let tx4 = cpfp_coordinated_tx(4, 5); // Both are expected to have the same fee rate
         let (diff, chain_vsize) = manager.chain_fee_diff(10, &[tx3, tx4]);
@@ -215,12 +215,12 @@ mod tests {
             base_fee_multiplier: 1.0,
         });
 
-        // Basic CPFP: parent 100 vB / 500 sat output; child 50 vB; rate 5; bump 1.0
-        // parent_total=500, child_total=250, total=750; fee = 750-500-100 = 150
+        // Basic CPFP: parent 100 vB / 500 sat output; child 50 vB; rate 5; bump 1.0.
+        // parent_total=500, child_total=250, total=750; fee = 750-500-100 = 150.
         let fee = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, false, 0, 0);
         assert_eq!(fee, 150);
 
-        // RBF bandwidth policy: total_fee(150) < child_total*2(500) → floor lifted to 500
+        // RBF bandwidth policy: total_fee(150) < child_total*2(500) -> floor lifted to 500.
         let fee = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, true, 0, 0);
         assert_eq!(fee, 500);
 

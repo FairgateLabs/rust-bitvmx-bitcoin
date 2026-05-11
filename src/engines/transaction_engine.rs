@@ -8,7 +8,7 @@ use crate::{
 };
 use bitcoin::Transaction;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
 
 pub struct TransactionEngine {
     pub ctx: Rc<EngineContext>,
@@ -96,10 +96,7 @@ impl TransactionEngine {
 
             if status.is_in_mempool() {
                 if tx.state == TransactionState::Confirmed {
-                    debug!(
-                        "Transaction({}) reorged back to mempool — resetting to InMempool",
-                        tx.txid
-                    );
+                    info!("Transaction({}) reorged back to mempool", tx.txid);
                     self.ctx.handle_reorg(&tx, current_height)?;
                 } else if tx.is_stuck_in_mempool(current_height) {
                     warn!(
@@ -122,7 +119,7 @@ impl TransactionEngine {
 
             if status.is_not_found() {
                 debug!(
-                    "Transaction({}) not found — re-queuing for dispatch",
+                    "Transaction({}) not found, re-queuing for dispatch",
                     tx.txid
                 );
                 self.ctx
@@ -133,7 +130,7 @@ impl TransactionEngine {
             }
 
             if status.is_finalized(max_confs) {
-                debug!(
+                info!(
                     "Transaction({}) finalized ({} confirmations)",
                     tx.txid, status.confirmations
                 );
@@ -151,7 +148,7 @@ impl TransactionEngine {
             }
 
             if status.is_orphan() {
-                debug!("Transaction({}) orphaned — keeping InMempool", tx.txid);
+                debug!("Transaction({}) orphaned, keeping InMempool", tx.txid);
                 self.ctx.handle_orphan(tx.txid)?;
             }
         }

@@ -60,7 +60,7 @@ impl SpeedupEngine {
         }
         let current_height = self.ctx.monitor.get_monitor_height()?;
 
-        // Don't create new CPFPs while evicted speedups are pending re-dispatch —
+        // Don't create new CPFPs while evicted speedups are pending re-dispatch:
         // their pre-built txs already claim the UTXOs in the funding chain.
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
         if all_speedups
@@ -290,11 +290,11 @@ impl SpeedupEngine {
 
     /// Review in-flight speedups and dispatch any that are pending.
     ///
-    /// Phase 1 — review active (`InMempool`/`Confirmed`) speedups:
+    /// Phase 1. Review active (`InMempool`/`Confirmed`) speedups:
     /// common helpers handle reorg, finalized, confirmed, orphan;
     /// speedup-specific arms handle funding restore and RBF cancel.
     ///
-    /// Phase 2 — dispatch all `ToDispatch` speedups in creation order;
+    /// Phase 2. Dispatch all `ToDispatch` speedups in creation order;
     /// stop on first failure to preserve the funding-UTXO chain ordering.
     fn review_in_flight(&self, current_height: BlockHeight) -> Result<(), BitcoinCoordinatorError> {
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
@@ -319,7 +319,7 @@ impl SpeedupEngine {
                 if tx.state == TransactionState::Confirmed {
                     self.ctx.handle_reorg(tx, current_height)?;
                 }
-                // Already live in the mempool — stale detection is handled by boost_if_stale.
+                // Already live in the mempool. Stale detection is handled by boost_if_stale.
                 continue;
             }
 
@@ -508,11 +508,11 @@ impl SpeedupEngine {
         self.ctx.storage.insert_speedup(record.clone())?;
         match record.speedup_kind()? {
             SpeedupKind::RBF { replaces, .. } => {
-                info!("Built RBF replacing {} | Txid({})", replaces, record.txid)
+                info!("Built RBF | Txid({}) | Replaces({})", record.txid, replaces)
             }
             SpeedupKind::CPFP { parents, .. } => info!(
-                "Built CPFP for parents {:?} | Txid({})",
-                parents, record.txid
+                "Built CPFP | Txid({}) | Parents({:?})",
+                record.txid, parents
             ),
         }
         self.ctx.monitor.monitor(
@@ -525,8 +525,8 @@ impl SpeedupEngine {
 
     /// Broadcast a single speedup transaction and update its state.
     ///
-    /// Returns `true` if the tx landed in the mempool (Success or AlreadyKnown),
-    /// `false` on failure — callers stop chained dispatch on `false`.
+    /// Returns `true` if the tx landed in the mempool (Success or AlreadyKnown).
+    /// Returns `false` on failure; callers stop chained dispatch on `false`.
     fn dispatch_speedup(
         &self,
         tx: &CoordinatedTx,

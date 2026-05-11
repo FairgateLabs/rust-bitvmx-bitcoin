@@ -156,7 +156,7 @@ impl CoordinatorStorage {
     }
 
     /// Transition a tx to a non-terminal state (`ToDispatch`, `InMempool`, `Confirmed`).
-    /// Returns an error if called with a terminal state — use `settle_tx` instead.
+    /// Returns an error if called with a terminal state; use `settle_tx` instead.
     pub fn update_tx_state(
         &self,
         tx_id: Txid,
@@ -167,7 +167,7 @@ impl CoordinatorStorage {
 
     /// Transition a tx to a terminal state (`Finalized` or `Failed`) and record
     /// the block height at which it settled.
-    /// Returns an error if called with a non-terminal state — use `update_tx_state` instead.
+    /// Returns an error if called with a non-terminal state; use `update_tx_state` instead.
     pub fn settle_tx(
         &self,
         tx_id: Txid,
@@ -651,8 +651,6 @@ mod tests {
         storage_backend.remove().unwrap();
     }
 
-    // -- add_news dedup -----------------------------------------------------------
-
     /// Adding the same item multiple times stores it only once.
     #[test]
     fn test_add_news_dedup() {
@@ -668,7 +666,7 @@ mod tests {
         let returned = storage.get_news().unwrap();
         assert_eq!(returned.len(), 1);
 
-        // get_news is idempotent — calling it again returns the same items.
+        // get_news is idempotent: calling it again returns the same items.
         let returned_again = storage.get_news().unwrap();
         assert_eq!(returned_again.len(), 1);
 
@@ -755,12 +753,12 @@ mod tests {
         let txid_stale = random_txid();
         let txid_fresh = random_txid();
 
-        // stale: settled at height 5, current height = 16 → 11 blocks ago ≥ 10
+        // Stale: settled at height 5, current height = 16 -> 11 blocks ago >= 10
         let mut stale = dummy_tx(txid_stale, TransactionState::Finalized);
         stale.settled_block_height = Some(5);
         storage.insert_tx(stale).unwrap();
 
-        // fresh: settled at height 10, current height = 16 → 6 blocks ago < 10
+        // Fresh: settled at height 10, current height = 16 -> 6 blocks ago < 10
         let mut fresh = dummy_tx(txid_fresh, TransactionState::Finalized);
         fresh.settled_block_height = Some(10);
         storage.insert_tx(fresh).unwrap();
@@ -830,7 +828,7 @@ mod tests {
 
         assert_eq!(storage.get_speedups_ordered().unwrap().len(), 2);
 
-        // current_height = 16: stale settled at 5 → 11 blocks ago ≥ max_tracking_confirmations(10)
+        // current_height = 16: stale settled at 5 -> 11 blocks ago >= max_tracking_confirmations(10)
         storage.evict_stale_txs(16).unwrap();
 
         let remaining = storage.get_speedups_ordered().unwrap();

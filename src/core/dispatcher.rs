@@ -3,7 +3,6 @@ use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use std::collections::HashSet;
 use std::rc::Rc;
-use tracing::info;
 
 /// Typed outcome returned per-transaction by [`Dispatcher::dispatch`].
 #[derive(Debug)]
@@ -75,10 +74,7 @@ impl Dispatcher {
         for tx in ordered {
             let txid = tx.compute_txid();
             let outcome = match self.bitcoin_client.send_transaction(&tx) {
-                Ok(_) => {
-                    info!("Successfully dispatched transaction {}", txid);
-                    DispatchOutcome::Success
-                }
+                Ok(_) => DispatchOutcome::Success,
                 Err(e) => classify_error(&e.to_string()),
             };
             results.push((txid, outcome));
@@ -171,7 +167,6 @@ fn topological_sort(txs: Vec<Transaction>) -> Vec<Transaction> {
 
 /// Map a raw Bitcoin RPC error message to a [`DispatchOutcome`].
 fn classify_error(msg: &str) -> DispatchOutcome {
-    // These mean the transaction is already confirmed on-chain — definitive, no indexer needed.
     if msg.contains("Transaction outputs already in utxo set")
         || msg.contains("already in block chain")
     {

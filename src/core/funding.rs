@@ -44,14 +44,14 @@ impl FundingManager {
         }
     }
 
-    /// Unified funding query — always returns the correct spendable UTXO for the current
+    /// Unified funding query. Returns the correct spendable UTXO for the current
     /// state of the speedup chain.
     ///
-    /// Pass 1 (newest → oldest): last live speedup (`InMempool | Confirmed | Finalized`) whose
+    /// Pass 1 (newest to oldest): last live speedup (`InMempool | Confirmed | Finalized`) whose
     /// change output meets `min_funding_amount_sats`. If the chain tip exists but is too small,
     /// older live txs are already spent by it, so Pass 1 stops and falls through.
     ///
-    /// Pass 2: `get_base_funding()` — the last UTXO stored by `set_funding` or `update_funding`
+    /// Pass 2: `get_base_funding()`, the last UTXO stored by `set_funding` or `update_funding`
     /// (only ever written on `Finalized`, so always a real on-chain UTXO).
     pub fn get_funding(
         &self,
@@ -81,7 +81,7 @@ impl FundingManager {
                 }
             }
             // Chain tip is live but unusable (amount too small or no output).
-            // Older live txs are already spent — stop Pass 1.
+            // Older live txs are already spent, so stop Pass 1.
             break;
         }
         // Pass 2: stored UTXO (last finalized chain output, or user-provided funding)
@@ -93,10 +93,9 @@ impl FundingManager {
         Ok(self.storage.get(FUNDING_KEY, None)?)
     }
 
-    /// Overwrite the funding UTXO without validation. Just for 'Finalized' txs.
-    ///
-    // Only updated at Finalized (not InMempool) so get_base_funding() always
-    // holds a confirmed UTXO and is resilient to mempool evictions/reorgs.
+    /// Overwrite the funding UTXO without validation. Only for `Finalized` txs,
+    /// so `get_base_funding()` always holds a confirmed UTXO and is resilient to
+    /// mempool evictions and reorgs.
     pub fn update_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
         self.storage.set(FUNDING_KEY, &utxo, None)?;
         Ok(())
@@ -336,7 +335,7 @@ mod tests {
     // get_funding tests
     // -------------------------------------------------------------------------
 
-    // Pass 2: no speedups, no stored UTXO → None.
+    // Pass 2: no speedups, no stored UTXO returns None.
     #[test]
     fn test_get_funding_empty() {
         let (mgr, config) = make_manager();
@@ -345,7 +344,7 @@ mod tests {
         config.remove().unwrap();
     }
 
-    // Pass 2: no speedups, stored UTXO → stored UTXO.
+    // Pass 2: no speedups, stored UTXO returns the stored UTXO.
     #[test]
     fn test_get_funding_no_speedups() {
         let (mgr, config) = make_manager();
@@ -355,7 +354,7 @@ mod tests {
         config.remove().unwrap();
     }
 
-    // Pass 1: InMempool speedup → change output.
+    // Pass 1: InMempool speedup returns its change output.
     #[test]
     fn test_get_funding_in_mempool() {
         let (mgr, config) = make_manager();
@@ -384,7 +383,7 @@ mod tests {
         config.remove().unwrap();
     }
 
-    // Pass 1: both Finalized → newer one's change.
+    // Pass 1: both Finalized returns newer one's change.
     #[test]
     fn test_get_funding_all_finalized() {
         let (mgr, config) = make_manager();
@@ -398,7 +397,7 @@ mod tests {
         config.remove().unwrap();
     }
 
-    // Pass 2: all ToDispatch (chain evicted from mempool) → stored base UTXO.
+    // Pass 2: all ToDispatch (chain evicted from mempool) returns stored base UTXO.
     #[test]
     fn test_get_funding_all_evicted() {
         let (mgr, config) = make_manager();
@@ -413,7 +412,7 @@ mod tests {
         config.remove().unwrap();
     }
 
-    // Pass 2: Failed speedup → stored base UTXO (same invariant as above).
+    // Pass 2: Failed speedup returns stored base UTXO (same invariant as above).
     #[test]
     fn test_get_funding_failed() {
         let (mgr, config) = make_manager();
