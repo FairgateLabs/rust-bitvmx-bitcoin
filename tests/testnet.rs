@@ -13,8 +13,14 @@
 ///
 /// 3. Fill in `tests/testnet_local.yaml` with the secret and UTXO details.
 ///
-/// 4. Dispatch through the coordinator and verify it reaches the mempool:
-///      cargo test --test testnet test_dispatch_transaction -- --ignored
+/// 4. Dispatch through the coordinator:
+///     cargo test --test testnet test_dispatch_transaction -- --ignored
+///    or
+///     cargo test --test testnet test_coordinator_full_lifecycle -- --ignored
+///    or
+///     cargo test --features testnet-test-delay --test testnet test_full_lifecycle_multi_tx_with_speedup -- --ignored
+/// Observation: the testnet-test-delay feature adds a 10 second delay before broadcasting each transaction,
+/// because P2P propagation between the upstream nodes takes seconds.
 mod common;
 use common::*;
 
@@ -25,8 +31,8 @@ use bitcoin::{
     secp256k1::{Message, Secp256k1, SecretKey},
     sighash::{EcdsaSighashType, SighashCache},
     transaction::{Sequence, Version},
-    Address, CompressedPublicKey, Network, OutPoint, PublicKey, ScriptBuf, Transaction, TxIn,
-    TxOut, Txid, Witness,
+    Address, Amount, CompressedPublicKey, Network, OutPoint, PublicKey, ScriptBuf, Transaction,
+    TxIn, TxOut, Txid, Witness,
 };
 use bitcoin_coordinator::{
     config::config::{BitcoinSettings, CoordinatorStorageSettings},
@@ -41,295 +47,15 @@ use bitvmx_bitcoin_rpc::{bitcoin_client::BitcoinClient, rpc_config::RpcConfig};
 use bitvmx_settings::settings::load_config_file;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
-    types::{AckMonitorNews, MonitorNews},
+    types::{AckMonitorNews, MonitorNews, TypesToMonitor},
 };
+use key_manager::key_type::BitcoinKeyType;
+use protocol_builder::types::{output::SpeedupData, Utxo};
 use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::info;
 
 const FEE_RATE_SAT_PER_VBYTE: u64 = 2;
-
-// =============================================================================
-// Config
-// =============================================================================
-
-fn testnet_rpc_config() -> RpcConfig {
-    let cfg = load_local_config();
-    RpcConfig::new(
-        Network::Testnet,
-        cfg.url,
-        "".to_string(),
-        "".to_string(),
-        "test_wallet".to_string(),
-    )
-}
-
-/// Returns `BitcoinSettings` with a checkpoint 10 blocks behind the current tip,
-/// so the coordinator only needs to sync a handful of blocks.
-fn testnet_settings_near_tip() -> BitcoinSettings {
-    let client = BitcoinClient::new_from_config(&testnet_rpc_config())
-        .expect("failed to connect to testnet RPC");
-    let tip = client
-        .client
-        .get_block_count()
-        .expect("failed to get block count") as u32;
-    let checkpoint = tip.saturating_sub(10);
-    BitcoinSettings {
-        monitor: MonitorSettingsConfig {
-            indexer_settings: Some(IndexerSettings {
-                checkpoint_height: Some(checkpoint),
-            }),
-            ..Default::default()
-        },
-        ..Default::default()
-    }
-}
-
-fn testnet_coord_storage(storage: &StorageTestConfig) -> CoordinatorStorage {
-    CoordinatorStorage::new(
-        storage.get_raw_storage(),
-        CoordinatorStorageSettings::default(),
-    )
-}
-
-/// Settings for the full lifecycle test: 2 confirmations to finalize, evict after 1
-/// tracking block. Both values are as small as the system allows so the test
-/// completes in ~3 testnet blocks (~30 min).
-fn testnet_lifecycle_settings() -> BitcoinSettings {
-    let client = BitcoinClient::new_from_config(&testnet_rpc_config())
-        .expect("failed to connect to testnet RPC");
-    let tip = client
-        .client
-        .get_block_count()
-        .expect("failed to get block count") as u32;
-    let checkpoint = tip.saturating_sub(10);
-    BitcoinSettings {
-        monitor: MonitorSettingsConfig {
-            max_monitoring_confirmations: Some(2),
-            indexer_settings: Some(IndexerSettings {
-                checkpoint_height: Some(checkpoint),
-            }),
-        },
-        storage: CoordinatorStorageSettings {
-            max_tracking_confirmations: 1,
-        },
-        ..Default::default()
-    }
-}
-
-/// Tick once, then sleep `interval`. Returns `true` as soon as `txid` reaches
-/// `expected` state in storage; returns `false` if `timeout` is exceeded.
-fn poll_until_state_with_sleep(
-    coordinator: &BitcoinCoordinator,
-    storage: &CoordinatorStorage,
-    txid: Txid,
-    expected: TransactionState,
-    timeout: Duration,
-    interval: Duration,
-) -> Result<bool, BitcoinCoordinatorError> {
-    let start = Instant::now();
-    loop {
-        coordinator.tick()?;
-        if let Some(tx) = storage.get_tx_by_id(txid)? {
-            if tx.state == expected {
-                return Ok(true);
-            }
-        }
-        if start.elapsed() >= timeout {
-            return Ok(false);
-        }
-        std::thread::sleep(interval);
-    }
-}
-
-/// Get pending news, ack every item, and return the snapshot.
-fn drain_news(coordinator: &BitcoinCoordinator) -> News {
-    let news = coordinator.get_news().unwrap();
-    for n in &news.monitor_news {
-        let ack = match n {
-            MonitorNews::Transaction(t, _, ctx) => AckMonitorNews::Transaction(*t, ctx.clone()),
-            MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
-            MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
-                AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
-            }
-            MonitorNews::OutputPatternTransaction(t, _, ctx) => {
-                AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
-            }
-        };
-        coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
-    }
-    for n in &news.coordinator_news {
-        coordinator
-            .ack_news(AckNews::Coordinator(n.clone()))
-            .unwrap();
-    }
-    news
-}
-
-/// Tick + sleep until  `TransactionEvicted` coordinator news item is seen for it.
-fn poll_until_evicted(
-    coordinator: &BitcoinCoordinator,
-    txid: Txid,
-    timeout: Duration,
-    interval: Duration,
-) -> Result<bool, BitcoinCoordinatorError> {
-    let start = Instant::now();
-    loop {
-        coordinator.tick()?;
-        let news = coordinator.get_news()?;
-        let evicted = news.coordinator_news.iter().any(
-            |n| matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == txid),
-        );
-        if evicted {
-            // ack everything accumulated
-            for n in &news.monitor_news {
-                let ack = match n {
-                    MonitorNews::Transaction(t, _, ctx) => {
-                        AckMonitorNews::Transaction(*t, ctx.clone())
-                    }
-                    MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
-                    MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
-                        AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
-                    }
-                    MonitorNews::OutputPatternTransaction(t, _, ctx) => {
-                        AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
-                    }
-                };
-                coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
-            }
-            for n in &news.coordinator_news {
-                coordinator
-                    .ack_news(AckNews::Coordinator(n.clone()))
-                    .unwrap();
-            }
-            return Ok(true);
-        }
-        if start.elapsed() >= timeout {
-            return Ok(false);
-        }
-        std::thread::sleep(interval);
-    }
-}
-
-/// Fields from `tests/testnet_local.yaml`.
-#[derive(Deserialize)]
-struct TestnetLocalConfig {
-    url: String,
-    secret: String,
-    txid: String,
-    vout: u32,
-    amount_sats: u64,
-}
-
-fn load_local_config() -> TestnetLocalConfig {
-    load_config_file(Some("tests/testnet_local.yaml".to_string()))
-        .expect("Fill in tests/testnet_local.yaml before running this test")
-}
-
-/// Rewrites the UTXO fields in `tests/testnet_local.yaml` after a spend so
-/// the remaining output is ready for the next run.
-fn update_local_config_after_spend(new_txid: Txid, new_amount_sats: u64) {
-    let path = "tests/testnet_local.yaml";
-    let content = std::fs::read_to_string(path).expect("failed to read testnet_local.yaml");
-    let updated = content
-        .lines()
-        .map(|line| {
-            if line.starts_with("txid:") {
-                format!("txid: \"{new_txid}\"")
-            } else if line.starts_with("vout:") {
-                "vout: 0".to_string()
-            } else if line.starts_with("amount_sats:") {
-                format!("amount_sats: {new_amount_sats}")
-            } else {
-                line.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    std::fs::write(path, updated).expect("failed to update testnet_local.yaml");
-}
-
-// =============================================================================
-// Transaction building
-// =============================================================================
-
-/// Builds and signs a P2WPKH self-transfer. Accepts WIF or 64-char hex secret.
-/// Returns the signed transaction and the fee paid.
-fn build_signed_p2wpkh_tx(
-    secret: &str,
-    funding_txid: Txid,
-    funding_vout: u32,
-    funding_amount_sats: u64,
-) -> (Transaction, u64) {
-    let secp = Secp256k1::new();
-
-    let secret_key = if secret.len() == 64 {
-        let bytes = hex::decode(secret).expect("invalid hex secret");
-        SecretKey::from_slice(&bytes).expect("invalid secret key bytes")
-    } else {
-        bitcoin::PrivateKey::from_wif(secret)
-            .expect("invalid WIF secret")
-            .inner
-    };
-
-    let public_key = PublicKey::new(secret_key.public_key(&secp));
-    let compressed = CompressedPublicKey::try_from(public_key).expect("key is not compressed");
-    let address = Address::p2wpkh(&compressed, Network::Testnet);
-    let spk = address.script_pubkey();
-    let input_amount = bitcoin::Amount::from_sat(funding_amount_sats);
-
-    // Build with a zero-value placeholder output so the witness is in place before we measure
-    // weight, so the fee can be accurately derived.
-    let mut tx = Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: funding_txid,
-                vout: funding_vout,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: bitcoin::Amount::ZERO,
-            script_pubkey: spk.clone(),
-        }],
-    };
-
-    // Sign once to populate the witness (P2WPKH witness size is deterministic,
-    // so this gives us the true transaction weight).
-    let sign = |tx: &Transaction| {
-        let sighash = SighashCache::new(tx)
-            .p2wpkh_signature_hash(0, &spk, input_amount, EcdsaSighashType::All)
-            .expect("failed to compute sighash");
-        let sig = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &secret_key);
-        Witness::p2wpkh(&EcdsaSig::sighash_all(sig), &public_key.inner)
-    };
-    tx.input[0].witness = sign(&tx);
-
-    // Derive fee from the actual weight of the signed transaction.
-    let fee_sats = tx.weight().to_vbytes_ceil() * FEE_RATE_SAT_PER_VBYTE;
-    tx.output[0].value = bitcoin::Amount::from_sat(
-        funding_amount_sats
-            .checked_sub(fee_sats)
-            .expect("amount too small to cover fee"),
-    );
-
-    // Re-sign now that the output amount is correct (outputs are part of the sighash).
-    tx.input[0].witness = sign(&tx);
-
-    info!(
-        "Built transaction {} with weight {} wu, fee {} sats",
-        tx.compute_txid(),
-        tx.weight(),
-        fee_sats
-    );
-
-    (tx, fee_sats)
-}
 
 // =============================================================================
 // Tests
@@ -601,3 +327,712 @@ fn test_coordinator_full_lifecycle() {
     drop(coord_storage);
     storage_cfg.remove().unwrap();
 }
+
+/// Comprehensive testnet3 lifecycle test. Drives **6 transactions** (1 splitter,
+/// 3 plain parents, 1 child of a parent, 1 parent-with-CPFP, plus the
+/// auto-built CPFP) through a single confirmation cycle
+///
+/// # Paths exercised
+/// - `add_funding` with a coordinator-owned P2WPKH UTXO
+/// - `monitor` + `cancel` for an unrelated external txid
+/// - `dispatch_without_speedup` (with and without `stuck_in_mempool_blocks`)
+/// - `dispatch_without_speedup` for a parent + child in the same tick
+///   (topological sort)
+/// - `dispatch_with_speedup` for a CPFP parent (auto-built CPFP)
+/// - `confirmation_trigger = Some(1)` (deterministic confirmation news)
+/// - `get_transaction` against the live monitor
+/// - Lifecycle: `ToDispatch -> InMempool -> Confirmed -> Finalized (no eviction tested here)`
+/// - `get_news` + `ack_news` at every phase
+///
+/// # UTXO layout (splitter outputs)
+/// - vout 0: change back to user (recorded in `testnet_local.yaml` for reuse)
+/// - vout 1: funds `parent_a`
+/// - vout 2: funds `parent_b` (which is then spent by `child_b`)
+/// - vout 3: funds `parent_with_speedup`
+/// - vout 4: funds the speedup UTXO (key-manager owned)
+///
+/// # Funds consumed per run
+/// ~20.000 sats (splitter + 4 chained P2WPKH txs at ~200 sat/tx fee + CPFP).
+#[test]
+#[ignore]
+fn test_full_lifecycle_multi_tx_with_speedup() {
+    init_trace();
+
+    let cfg = load_local_config();
+    let funding_txid: Txid = cfg
+        .txid
+        .parse()
+        .expect("invalid funding txid in testnet_local.yaml");
+
+    let key_manager = dummy_key_manager();
+    let parent_dest_pk = key_manager
+        .next_keypair(BitcoinKeyType::P2wpkh)
+        .expect("next_keypair");
+    let funding_pk = key_manager
+        .next_keypair(BitcoinKeyType::P2wpkh)
+        .expect("next_keypair");
+    let parent_dest_addr = p2wpkh_addr(&parent_dest_pk);
+    let funding_addr = p2wpkh_addr(&funding_pk);
+
+    // User key material (loaded from the local yaml).
+    let secp = Secp256k1::new();
+    let secret_key = parse_secret_key(&cfg.secret);
+    let user_pk = PublicKey::new(secret_key.public_key(&secp));
+    let user_addr = p2wpkh_addr(&user_pk);
+    let user_spk = user_addr.script_pubkey();
+
+    let ctx = ctx("test");
+    // ──────────────────────── Build the splitter and its 4 children ────────────────────────
+    // Output amounts are chosen so a 4-tx chain (parent_b -> child_b) can each
+    // pay a 200 sat fee while keeping every output above the 294-sat dust limit.
+    const PARENT_A_SATS: u64 = 1_000;
+    const PARENT_B_SATS: u64 = 1_500; // chained: parent_b -> child_b
+    const PARENT_SP_SATS: u64 = 1_000;
+    const FUNDING_SATS: u64 = 15_000; // >= default min_funding_amount_sats also min in protocol builder
+    const TX_FEE_SATS: u64 = 200; // ~2 sat/vbyte for a 1-in/1-out P2WPKH
+
+    let total_child_outputs = PARENT_A_SATS + PARENT_B_SATS + PARENT_SP_SATS + FUNDING_SATS;
+    assert!(
+        cfg.amount_sats > total_child_outputs + TX_FEE_SATS,
+        "funding UTXO too small for the lifecycle test (have {}, need > {})",
+        cfg.amount_sats,
+        total_child_outputs + TX_FEE_SATS
+    );
+    let change_sats = cfg.amount_sats - total_child_outputs - TX_FEE_SATS;
+
+    let splitter = build_p2wpkh_tx(
+        &secret_key,
+        &user_pk,
+        funding_txid,
+        cfg.vout,
+        cfg.amount_sats,
+        &[
+            (change_sats, user_spk.clone()),
+            (PARENT_A_SATS, user_spk.clone()),
+            (PARENT_B_SATS, user_spk.clone()),
+            (PARENT_SP_SATS, user_spk.clone()),
+            (FUNDING_SATS, funding_addr.script_pubkey()),
+        ],
+        &secp,
+    );
+
+    info!("Built splitter with change {change_sats} sats and 4 child outputs ({} + {} + {} + {}) sats",
+        PARENT_A_SATS, PARENT_B_SATS, PARENT_SP_SATS, FUNDING_SATS
+    );
+
+    let splitter_txid = splitter.compute_txid();
+
+    let parent_a_out = PARENT_A_SATS - TX_FEE_SATS;
+    let parent_a = build_p2wpkh_tx(
+        &secret_key,
+        &user_pk,
+        splitter_txid,
+        1,
+        PARENT_A_SATS,
+        &[(parent_a_out, user_spk.clone())],
+        &secp,
+    );
+    let parent_a_txid = parent_a.compute_txid();
+
+    let parent_b_out = PARENT_B_SATS - TX_FEE_SATS;
+    let parent_b = build_p2wpkh_tx(
+        &secret_key,
+        &user_pk,
+        splitter_txid,
+        2,
+        PARENT_B_SATS,
+        &[(parent_b_out, user_spk.clone())],
+        &secp,
+    );
+    let parent_b_txid = parent_b.compute_txid();
+
+    let child_b_out = parent_b_out - TX_FEE_SATS;
+    let child_b = build_p2wpkh_tx(
+        &secret_key,
+        &user_pk,
+        parent_b_txid,
+        0,
+        parent_b_out,
+        &[(child_b_out, user_spk.clone())],
+        &secp,
+    );
+    let child_b_txid = child_b.compute_txid();
+
+    let parent_sp_out = PARENT_SP_SATS - TX_FEE_SATS;
+    let parent_sp = build_p2wpkh_tx(
+        &secret_key,
+        &user_pk,
+        splitter_txid,
+        3,
+        PARENT_SP_SATS,
+        &[(parent_sp_out, parent_dest_addr.script_pubkey())],
+        &secp,
+    );
+    let parent_sp_txid = parent_sp.compute_txid();
+
+    let funding_utxo = Utxo::new(splitter_txid, 4, FUNDING_SATS, &funding_pk);
+    let speedup_data =
+        SpeedupData::new(Utxo::new(parent_sp_txid, 0, parent_sp_out, &parent_dest_pk));
+
+    // ──────────────────────── Coordinator setup ────────────────────────
+    let storage_cfg = StorageTestConfig::new();
+    let coordinator = BitcoinCoordinator::new_with_paths(
+        &testnet_rpc_config(),
+        storage_cfg.get_raw_storage(),
+        key_manager,
+        Some(testnet_lifecycle_settings()),
+    )
+    .expect("failed to create coordinator");
+
+    info!("[lifecycle++] phase 1: syncing to near-tip");
+    tick_until_ready(&coordinator).unwrap();
+    info!("[lifecycle++] splitter   = {splitter_txid}");
+    info!("[lifecycle++] parent_a   = {parent_a_txid}");
+    info!("[lifecycle++] parent_b   = {parent_b_txid}");
+    info!("[lifecycle++] child_b    = {child_b_txid}");
+    info!("[lifecycle++] parent_sp  = {parent_sp_txid}");
+
+    // ────────────────────────Exercise the cancel path: monitor an unrelated txid, then drop it ────────────────────────
+    coordinator
+        .monitor(TypesToMonitor::Transactions(
+            vec![funding_txid],
+            ctx.clone(),
+            Some(1),
+        ))
+        .unwrap();
+    coordinator
+        .cancel(TypesToMonitor::Transactions(
+            vec![funding_txid],
+            ctx.clone(),
+            Some(1),
+        ))
+        .unwrap();
+
+    // ──────────────────────── Register funding + dispatch the 5 user txs in a single tick ────────────────────────
+    coordinator.add_funding(funding_utxo).unwrap();
+
+    coordinator
+        .dispatch_without_speedup(splitter, ctx.clone(), None, Some(1), None)
+        .unwrap();
+    // parent_a sets a high stuck_in_mempool threshold (no firing expected).
+    coordinator
+        .dispatch_without_speedup(parent_a, ctx.clone(), None, Some(1), Some(1_000))
+        .unwrap();
+    // parent_b + child_b exercise topological sort in one tick.
+    coordinator
+        .dispatch_without_speedup(parent_b, ctx.clone(), None, Some(1), None)
+        .unwrap();
+    coordinator
+        .dispatch_without_speedup(child_b, ctx.clone(), None, Some(1), None)
+        .unwrap();
+    // CPFP path: speedup_data carries parent_sp's output for the auto-built CPFP.
+    coordinator
+        .dispatch_with_speedup(parent_sp, speedup_data, ctx.clone(), None, Some(1))
+        .unwrap();
+
+    let coord_storage = testnet_coord_storage(&storage_cfg);
+
+    // ──────────────────────── Phase 2: tick once and confirm the splitter reaches InMempool ────────────────────────
+    info!("[lifecycle++] phase 2: dispatching all in one tick");
+    let reached = poll_until_state_with_sleep(
+        &coordinator,
+        &coord_storage,
+        splitter_txid,
+        TransactionState::InMempool,
+        Duration::from_secs(3 * 60),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "splitter {splitter_txid} did not reach InMempool within 3 min"
+    );
+
+    // Splitter is in mempool, its outputs exist for spending. Persist the yaml
+    // pointer to splitter:0 (change) so the next run can resume cleanly.
+    update_local_config_after_spend(splitter_txid, change_sats);
+    info!("[lifecycle++] yaml updated: next funding = {splitter_txid}:0 ({change_sats} sats)");
+
+    // Capture the auto-built CPFP txid.
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(
+        speedups.len(),
+        1,
+        "exactly one CPFP must be created after the dispatch tick"
+    );
+    let cpfp_txid = speedups[0].txid;
+    info!("[lifecycle++] cpfp = {cpfp_txid}");
+
+    let user_txids = vec![
+        splitter_txid,
+        parent_a_txid,
+        parent_b_txid,
+        child_b_txid,
+        parent_sp_txid,
+    ];
+    let mut all_txids = user_txids.clone();
+    all_txids.push(cpfp_txid);
+
+    info!("[lifecycle++] waiting for all 6 txs to reach InMempool");
+    let reached = poll_until_all_states_sleep(
+        &coordinator,
+        &coord_storage,
+        &all_txids,
+        TransactionState::InMempool,
+        Duration::from_secs(3 * 60),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(reached, "not all txs reached InMempool within 3 min");
+
+    // ──────────────────────── Phase 3: block 1 -> Confirmed ────────────────────────
+    info!("[lifecycle++] phase 3: waiting for Confirmed (1 testnet block, up to 40 min)");
+    let reached = poll_until_all_states_sleep(
+        &coordinator,
+        &coord_storage,
+        &all_txids,
+        TransactionState::Confirmed,
+        Duration::from_secs(40 * 60),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(reached, "not all txs reached Confirmed within 40 min");
+
+    let news = drain_news(&coordinator);
+    for txid in &user_txids {
+        let saw = news.monitor_news.iter().any(|n| {
+            matches!(
+                n,
+                MonitorNews::Transaction(id, status, _) if id == txid && status.is_confirmed()
+            )
+        });
+        assert!(saw, "no Confirmed monitor news for {txid}");
+    }
+    info!("[lifecycle++] phase 3: all Confirmed + confirmation news verified");
+
+    // ──────────────────────── Phase 4: block 2 -> Finalized ────────────────────────
+    info!("[lifecycle++] phase 4: waiting for Finalized (block 2, up to 40 min)");
+    let reached = poll_until_all_states_sleep(
+        &coordinator,
+        &coord_storage,
+        &all_txids,
+        TransactionState::Finalized,
+        Duration::from_secs(40 * 60),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(reached, "not all txs reached Finalized within 40 min");
+    let _ = drain_news(&coordinator);
+    info!("[lifecycle++] phase 4: all Finalized — full lifecycle complete ✓");
+
+    drop(coordinator);
+    drop(coord_storage);
+    storage_cfg.remove().unwrap();
+}
+
+// ===================================================
+// Helpers
+// ===================================================
+
+fn testnet_rpc_config() -> RpcConfig {
+    let cfg = load_local_config();
+    RpcConfig::new(
+        Network::Testnet,
+        cfg.url,
+        "".to_string(),
+        "".to_string(),
+        "test_wallet".to_string(),
+    )
+}
+
+/// Returns `BitcoinSettings` with a checkpoint 10 blocks behind the current tip,
+/// so the coordinator only needs to sync a handful of blocks.
+fn testnet_settings_near_tip() -> BitcoinSettings {
+    let client = BitcoinClient::new_from_config(&testnet_rpc_config())
+        .expect("failed to connect to testnet RPC");
+    let tip = client
+        .client
+        .get_block_count()
+        .expect("failed to get block count") as u32;
+    let checkpoint = tip.saturating_sub(10);
+    BitcoinSettings {
+        monitor: MonitorSettingsConfig {
+            indexer_settings: Some(IndexerSettings {
+                checkpoint_height: Some(checkpoint),
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+fn testnet_coord_storage(storage: &StorageTestConfig) -> CoordinatorStorage {
+    CoordinatorStorage::new(
+        storage.get_raw_storage(),
+        CoordinatorStorageSettings::default(),
+    )
+}
+
+/// Settings for the full lifecycle test: 2 confirmations to finalize, evict after 1
+/// tracking block. Both values are as small as the system allows so the test
+/// completes in ~3 testnet blocks (~30 min).
+fn testnet_lifecycle_settings() -> BitcoinSettings {
+    let client = BitcoinClient::new_from_config(&testnet_rpc_config())
+        .expect("failed to connect to testnet RPC");
+    let tip = client
+        .client
+        .get_block_count()
+        .expect("failed to get block count") as u32;
+    let checkpoint = tip.saturating_sub(10);
+    BitcoinSettings {
+        monitor: MonitorSettingsConfig {
+            max_monitoring_confirmations: Some(2),
+            indexer_settings: Some(IndexerSettings {
+                checkpoint_height: Some(checkpoint),
+            }),
+        },
+        storage: CoordinatorStorageSettings {
+            max_tracking_confirmations: 1,
+        },
+        ..Default::default()
+    }
+}
+
+/// Tick once, then sleep `interval`. Returns `true` as soon as `txid` reaches
+/// `expected` state in storage; returns `false` if `timeout` is exceeded.
+fn poll_until_state_with_sleep(
+    coordinator: &BitcoinCoordinator,
+    storage: &CoordinatorStorage,
+    txid: Txid,
+    expected: TransactionState,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<bool, BitcoinCoordinatorError> {
+    let start = Instant::now();
+    loop {
+        coordinator.tick()?;
+        if let Some(tx) = storage.get_tx_by_id(txid)? {
+            if tx.state == expected {
+                return Ok(true);
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Ok(false);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Get pending news, ack every item, and return the snapshot.
+fn drain_news(coordinator: &BitcoinCoordinator) -> News {
+    let news = coordinator.get_news().unwrap();
+    info!(
+        "Draining news: {} monitor news, {} coordinator news",
+        news.monitor_news.len(),
+        news.coordinator_news.len()
+    );
+    for n in &news.monitor_news {
+        let ack = match n {
+            MonitorNews::Transaction(t, _, ctx) => AckMonitorNews::Transaction(*t, ctx.clone()),
+            MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
+            MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
+                AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
+            }
+            MonitorNews::OutputPatternTransaction(t, _, ctx) => {
+                AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
+            }
+        };
+        coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
+    }
+    for n in &news.coordinator_news {
+        coordinator
+            .ack_news(AckNews::Coordinator(n.clone()))
+            .unwrap();
+    }
+    news
+}
+
+/// Tick + sleep until  `TransactionEvicted` coordinator news item is seen for it.
+fn poll_until_evicted(
+    coordinator: &BitcoinCoordinator,
+    txid: Txid,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<bool, BitcoinCoordinatorError> {
+    let start = Instant::now();
+    loop {
+        coordinator.tick()?;
+        let news = coordinator.get_news()?;
+        let evicted = news.coordinator_news.iter().any(
+            |n| matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == txid),
+        );
+        if evicted {
+            // ack everything accumulated
+            for n in &news.monitor_news {
+                let ack = match n {
+                    MonitorNews::Transaction(t, _, ctx) => {
+                        AckMonitorNews::Transaction(*t, ctx.clone())
+                    }
+                    MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
+                    MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
+                        AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
+                    }
+                    MonitorNews::OutputPatternTransaction(t, _, ctx) => {
+                        AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
+                    }
+                };
+                coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
+            }
+            for n in &news.coordinator_news {
+                coordinator
+                    .ack_news(AckNews::Coordinator(n.clone()))
+                    .unwrap();
+            }
+            return Ok(true);
+        }
+        if start.elapsed() >= timeout {
+            return Ok(false);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+/// Fields from `tests/testnet_local.yaml`.
+#[derive(Deserialize)]
+struct TestnetLocalConfig {
+    url: String,
+    secret: String,
+    txid: String,
+    vout: u32,
+    amount_sats: u64,
+}
+
+fn load_local_config() -> TestnetLocalConfig {
+    load_config_file(Some("tests/testnet_local.yaml".to_string()))
+        .expect("Fill in tests/testnet_local.yaml before running this test")
+}
+
+/// Rewrites the UTXO fields in `tests/testnet_local.yaml` after a spend so
+/// the remaining output is ready for the next run.
+fn update_local_config_after_spend(new_txid: Txid, new_amount_sats: u64) {
+    let path = "tests/testnet_local.yaml";
+    let content = std::fs::read_to_string(path).expect("failed to read testnet_local.yaml");
+    let updated = content
+        .lines()
+        .map(|line| {
+            if line.starts_with("txid:") {
+                format!("txid: \"{new_txid}\"")
+            } else if line.starts_with("vout:") {
+                "vout: 0".to_string()
+            } else if line.starts_with("amount_sats:") {
+                format!("amount_sats: {new_amount_sats}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(path, updated).expect("failed to update testnet_local.yaml");
+}
+
+/// Builds and signs a P2WPKH self-transfer. Accepts WIF or 64-char hex secret.
+/// Returns the signed transaction and the fee paid.
+fn build_signed_p2wpkh_tx(
+    secret: &str,
+    funding_txid: Txid,
+    funding_vout: u32,
+    funding_amount_sats: u64,
+) -> (Transaction, u64) {
+    let secp = Secp256k1::new();
+
+    let secret_key = if secret.len() == 64 {
+        let bytes = hex::decode(secret).expect("invalid hex secret");
+        SecretKey::from_slice(&bytes).expect("invalid secret key bytes")
+    } else {
+        bitcoin::PrivateKey::from_wif(secret)
+            .expect("invalid WIF secret")
+            .inner
+    };
+
+    let public_key = PublicKey::new(secret_key.public_key(&secp));
+    let compressed = CompressedPublicKey::try_from(public_key).expect("key is not compressed");
+    let address = Address::p2wpkh(&compressed, Network::Testnet);
+    let spk = address.script_pubkey();
+    let input_amount = bitcoin::Amount::from_sat(funding_amount_sats);
+
+    // Build with a zero-value placeholder output so the witness is in place before we measure
+    // weight, so the fee can be accurately derived.
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: funding_txid,
+                vout: funding_vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: spk.clone(),
+        }],
+    };
+
+    // Sign once to populate the witness (P2WPKH witness size is deterministic,
+    // so this gives us the true transaction weight).
+    let sign = |tx: &Transaction| {
+        let sighash = SighashCache::new(tx)
+            .p2wpkh_signature_hash(0, &spk, input_amount, EcdsaSighashType::All)
+            .expect("failed to compute sighash");
+        let sig = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), &secret_key);
+        Witness::p2wpkh(&EcdsaSig::sighash_all(sig), &public_key.inner)
+    };
+    tx.input[0].witness = sign(&tx);
+
+    // Derive fee from the actual weight of the signed transaction.
+    let fee_sats = tx.weight().to_vbytes_ceil() * FEE_RATE_SAT_PER_VBYTE;
+    tx.output[0].value = bitcoin::Amount::from_sat(
+        funding_amount_sats
+            .checked_sub(fee_sats)
+            .expect("amount too small to cover fee"),
+    );
+
+    // Re-sign now that the output amount is correct (outputs are part of the sighash).
+    tx.input[0].witness = sign(&tx);
+
+    info!(
+        "Built transaction {} with weight {} wu, fee {} sats",
+        tx.compute_txid(),
+        tx.weight(),
+        fee_sats
+    );
+
+    (tx, fee_sats)
+}
+
+/// Parse a 64-char hex or WIF secret into a `SecretKey`.
+fn parse_secret_key(secret: &str) -> SecretKey {
+    if secret.len() == 64 {
+        let bytes = hex::decode(secret).expect("invalid hex secret");
+        SecretKey::from_slice(&bytes).expect("invalid secret key bytes")
+    } else {
+        bitcoin::PrivateKey::from_wif(secret)
+            .expect("invalid WIF secret")
+            .inner
+    }
+}
+
+/// P2WPKH testnet address for `pubkey`.
+fn p2wpkh_addr(pubkey: &PublicKey) -> Address {
+    let compressed = CompressedPublicKey::try_from(*pubkey).expect("compressed pubkey");
+    Address::p2wpkh(&compressed, Network::Testnet)
+}
+
+/// Builds and signs a P2WPKH transaction with a single input owned by
+/// `(secret_key, public_key)` and an arbitrary list of `(amount_sats, spk)` outputs.
+fn build_p2wpkh_tx(
+    secret_key: &SecretKey,
+    public_key: &PublicKey,
+    funding_txid: Txid,
+    funding_vout: u32,
+    funding_amount_sats: u64,
+    outputs: &[(u64, ScriptBuf)],
+    secp: &Secp256k1<bitcoin::secp256k1::All>,
+) -> Transaction {
+    let compressed = CompressedPublicKey::try_from(*public_key).expect("compressed pubkey");
+    let address = Address::p2wpkh(&compressed, Network::Testnet);
+    let spk = address.script_pubkey();
+    let input_amount = Amount::from_sat(funding_amount_sats);
+
+    let mut tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: funding_txid,
+                vout: funding_vout,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: outputs
+            .iter()
+            .map(|(amount, script)| TxOut {
+                value: Amount::from_sat(*amount),
+                script_pubkey: script.clone(),
+            })
+            .collect(),
+    };
+
+    let sighash = SighashCache::new(&tx)
+        .p2wpkh_signature_hash(0, &spk, input_amount, EcdsaSighashType::All)
+        .expect("failed to compute sighash");
+    let sig = secp.sign_ecdsa(&Message::from_digest(sighash.to_byte_array()), secret_key);
+    tx.input[0].witness = Witness::p2wpkh(&EcdsaSig::sighash_all(sig), &public_key.inner);
+
+    tx
+}
+
+/// Tick + sleep until every txid in `txids` reaches `expected`, or `timeout`.
+fn poll_until_all_states_sleep(
+    coordinator: &BitcoinCoordinator,
+    storage: &CoordinatorStorage,
+    txids: &[Txid],
+    expected: TransactionState,
+    timeout: Duration,
+    interval: Duration,
+) -> Result<bool, BitcoinCoordinatorError> {
+    let start = Instant::now();
+    loop {
+        coordinator.tick()?;
+        let all_reached = txids.iter().all(|t| {
+            storage
+                .get_tx_by_id(*t)
+                .ok()
+                .flatten()
+                .map_or(false, |tx| tx.state == expected)
+        });
+        if all_reached {
+            return Ok(true);
+        }
+        if start.elapsed() >= timeout {
+            let not_reached = txids
+                .iter()
+                .filter_map(|t| storage.get_tx_by_id(*t).ok().flatten())
+                .filter(|tx| tx.state != expected)
+                .map(|tx| (tx.txid, tx.state))
+                .collect::<Vec<_>>();
+            info!("Txids not in {expected:?} after timeout: {not_reached:?}");
+            return Ok(false);
+        }
+        std::thread::sleep(interval);
+    }
+}
+
+// #[test]
+// #[ignore]
+// fn test_get_mempool_transaction() {
+//     init_trace();
+
+//     let cfg = load_local_config();
+//     let funding_txid: Txid = cfg
+//         .txid
+//         .parse()
+//         .expect("invalid txid in testnet_local.yaml");
+
+//     let rpc_config = testnet_rpc_config();
+
+//     let rpc_client =
+//         BitcoinClient::new_from_config(&rpc_config).expect("failed to create RPC client");
+
+//     let txid = "42c4ef474a9e62d27af99762dcd34bfb2e35968e66d8f4544aa2c4a1d5cbb9cb"
+//         .parse()
+//         .unwrap();
+//     let result = rpc_client.check_in_mempool(&txid);
+
+//     info!("check_in_mempool result for {}: {:?}", funding_txid, result);
+// }

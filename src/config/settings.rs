@@ -26,7 +26,7 @@ pub const MAX_MAX_RBF_ATTEMPTS: u32 = 20;
 
 // Minimum funding amount in sats to ensure sufficient funds for speedups
 pub const DEFAULT_MIN_FUNDING_AMOUNT_SATS: u64 = 10_000;
-pub const MIN_MIN_FUNDING_AMOUNT_SATS: u64 = 1_000;
+pub const MIN_MIN_FUNDING_AMOUNT_SATS: u64 = 10_000;
 
 // Minimum blocks to wait before attempting to resend a speedup transaction (CPFP or RBF)
 pub const DEFAULT_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP: u32 = 1;

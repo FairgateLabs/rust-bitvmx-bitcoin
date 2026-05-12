@@ -73,6 +73,9 @@ impl Dispatcher {
 
         for tx in ordered {
             let txid = tx.compute_txid();
+
+            #[cfg(feature = "testnet-test-delay")]
+            std::thread::sleep(std::time::Duration::from_secs(10));
             let outcome = match self.bitcoin_client.send_transaction(&tx) {
                 Ok(_) => DispatchOutcome::Success,
                 Err(e) => classify_error(&e.to_string()),
