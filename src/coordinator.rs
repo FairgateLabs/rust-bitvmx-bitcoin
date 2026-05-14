@@ -99,9 +99,8 @@ impl BitcoinCoordinator {
         }
 
         self.speedup_engine.process_active_transactions()?;
-        let dispatched_parents = self.tx_engine.process_active_transactions()?;
-        self.speedup_engine
-            .create_cpfps_for_parents(&dispatched_parents)?;
+        self.tx_engine.process_active_transactions()?;
+        self.speedup_engine.create_cpfps_for_parents()?;
 
         Ok(())
     }
@@ -333,7 +332,7 @@ impl BitcoinCoordinator {
         self.tx_engine.ctx.storage.insert_tx(CoordinatedTx {
             txid,
             tx,
-            kind,
+            kind: kind.clone(),
             state: TransactionState::ToDispatch,
             broadcast_block_height: None,
             target_block_height: target_height,
@@ -344,6 +343,10 @@ impl BitcoinCoordinator {
             fee_info,
             context,
         })?;
+
+        if matches!(kind, TxKind::NeedsSpeedup(_)) {
+            self.tx_engine.ctx.storage.add_pending_speedup_parent(txid)?;
+        }
 
         Ok(())
     }

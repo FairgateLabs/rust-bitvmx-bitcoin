@@ -17,9 +17,15 @@ pub struct CoordinatorStorage {
 }
 
 enum StoreKey {
+    /// Individual coordinated transaction record (Normal / NeedsSpeedup / Speedup).
     Tx(Txid),
+    /// Ordered list of coordinator and monitor news items awaiting acknowledgement.
     News,
+    /// Ordered list of Speedup-kind transaction ids (CPFPs / RBFs), insertion order.
     SpeedupList,
+    /// Set of NeedsSpeedup parent txids that still require a CPFP to be built.
+    /// Added on dispatch_with_speedup; removed when the covering CPFP is dispatched.
+    PendingSpeedupParents,
 }
 
 impl CoordinatorStorage {
@@ -317,6 +323,66 @@ impl CoordinatorStorage {
     }
 
     // ================================
+    // PENDING SPEEDUP PARENTS
+    // ================================
+
+    /// Record that `txid` (a `NeedsSpeedup` parent) is waiting for a CPFP.
+    pub fn add_pending_speedup_parent(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::PendingSpeedupParents);
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        if !list.contains(&txid) {
+            list.push(txid);
+            self.storage.set(&key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    /// Remove `txid` from the pending set (CPFP dispatched or parent no longer active).
+    pub fn remove_pending_speedup_parent(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::PendingSpeedupParents);
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let before = list.len();
+        list.retain(|id| id != &txid);
+        if list.len() != before {
+            self.storage.set(&key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    /// Return the `CoordinatedTx` records for all pending speedup parents that
+    /// are currently `InMempool`. Parents in `Confirmed`, `Finalized`, `Failed`,
+    /// or that no longer exist in storage are pruned from the set automatically.
+    pub fn get_pending_speedup_parents(
+        &self,
+    ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        let list: Vec<Txid> = {
+            let key = self.get_key(StoreKey::PendingSpeedupParents);
+            self.storage.get(&key, None)?.unwrap_or_default()
+        };
+        let mut live = Vec::new();
+        for txid in list {
+            match self.get_tx_by_id(txid)? {
+                Some(tx) if tx.state == TransactionState::InMempool => live.push(tx),
+                Some(tx)
+                    if matches!(
+                        tx.state,
+                        TransactionState::Confirmed
+                            | TransactionState::Finalized
+                            | TransactionState::Failed
+                    ) =>
+                {
+                    self.remove_pending_speedup_parent(txid)?;
+                }
+                None => {
+                    self.remove_pending_speedup_parent(txid)?;
+                }
+                _ => {} // ToDispatch: not yet in mempool, skip
+            }
+        }
+        Ok(live)
+    }
+
+    // ================================
     //  NEWS
     // ================================
 
@@ -368,6 +434,7 @@ impl CoordinatorStorage {
             StoreKey::Tx(tx_id) => format!("{prefix}/txs/{tx_id}"),
             StoreKey::News => format!("{prefix}/news"),
             StoreKey::SpeedupList => format!("{prefix}/speedup/list"),
+            StoreKey::PendingSpeedupParents => format!("{prefix}/speedup/pending_parents"),
         }
     }
 }

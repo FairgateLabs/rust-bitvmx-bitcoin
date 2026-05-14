@@ -4,7 +4,8 @@ use common::*;
 use bitcoin::Network;
 use bitcoin_coordinator::{
     config::config::{
-        BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings, SpeedupSettings,
+        BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings, FeeSettings,
+        SpeedupSettings,
     },
     types::{CoordinatorNews, TransactionState},
 };
@@ -50,6 +51,18 @@ fn boost_settings(max_unconfirmed: u32) -> BitcoinSettings {
             min_blocks_before_resend_speedup: 1,
             rbf_fee_multiplier: 1.5,
             bump_fee_percentage: 2.0,
+        },
+        ..cpfp_settings()
+    }
+}
+
+/// Settings that inflate the CPFP fee so a 10 000-sat funding can't cover it.
+fn multi_funding_settings() -> BitcoinSettings {
+    BitcoinSettings {
+        fee: FeeSettings {
+            min_network_fee_rate: 80,
+            max_feerate_sat_vb: 1000,
+            base_fee_multiplier: 1.0,
         },
         ..cpfp_settings()
     }
@@ -832,8 +845,264 @@ fn test_cpfp_funding_restored_after_finalization() {
             .input
             .iter()
             .any(|inp| inp.previous_output.txid == cpfp1_txid),
-        "CPFP2 must spend CPFP1's confirmed change output (cpfp1={}) — funding chain not restored",
+        "CPFP2 must spend CPFP1's confirmed change output (cpfp1={}). Funding chain not restored",
         cpfp1_txid
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Two fundings are registered; the first is below the CPFP fee, the second
+/// is plenty. The coordinator must advance past the first and build the CPFP
+/// against the second without emitting `InsufficientFunds`.
+#[test]
+fn test_cpfp_advances_to_next_funding() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = dummy_key_manager();
+    let coordinator =
+        create_coordinator_with_km(&setup, Rc::clone(&key_manager), multi_funding_settings());
+    let coord_storage = get_coord_storage(&setup);
+
+    // Funding A: exactly at min_funding_amount_sats (10 000). Will pass the
+    // add-time validator but the inflated CPFP fee (~100 sat/vB * ~200 vB =
+    // ~20 000) will exceed its amount.
+    let funding_a = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        10_000,
+    )
+    .unwrap();
+    // Funding B: comfortably above any plausible CPFP fee at this multiplier.
+    let funding_b = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000_000,
+    )
+    .unwrap();
+
+    // Small parent output so the CPFP can't offset its fee with the value it
+    // claims back from the parent.
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000,
+    )
+    .unwrap();
+    let parent_txid = parent_tx.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_a.clone()).unwrap();
+    coordinator.add_funding(funding_b.clone()).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("multi_funding"), None, None)
+        .unwrap();
+
+    // Tick 1: parent dispatches (InMempool), CPFP build with A fails (fee
+    // exceeds A.amount), funding advances to B.
+    coordinator.tick().unwrap();
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "parent must stay InMempool after CPFP build fails (pending set handles retry)"
+    );
+    assert!(
+        coord_storage.get_speedups_ordered().unwrap().is_empty(),
+        "no CPFP must be created when funding A is insufficient"
+    );
+    let news_after_tick1 = coordinator.get_news().unwrap();
+    assert!(
+        news_after_tick1
+            .coordinator_news
+            .iter()
+            .any(|n| matches!(n, CoordinatorNews::FundingConsumed { txid, .. } if *txid == funding_a.txid)),
+        "FundingConsumed must fire for funding A; got {:?}",
+        news_after_tick1.coordinator_news
+    );
+    assert!(
+        !news_after_tick1
+            .coordinator_news
+            .iter()
+            .any(|n| matches!(n, CoordinatorNews::InsufficientFunds { .. })),
+        "no InsufficientFunds while the queue still has B; got {:?}",
+        news_after_tick1.coordinator_news
+    );
+    ack_all_news(&coordinator, &news_after_tick1);
+
+    // Tick 2: pending set still has parent (InMempool), CPFP built with B.
+    coordinator.tick().unwrap();
+
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(
+        speedups.len(),
+        1,
+        "exactly one CPFP must exist after the second tick"
+    );
+    let cpfp = &speedups[0];
+    assert_eq!(
+        cpfp.state,
+        TransactionState::InMempool,
+        "CPFP must be InMempool"
+    );
+
+    // The CPFP must spend funding B, not funding A.
+    assert!(
+        cpfp.tx
+            .input
+            .iter()
+            .any(|i| i.previous_output.txid == funding_b.txid),
+        "CPFP must spend funding B",
+    );
+    assert!(
+        cpfp.tx
+            .input
+            .iter()
+            .all(|i| i.previous_output.txid != funding_a.txid),
+        "CPFP must not spend funding A (advanced past)"
+    );
+
+    // Confirming block: parent and CPFP both reach Confirmed.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let reached = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent_txid, cpfp.txid],
+        TransactionState::Confirmed,
+        10,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "parent and CPFP must both reach Confirmed after one block"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// When the funding queue is entirely exhausted (all entries too small),
+/// `InsufficientFunds` is emitted and the parent stays in `InMempool` with
+/// no CPFP. Once the user registers new funding, the next tick picks up the
+/// parent from the pending set and creates the CPFP
+#[test]
+fn test_cpfp_recovers_after_queue_was_exhausted() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = dummy_key_manager();
+    let coordinator =
+        create_coordinator_with_km(&setup, Rc::clone(&key_manager), multi_funding_settings());
+    let coord_storage = get_coord_storage(&setup);
+
+    // Create both UTXOs up front (each mines a block) so no block is mined between ticks
+    let funding_a = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        10_000,
+    )
+    .unwrap();
+    let funding_b = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000_000,
+    )
+    .unwrap();
+
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000,
+    )
+    .unwrap();
+    let parent_txid = parent_tx.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+    // Register only A with the coordinator. B is confirmed on-chain but
+    // the coordinator doesn't know about it yet (simulates user adding funding
+    // after the queue was exhausted).
+    let funding_a_txid = funding_a.txid;
+    coordinator.add_funding(funding_a).unwrap();
+    coordinator
+        .dispatch_with_speedup(
+            parent_tx,
+            speedup_data,
+            ctx("exhausted_funding"),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Tick 1: CPFP fails, queue advances → empty, InsufficientFunds fired.
+    coordinator.tick().unwrap();
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "parent must stay InMempool after queue exhaustion"
+    );
+    assert!(
+        coord_storage.get_speedups_ordered().unwrap().is_empty(),
+        "no CPFP must exist after queue exhaustion"
+    );
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.coordinator_news
+            .iter()
+            .any(|n| matches!(n, CoordinatorNews::FundingConsumed { txid, .. } if *txid == funding_a_txid)),
+        "FundingConsumed must fire for funding A; got {:?}",
+        news.coordinator_news
+    );
+    assert!(
+        news.coordinator_news
+            .iter()
+            .any(|n| matches!(n, CoordinatorNews::InsufficientFunds { .. })),
+        "InsufficientFunds must be emitted when the queue is empty; got {:?}",
+        news.coordinator_news
+    );
+    ack_all_news(&coordinator, &news);
+
+    // User now registers B. The coordinator learns about it without mining.
+    coordinator.add_funding(funding_b.clone()).unwrap();
+
+    // Tick 2: pending set has parent → CPFP built with B → dispatched.
+    coordinator.tick().unwrap();
+
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 1, "exactly one CPFP after recovery");
+    let cpfp = &speedups[0];
+    assert_eq!(cpfp.state, TransactionState::InMempool);
+    assert!(
+        cpfp.tx
+            .input
+            .iter()
+            .any(|i| i.previous_output.txid == funding_b.txid),
+        "CPFP must spend funding B"
+    );
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        !news
+            .coordinator_news
+            .iter()
+            .any(|n| matches!(n, CoordinatorNews::InsufficientFunds { .. })),
+        "no further InsufficientFunds after recovery; got {:?}",
+        news.coordinator_news
     );
 
     drop(coordinator);

@@ -24,21 +24,22 @@ impl FundingManager {
         Self { settings, storage }
     }
 
-    /// Validate and persist a new funding UTXO.
+    /// Validate `utxo` and append it to the back of the funding queue. The
+    /// head of the queue (index 0) is the active base; subsequent entries are
+    /// pending fallbacks consumed in FIFO order by `advance_funding`.
     pub fn set_funding(
         &self,
         utxo: Utxo,
     ) -> Result<Option<CoordinatorNews>, BitcoinCoordinatorError> {
         match self.validate(&utxo) {
             Ok(()) => {
-                self.update_funding(utxo)?;
+                let mut queue = self.read_queue()?;
+                queue.push(utxo);
+                self.write_queue(&queue)?;
                 Ok(None)
             }
             Err(news) => {
                 warn!("FundingManager: invalid funding utxo: {:?}", utxo);
-                // Clear any stale value so a previously valid UTXO is not
-                // accidentally reused after a failed update.
-                self.storage.remove(FUNDING_KEY, None)?;
                 Ok(Some(news))
             }
         }
@@ -51,8 +52,7 @@ impl FundingManager {
     /// change output meets `min_funding_amount_sats`. If the chain tip exists but is too small,
     /// older live txs are already spent by it, so Pass 1 stops and falls through.
     ///
-    /// Pass 2: `get_base_funding()`, the last UTXO stored by `set_funding` or `update_funding`
-    /// (only ever written on `Finalized`, so always a real on-chain UTXO).
+    /// Pass 2: `get_base_funding()`, the head of the funding queue.
     pub fn get_funding(
         &self,
         speedups: &[CoordinatedTx],
@@ -84,37 +84,64 @@ impl FundingManager {
             // Older live txs are already spent, so stop Pass 1.
             break;
         }
-        // Pass 2: stored UTXO (last finalized chain output, or user-provided funding)
+        // Pass 2: queue head (last finalized chain output, or user-provided funding)
         self.get_base_funding()
     }
 
-    /// Load the raw stored funding UTXO from storage.
-    fn get_base_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
-        Ok(self.storage.get(FUNDING_KEY, None)?)
+    /// Return the head of the funding queue, or `None` if empty.
+    pub fn get_base_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
+        Ok(self.read_queue()?.into_iter().next())
     }
 
-    /// Overwrite the funding UTXO without validation. Only for `Finalized` txs,
-    /// so `get_base_funding()` always holds a confirmed UTXO and is resilient to
-    /// mempool evictions and reorgs.
+    /// Pop the head of the queue and return the new head, or `None` if the
+    /// queue is now empty.
+    pub fn advance_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
+        let mut queue = self.read_queue()?;
+        if queue.is_empty() {
+            return Ok(None);
+        }
+        queue.remove(0);
+        self.write_queue(&queue)?;
+        Ok(queue.into_iter().next())
+    }
+
+    /// Overwrite the head of the funding queue without validation. Only
+    /// for `Finalized` txs, so the head always holds a confirmed UTXO and is
+    /// resilient to mempool evictions and reorgs.
     pub fn update_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
-        self.storage.set(FUNDING_KEY, &utxo, None)?;
+        let mut queue = self.read_queue()?;
+        if queue.is_empty() {
+            queue.push(utxo);
+        } else {
+            queue[0] = utxo;
+        }
+        self.write_queue(&queue)?;
         Ok(())
     }
 
-    /// Remove the funding UTXO from storage.
+    /// Remove every funding UTXO from storage.
     pub fn clear_funding(&self) -> Result<(), BitcoinCoordinatorError> {
         self.storage.remove(FUNDING_KEY, None)?;
         Ok(())
     }
 
-    /// Return `true` when a funding UTXO is currently stored.
+    /// Return `true` when at least one funding UTXO is currently queued.
     pub fn has_funding(&self) -> Result<bool, BitcoinCoordinatorError> {
-        Ok(self.get_base_funding()?.is_some())
+        Ok(!self.read_queue()?.is_empty())
     }
 
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
+
+    fn read_queue(&self) -> Result<Vec<Utxo>, BitcoinCoordinatorError> {
+        Ok(self.storage.get(FUNDING_KEY, None)?.unwrap_or_default())
+    }
+
+    fn write_queue(&self, queue: &[Utxo]) -> Result<(), BitcoinCoordinatorError> {
+        self.storage.set(FUNDING_KEY, &queue, None)?;
+        Ok(())
+    }
 
     fn validate(&self, utxo: &Utxo) -> Result<(), CoordinatorNews> {
         if utxo.amount < self.settings.min_funding_amount_sats {
@@ -238,22 +265,107 @@ mod tests {
     }
 
     #[test]
-    fn test_set_invalid_funding_below_min_returns_news_and_clears_storage() {
+    fn test_invalid_funding_keeps_queue() {
         let (mgr, config) = make_manager();
 
-        // Set a valid UTXO first, then overwrite with an invalid one.
-        mgr.set_funding(utxo(MIN)).unwrap();
-        let news = mgr.set_funding(utxo(MIN - 1)).unwrap();
+        let valid = utxo(MIN);
+        mgr.set_funding(valid.clone()).unwrap();
 
+        let news = mgr.set_funding(utxo(MIN - 1)).unwrap();
         assert!(matches!(
             news,
             Some(CoordinatorNews::InvalidFundingUtxo { .. })
         ));
 
-        // Invalid UTXO must not be stored, and the previous value must be cleared.
-        assert!(mgr.get_base_funding().unwrap().is_none());
+        // The invalid set_funding leaves the queue untouched.
+        let head = mgr.get_base_funding().unwrap().unwrap();
+        assert_eq!(head.txid, valid.txid);
+        assert_eq!(head.amount, MIN);
+        assert!(mgr.advance_funding().unwrap().is_none());
 
         drop(mgr);
+        config.remove().unwrap();
+    }
+
+    #[test]
+    fn test_add_funding_appends_to_queue() {
+        let (mgr, config) = make_manager();
+
+        let a = utxo(MIN);
+        let b = utxo(MIN * 2);
+        mgr.set_funding(a.clone()).unwrap();
+        mgr.set_funding(b.clone()).unwrap();
+
+        // Head is the first added.
+        assert_eq!(mgr.get_base_funding().unwrap().unwrap().txid, a.txid);
+
+        // After advancing, the second entry becomes the head.
+        let new_head = mgr.advance_funding().unwrap().unwrap();
+        assert_eq!(new_head.txid, b.txid);
+        assert_eq!(mgr.get_base_funding().unwrap().unwrap().txid, b.txid);
+
+        drop(mgr);
+        config.remove().unwrap();
+    }
+
+    #[test]
+    fn test_advance_funding_returns_none_when_empty() {
+        let (mgr, config) = make_manager();
+
+        // Empty queue.
+        assert!(mgr.advance_funding().unwrap().is_none());
+
+        // Single-entry queue: advancing leaves the queue empty.
+        mgr.set_funding(utxo(MIN)).unwrap();
+        assert!(mgr.advance_funding().unwrap().is_none());
+        assert!(!mgr.has_funding().unwrap());
+
+        drop(mgr);
+        config.remove().unwrap();
+    }
+
+    #[test]
+    fn test_update_funding_replaces_head_only() {
+        let (mgr, config) = make_manager();
+
+        let a = utxo(MIN);
+        let b = utxo(MIN * 2);
+        let c = utxo(MIN * 3);
+        mgr.set_funding(a).unwrap();
+        mgr.set_funding(b.clone()).unwrap();
+
+        // Replace the head; the tail (b) must remain.
+        mgr.update_funding(c.clone()).unwrap();
+        assert_eq!(mgr.get_base_funding().unwrap().unwrap().txid, c.txid);
+        assert_eq!(
+            mgr.advance_funding().unwrap().unwrap().txid,
+            b.txid,
+            "second queue entry must be preserved across update_funding"
+        );
+
+        drop(mgr);
+        config.remove().unwrap();
+    }
+
+    #[test]
+    fn test_funding_queue_survives_restart() {
+        let config = StorageTestConfig::new();
+        let storage = config.get_raw_storage();
+
+        let a = utxo(MIN);
+        let b = utxo(MIN * 2);
+
+        let mgr1 = FundingManager::new(settings(), Rc::clone(&storage));
+        mgr1.set_funding(a.clone()).unwrap();
+        mgr1.set_funding(b.clone()).unwrap();
+        drop(mgr1);
+
+        let mgr2 = FundingManager::new(settings(), Rc::clone(&storage));
+        assert_eq!(mgr2.get_base_funding().unwrap().unwrap().txid, a.txid);
+        assert_eq!(mgr2.advance_funding().unwrap().unwrap().txid, b.txid);
+        drop(mgr2);
+
+        drop(storage);
         config.remove().unwrap();
     }
 

@@ -1022,7 +1022,7 @@ fn test_retry_dispatches_after_rate_limit() {
         .unwrap();
     coord_storage.mark_as_retry(txid_subject).unwrap();
 
-    // Ticks 1 and 2 must be blocked — the interval has not elapsed yet.
+    // Ticks 1 and 2 must be blocked. The interval has not elapsed yet.
     for tick in 1..=2 {
         coordinator.tick().unwrap();
         assert_eq!(
@@ -1036,7 +1036,7 @@ fn test_retry_dispatches_after_rate_limit() {
         );
     }
 
-    // Tick 3 — after the interval — must dispatch successfully.
+    // Tick 3: After the interval, must dispatch successfully.
     std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
     coordinator.tick().unwrap();
     assert_eq!(
@@ -1068,7 +1068,7 @@ fn test_retry_failure() {
     // Non-zero min_relay_tx_fee ensures our zero-fee tx is always rejected.
     let setup = TestSetup::new(TestSetupConfig {
         bitcoind_flags: Some(BitcoindFlags {
-            min_relay_tx_fee: 0.00002, // 2 sat/vbyte — zero-fee tx will fail
+            min_relay_tx_fee: 0.00002, // 2 sat/vbyte. Zero-fee tx will fail
             ..BitcoindFlags::default()
         }),
         ..TestSetupConfig::default()
@@ -1094,7 +1094,7 @@ fn test_retry_failure() {
 
     let coord_storage = get_coord_storage(&setup);
 
-    // Tick 1 — first dispatch attempt (retry_count = 0, not rate-limited).
+    // Tick 1: first dispatch attempt (retry_count = 0, not rate-limited).
     // The tx fails → mark_as_retry → retry_count = 1.
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
@@ -1104,7 +1104,7 @@ fn test_retry_failure() {
     );
     assert_eq!(stored.state, TransactionState::ToDispatch);
 
-    // Tick 2 immediately — `last_retry_at` is still None so the first retry is
+    // Tick 2 immediately: `last_retry_at` is still None so the first retry is
     // allowed.  The tx fails again → mark_as_retry → retry_count = 2.
     // `last_retry_at` is now set.
     coordinator.tick().unwrap();
@@ -1115,7 +1115,7 @@ fn test_retry_failure() {
     );
     assert_eq!(stored.state, TransactionState::ToDispatch);
 
-    // Tick 3 immediately — rate-limiter blocks the retry (interval not elapsed).
+    // Tick 3 immediately: rate-limiter blocks the retry (interval not elapsed).
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
     assert_eq!(

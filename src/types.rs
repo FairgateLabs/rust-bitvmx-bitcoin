@@ -129,6 +129,14 @@ pub enum CoordinatorNews {
         txid: Txid,
         context: String,
     },
+    /// A funding UTXO was consumed (too small to cover the speedup fee) and
+    /// the coordinator has advanced to the next entry in the queue. Emitted
+    /// once per consumed entry so the client can track funding depletion.
+    FundingConsumed {
+        txid: Txid,
+        vout: u32,
+        amount: u64,
+    },
     /// Funding UTXO has insufficient balance to cover a speedup fee.
     InsufficientFunds {
         available: u64,
