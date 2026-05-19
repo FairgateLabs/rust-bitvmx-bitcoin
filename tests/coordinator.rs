@@ -1,15 +1,15 @@
 mod common;
 use common::*;
 
+use bitcoin_coordinator::{
+    config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
+    types::{AckNews, CoordinatorNews, TransactionState},
+};
 use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
     types::{MonitorNews, TypesToMonitor},
-};
-use rust_bitvmx_bitcoin::{
-    config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
-    types::{AckNews, CoordinatorNews, TransactionState},
 };
 use tracing::info;
 
@@ -290,6 +290,54 @@ fn test_multiple_txs_dispatched_in_single_tick() {
             txid
         );
     }
+
+    assert!(coordinator.get_news().unwrap().is_empty());
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Registering a parent transaction and a child transaction that spends the
+/// parent's first output, then ticking once, must dispatch both into the
+/// mempool.
+#[test]
+fn test_dispatch_parent_and_child_in_single_tick() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+
+    let (parent, child) = create_parent_and_child_signed_txs(&setup.bitcoin_client);
+    let parent_id = parent.compute_txid();
+    let child_id = child.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+
+    coordinator
+        .dispatch_without_speedup(parent, ctx("parent"), None, None, None)
+        .unwrap();
+    coordinator
+        .dispatch_without_speedup(child, ctx("child"), None, None, None)
+        .unwrap();
+
+    coordinator.tick().unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "parent {parent_id} must be InMempool after batch dispatch"
+    );
+    assert_eq!(
+        coord_storage.get_tx_by_id(child_id).unwrap().unwrap().state,
+        TransactionState::InMempool,
+        "child {child_id} must be InMempool after batch dispatch"
+    );
 
     assert!(coordinator.get_news().unwrap().is_empty());
 
@@ -590,10 +638,7 @@ fn test_add_funding_below_min() {
 }
 
 /// When a valid funding UTXO is in storage and a subsequent call replaces it
-/// with an invalid one, the invalid call must:
-/// 1. Generate an `InvalidFundingUtxo` news item.
-/// 2. Clear the previously valid UTXO from storage so it cannot be
-///    accidentally reused. //TODO: add this to the test when speedup logic is implemented
+/// with an invalid one, the invalid call must generate an `InvalidFundingUtxo` news item.
 #[test]
 fn test_invalid_funding_replaces() {
     init_trace();
@@ -977,7 +1022,7 @@ fn test_retry_dispatches_after_rate_limit() {
         .unwrap();
     coord_storage.mark_as_retry(txid_subject).unwrap();
 
-    // Ticks 1 and 2 must be blocked — the interval has not elapsed yet.
+    // Ticks 1 and 2 must be blocked. The interval has not elapsed yet.
     for tick in 1..=2 {
         coordinator.tick().unwrap();
         assert_eq!(
@@ -991,7 +1036,7 @@ fn test_retry_dispatches_after_rate_limit() {
         );
     }
 
-    // Tick 3 — after the interval — must dispatch successfully.
+    // Tick 3: After the interval, must dispatch successfully.
     std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
     coordinator.tick().unwrap();
     assert_eq!(
@@ -1023,7 +1068,7 @@ fn test_retry_failure() {
     // Non-zero min_relay_tx_fee ensures our zero-fee tx is always rejected.
     let setup = TestSetup::new(TestSetupConfig {
         bitcoind_flags: Some(BitcoindFlags {
-            min_relay_tx_fee: 0.00002, // 2 sat/vbyte — zero-fee tx will fail
+            min_relay_tx_fee: 0.00002, // 2 sat/vbyte. Zero-fee tx will fail
             ..BitcoindFlags::default()
         }),
         ..TestSetupConfig::default()
@@ -1049,7 +1094,7 @@ fn test_retry_failure() {
 
     let coord_storage = get_coord_storage(&setup);
 
-    // Tick 1 — first dispatch attempt (retry_count = 0, not rate-limited).
+    // Tick 1: first dispatch attempt (retry_count = 0, not rate-limited).
     // The tx fails → mark_as_retry → retry_count = 1.
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
@@ -1059,7 +1104,7 @@ fn test_retry_failure() {
     );
     assert_eq!(stored.state, TransactionState::ToDispatch);
 
-    // Tick 2 immediately — `last_retry_at` is still None so the first retry is
+    // Tick 2 immediately: `last_retry_at` is still None so the first retry is
     // allowed.  The tx fails again → mark_as_retry → retry_count = 2.
     // `last_retry_at` is now set.
     coordinator.tick().unwrap();
@@ -1070,7 +1115,7 @@ fn test_retry_failure() {
     );
     assert_eq!(stored.state, TransactionState::ToDispatch);
 
-    // Tick 3 immediately — rate-limiter blocks the retry (interval not elapsed).
+    // Tick 3 immediately: rate-limiter blocks the retry (interval not elapsed).
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
     assert_eq!(

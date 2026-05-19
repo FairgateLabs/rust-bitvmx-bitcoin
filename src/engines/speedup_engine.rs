@@ -6,9 +6,12 @@ use bitvmx_transaction_monitor::types::TypesToMonitor;
 use key_manager::key_manager::KeyManager;
 use protocol_builder::{
     builder::ProtocolBuilder,
-    types::{output::SpeedupData, Utxo},
+    types::{
+        output::{SpeedupData, MAX_DUST_LIMIT},
+        Utxo,
+    },
 };
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     config::{
@@ -24,6 +27,16 @@ use crate::{
     },
 };
 
+/// SpeedupEngine implements the four speedup-related phases of `tick()`:
+/// 1. `dispatch_pending_speedups` — broadcast TO-DISPATCH speedups built in a prior tick.
+/// 2. `review_speedups`           — update state from chain (no dispatch).
+/// 3. `boost_if_stale`            — build a boost CPFP or RBF, save as TO-DISPATCH (no dispatch).
+/// 4. `create_cpfp_batch`         — build one CPFP for the next PendingSpeedupParents batch, save as TO-DISPATCH (no dispatch).
+///
+/// Invariants:
+/// - At most one TO-DISPATCH speedup at a time (more only in reorg/restart edge cases).
+/// - Build/save happens in one tick; dispatch happens the next tick.
+/// - Boost takes priority over new CPFP.
 pub struct SpeedupEngine {
     ctx: Rc<EngineContext>,
     key_manager: Rc<KeyManager>,
@@ -43,135 +56,118 @@ impl SpeedupEngine {
         }
     }
 
-    /// Build and store CPFP transactions for a batch of newly-dispatched parent
-    /// transactions.  Parents are batched by weight up to the available ancestor
-    /// slots; each CPFP spends the change output of the previous one.
+    /// Step 3 of `tick`: broadcast TO-DISPATCH speedups (built and saved in a prior tick).
     ///
-    /// Early exits:
-    /// - All ancestor slots are occupied by in-mempool CPFPs.
-    /// - No funding UTXO is set.
-    /// - The computed fee exceeds the available funding balance.
-    pub fn create_cpfps_for_parents(
-        &self,
-        parents: &[CoordinatedTx],
-    ) -> Result<(), BitcoinCoordinatorError> {
-        if parents.is_empty() {
-            return Ok(());
-        }
+    /// Funding guard: If no funding source is currently available, skip the step entirely.
+    /// Any pre-built speedup whose `fee_info.fee_rate` is below the current `min_safe_fee_rate`
+    /// setting is settled `Failed` and its CPFP parents are re-queued into PendingSpeedupParents.
+    /// On Fatal or retries-exhausted Retryable, the speedup is settled `Failed` and the user is
+    /// notified via news. The CPFP's parents are NOT re-queued into PendingSpeedupParents (except
+    /// "speedup disappeared from mempool" case)
+    pub fn dispatch_pending_speedups(&self) -> Result<(), BitcoinCoordinatorError> {
         let current_height = self.ctx.monitor.get_monitor_height()?;
-
-        // Don't create new CPFPs while evicted speedups are pending re-dispatch —
-        // their pre-built txs already claim the UTXOs in the funding chain.
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
-        if all_speedups
+        let pending: Vec<CoordinatedTx> = all_speedups
             .iter()
-            .any(|tx| tx.state == TransactionState::ToDispatch)
+            .filter(|tx| tx.state == TransactionState::ToDispatch)
+            .cloned()
+            .collect();
+        if pending.is_empty() {
+            return Ok(());
+        }
+
+        if self
+            .ctx
+            .funding_manager
+            .get_funding(&all_speedups)?
+            .is_none()
         {
+            self.ctx
+                .storage
+                .add_news(CoordinatorNews::FundingNotAvailable)?;
+            return Ok(());
+        }
+        let dispatchable = self.verify_min_fee_rate(pending, current_height)?; //TODO: is not efficient to pass all speedups again
+        let dispatchable = self.ctx.apply_retry_rate_limit(dispatchable);
+        for tx in &dispatchable {
+            let _ = self.try_dispatch_speedup(tx, current_height)?;
+        }
+        Ok(())
+    }
+
+    /// Step 2 of `tick`: update each speedup's state from chain. Never dispatches.
+    /// Reorg of a Confirmed speedup moves it back to InMempool
+    pub fn review_speedups(&self) -> Result<(), BitcoinCoordinatorError> {
+        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let all_speedups = self.ctx.storage.get_speedups_ordered()?;
+        if all_speedups.is_empty() {
             return Ok(());
         }
 
-        let unconfirmed = self.ctx.storage.get_unconfirmed_speedups()?;
-        let available_slots = self
-            .settings
-            .max_unconfirmed_speedups
-            .saturating_sub(unconfirmed.len() as u32);
-        if available_slots == 0 {
-            return Ok(());
-        }
+        let max_confs = self.ctx.monitor.settings.max_monitoring_confirmations;
 
-        let (fee_rate, fee_news) = self
-            .ctx
-            .fee_manager
-            .get_network_fee_rate(&self.ctx.monitor)?;
-        if let Some(news) = fee_news {
-            self.ctx.storage.add_news(news)?;
-        }
-
-        let mut funding = match self.ctx.funding_manager.get_funding(&all_speedups)? {
-            Some(f) => f,
-            None => {
-                self.ctx
-                    .storage
-                    .add_news(CoordinatorNews::FundingNotAvailable)?;
-                return Ok(());
-            }
-        };
-
-        let (chain_diff_fee, chain_vsize) =
-            self.ctx.fee_manager.chain_fee_diff(fee_rate, &unconfirmed);
-        let bump_fee = self.ctx.fee_manager.base_fee_multiplier();
-        let batches = self
-            .ctx
-            .dispatcher
-            .batch_by_weight(parents, available_slots);
-
-        for batch in batches {
-            let parent_entries: Vec<(SpeedupData, usize)> = batch
-                .iter()
-                .filter_map(|p| {
-                    if let TxKind::NeedsSpeedup(ref sd) = p.kind {
-                        Some((sd.clone(), p.tx.vsize()))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-            if parent_entries.is_empty() {
+        for tx in &all_speedups {
+            if !matches!(
+                tx.state,
+                TransactionState::InMempool | TransactionState::Confirmed
+            ) {
                 continue;
             }
 
-            let parent_txids: Vec<Txid> = batch.iter().map(|p| p.txid).collect();
+            let status = self.ctx.monitor.get_tx_status(&tx.txid, true)?;
 
-            let (cpfp_tx, fee_paid) = self.build_cpfp(
-                &parent_entries,
-                &funding,
-                bump_fee,
-                false,
-                fee_rate,
-                chain_diff_fee,
-                chain_vsize,
-            )?;
+            if status.is_in_mempool() {
+                if tx.state == TransactionState::Confirmed {
+                    self.ctx.handle_reorg(tx, current_height)?;
+                }
+                continue;
+            }
 
-            let context = Self::make_speedup_context(&funding, bump_fee, &parent_entries);
-            let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&cpfp_tx, fee_rate);
-            let kind = SpeedupKind::CPFP {
-                parents: parent_txids,
-                context,
-            };
-
-            let Some(change_utxo) =
-                self.commit_speedup(cpfp_tx, fee_paid, fee_info, kind, current_height)?
-            else {
+            // Not found: the tx is no longer in mempool and not on chain. If an RBF is replacing it,
+            // `remove_replaced_rbf` will mark it. Otherwise mark Failed directly and re-queue parents.
+            if status.is_not_found() {
+                if matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced()) {
+                    continue;
+                }
+                warn!(
+                    txid = %tx.txid,
+                    state = ?tx.state,
+                    "speedup is not in mempool and not on chain; marking Failed and re-queuing parents",
+                );
                 self.ctx
                     .storage
-                    .add_news(CoordinatorNews::InsufficientFunds {
-                        available: funding.amount,
-                        required: fee_paid,
-                    })?;
-                break;
-            };
+                    .settle_tx(tx.txid, TransactionState::Failed, current_height)?;
+                self.requeue_failed_speedup_parents(tx)?;
+                continue;
+            }
 
-            funding = change_utxo;
+            if status.is_finalized(max_confs) {
+                self.ctx.handle_finalized(tx.txid, current_height)?;
+                self.remove_replaced_rbf(tx, current_height)?;
+                // Advance base funding to the last finalized on-chain change output.
+                self.ctx.funding_manager.update_funding_from_tx(tx)?;
+                continue;
+            }
+
+            if status.is_confirmed() {
+                self.ctx.handle_confirmed(tx.txid)?;
+                continue;
+            }
+
+            if status.is_orphan() {
+                self.ctx.handle_orphan(tx.txid)?;
+                continue;
+            }
         }
 
         Ok(())
     }
 
-    pub fn process_active_transactions(&self) -> Result<(), BitcoinCoordinatorError> {
+    /// Step 5 of `tick`: if the latest live speedup is stale, build a boost (new
+    /// CPFP when slots are available, otherwise RBF) and save it as TO-DISPATCH.
+    /// Never dispatches. Short-circuits if any speedup is already TO-DISPATCH.
+    pub fn boost_if_stale(&self) -> Result<(), BitcoinCoordinatorError> {
         let current_height = self.ctx.monitor.get_monitor_height()?;
-        self.review_in_flight(current_height)?;
-        self.boost_if_stale(current_height)?;
-        Ok(())
-    }
-
-    // =========================================================================
-    // Private helpers
-    // =========================================================================
-
-    /// Build and store a boost CPFP or RBF transaction if the latest in-mempool
-    /// speedup is stale and no other speedup is pending dispatch.
-    fn boost_if_stale(&self, current_height: BlockHeight) -> Result<(), BitcoinCoordinatorError> {
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
         let last = match all_speedups.iter().rev().find(|tx| {
@@ -193,6 +189,7 @@ impl SpeedupEngine {
             return Ok(());
         }
 
+        // Short-circuit if any speedup is already TO-DISPATCH to avoid building multiple boosts in the same tick
         if all_speedups
             .iter()
             .any(|tx| tx.state == TransactionState::ToDispatch)
@@ -203,7 +200,7 @@ impl SpeedupEngine {
         let last_context = match &last.kind {
             TxKind::Speedup(k) => k.context(),
             _ => {
-                tracing::warn!(txid = %last.txid, "expected Speedup kind in boost_if_stale; skipping");
+                warn!(txid = %last.txid, "expected Speedup kind in boost_if_stale; skipping");
                 return Ok(());
             }
         };
@@ -232,7 +229,7 @@ impl SpeedupEngine {
         let unconfirmed: Vec<_> = all_speedups
             .iter()
             .filter(|tx| tx.state == TransactionState::InMempool)
-            .cloned()
+            .cloned() //TODO: try to avoid cloning all along this file
             .collect();
 
         let use_rbf = (unconfirmed.len() as u32) >= self.settings.max_unconfirmed_speedups;
@@ -249,7 +246,7 @@ impl SpeedupEngine {
             vec![]
         };
 
-        let (new_tx, fee_paid) = self.build_cpfp(
+        let Some((new_tx, _fee_paid)) = self.build_speedup(
             &parent_entries,
             &funding,
             next_bump,
@@ -257,7 +254,11 @@ impl SpeedupEngine {
             fee_rate,
             chain_diff_fee,
             chain_vsize,
-        )?;
+        )?
+        else {
+            emit_funding_news_for_speedup(&self.ctx, &funding)?;
+            return Ok(());
+        };
 
         let context = Self::make_speedup_context(&funding, next_bump, &parent_entries);
         let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&new_tx, fee_rate);
@@ -272,115 +273,125 @@ impl SpeedupEngine {
                 context,
             }
         };
-
-        if self
-            .commit_speedup(new_tx, fee_paid, fee_info, kind, current_height)?
-            .is_none()
-        {
-            self.ctx
-                .storage
-                .add_news(CoordinatorNews::InsufficientFunds {
-                    available: funding.amount,
-                    required: fee_paid,
-                })?;
-        }
+        self.save_speedup(new_tx, fee_info, kind, current_height)?;
 
         Ok(())
     }
 
-    /// Review in-flight speedups and dispatch any that are pending.
-    ///
-    /// Phase 1 — review active (`InMempool`/`Confirmed`) speedups:
-    /// common helpers handle reorg, finalized, confirmed, orphan;
-    /// speedup-specific arms handle funding restore and RBF cancel.
-    ///
-    /// Phase 2 — dispatch all `ToDispatch` speedups in creation order;
-    /// stop on first failure to preserve the funding-UTXO chain ordering.
-    fn review_in_flight(&self, current_height: BlockHeight) -> Result<(), BitcoinCoordinatorError> {
+    /// Step 6 of `tick`: build a single CPFP covering the next batch of PendingSpeedupParents parents and
+    /// save it as TO-DISPATCH. Never dispatches. Short-circuits when a TO-DISPATCH speedup already exists
+    /// or when funding is not available.
+    pub fn create_cpfp_batch(&self) -> Result<(), BitcoinCoordinatorError> {
+        let parents = self.ctx.storage.get_pending_speedup_parents()?;
+        if parents.is_empty() {
+            return Ok(());
+        }
+        let current_height = self.ctx.monitor.get_monitor_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
-        if all_speedups.is_empty() {
+
+        if all_speedups
+            .iter()
+            .any(|tx| tx.state == TransactionState::ToDispatch)
+        {
+            return Ok(());
+        }
+        let funding = match self.ctx.funding_manager.get_funding(&all_speedups)? {
+            Some(f) => f,
+            None => {
+                self.ctx
+                    .storage
+                    .add_news(CoordinatorNews::FundingNotAvailable)?;
+                return Ok(());
+            }
+        };
+
+        let unconfirmed: Vec<CoordinatedTx> = all_speedups
+            .into_iter()
+            .filter(|tx| tx.state == TransactionState::InMempool)
+            .collect();
+        let available_slots = self
+            .settings
+            .max_unconfirmed_speedups
+            .saturating_sub(unconfirmed.len() as u32);
+        if available_slots == 0 {
             return Ok(());
         }
 
-        let max_confs = self.ctx.monitor.settings.max_monitoring_confirmations;
-
-        for tx in &all_speedups {
-            if !matches!(
-                tx.state,
-                TransactionState::InMempool | TransactionState::Confirmed
-            ) {
-                // Nothing to review until the tx is broadcast, finalized, or evicted.
-                continue;
-            }
-
-            let status = self.ctx.monitor.get_tx_status(&tx.txid, true)?;
-
-            if status.is_in_mempool() {
-                if tx.state == TransactionState::Confirmed {
-                    self.ctx.handle_reorg(tx, current_height)?;
-                }
-                // Already live in the mempool — stale detection is handled by boost_if_stale.
-                continue;
-            }
-
-            let context = tx.speedup_kind()?.context();
-
-            if status.is_not_found() {
-                if context.is_being_replaced() {
-                    continue;
-                }
-                self.ctx
-                    .storage
-                    .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
-                continue;
-            }
-
-            if status.is_finalized(max_confs) {
-                self.ctx.handle_finalized(tx.txid, current_height)?;
-                self.remove_replaced_rbf(tx, current_height)?;
-
-                // Advance base funding to the last finalized on-chain change output.
-                let k = tx.speedup_kind()?;
-                let (out, vout) = tx.last_output()?;
-                self.ctx.funding_manager.update_funding(Utxo::new(
-                    tx.txid,
-                    vout,
-                    out.value.to_sat(),
-                    &k.context().funding_input.pub_key,
-                ))?;
-                continue;
-            }
-
-            if status.is_confirmed() {
-                self.ctx.handle_confirmed(tx.txid)?;
-                continue;
-            }
-
-            if status.is_orphan() {
-                self.ctx.handle_orphan(tx.txid)?;
-            }
-        }
-
-        // Phase 2: dispatch all pending `ToDispatch` speedups in order.
-        let pending: Vec<CoordinatedTx> = self
+        let (fee_rate, fee_news) = self
             .ctx
-            .storage
-            .get_speedups_ordered()?
-            .into_iter()
-            .filter(|tx| tx.state == TransactionState::ToDispatch)
-            .collect();
-        let pending = self.ctx.apply_retry_rate_limit(pending);
-        for tx in &pending {
-            if !self.dispatch_speedup(tx, current_height)? {
-                break; // stop on first failure to preserve funding-UTXO chain ordering
-            }
+            .fee_manager
+            .get_network_fee_rate(&self.ctx.monitor)?;
+        if let Some(news) = fee_news {
+            self.ctx.storage.add_news(news)?;
         }
+
+        let (chain_diff_fee, chain_vsize) =
+            self.ctx.fee_manager.chain_fee_diff(fee_rate, &unconfirmed);
+        let bump_fee = self.ctx.fee_manager.base_fee_multiplier();
+
+        // Take only the first batch: one CPFP per tick.
+        let mut batches = self.ctx.dispatcher.batch_by_weight(&parents, 1);
+        let batch = match batches.pop() {
+            Some(b) => b,
+            None => return Ok(()),
+        };
+
+        let parent_entries: Vec<(SpeedupData, usize)> = batch
+            .iter()
+            .filter_map(|p| {
+                if let TxKind::NeedsSpeedup(ref sd) = p.kind {
+                    Some((sd.clone(), p.tx.vsize()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if parent_entries.is_empty() {
+            return Ok(());
+        }
+
+        let parent_txids: Vec<Txid> = batch.iter().map(|p| p.txid).collect();
+
+        let Some((cpfp_tx, _fee_paid)) = self.build_speedup(
+            &parent_entries,
+            &funding,
+            bump_fee,
+            false,
+            fee_rate,
+            chain_diff_fee,
+            chain_vsize,
+        )?
+        else {
+            emit_funding_news_for_speedup(&self.ctx, &funding)?;
+            return Ok(());
+        };
+
+        // Build succeeded: pull these parents out of PendingSpeedupParents and persist the CPFP.
+        for parent_txid in &parent_txids {
+            self.ctx
+                .storage
+                .remove_pending_speedup_parent(*parent_txid)?;
+        }
+
+        let context = Self::make_speedup_context(&funding, bump_fee, &parent_entries);
+        let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&cpfp_tx, fee_rate);
+        let kind = SpeedupKind::CPFP {
+            parents: parent_txids,
+            context,
+        };
+        self.save_speedup(cpfp_tx, fee_info, kind, current_height)?;
 
         Ok(())
     }
 
-    /// Build a CPFP (or RBF) transaction via the fee convergence loop.
-    fn build_cpfp(
+    // =========================================================================
+    // Private helpers
+    // =========================================================================
+
+    /// Build a CPFP or RBF transaction via the fee convergence loop.
+    /// Returns `Ok(Some((tx, fee)))` on success.
+    fn build_speedup(
         &self,
         parent_entries: &[(SpeedupData, usize)],
         funding: &Utxo,
@@ -389,7 +400,7 @@ impl SpeedupEngine {
         fee_rate: u64,
         chain_diff_fee: u64,
         chain_vsize: usize,
-    ) -> Result<(Transaction, u64), BitcoinCoordinatorError> {
+    ) -> Result<Option<(Transaction, u64)>, BitcoinCoordinatorError> {
         let speedups_data: Vec<SpeedupData> =
             parent_entries.iter().map(|(d, _)| d.clone()).collect();
 
@@ -400,12 +411,14 @@ impl SpeedupEngine {
 
         let mut child_vsize = 0usize;
         loop {
+            // Use a nominal fee of 1 sat so the probe build always produces a
+            // valid change output regardless of funding size.
             let dummy_vsize = ProtocolBuilder {}
                 .speedup_transactions(
                     &speedups_data,
                     funding.clone(),
                     &funding.pub_key,
-                    10_000,
+                    1,
                     &self.key_manager,
                 )?
                 .vsize();
@@ -424,6 +437,12 @@ impl SpeedupEngine {
                 chain_vsize,
             );
 
+            // If the fee would leave a below dust change output,
+            // signal insufficient funding.
+            if funding.amount.saturating_sub(fee) < MAX_DUST_LIMIT {
+                return Ok(None);
+            }
+
             let final_tx = ProtocolBuilder {}.speedup_transactions(
                 &speedups_data,
                 funding.clone(),
@@ -434,7 +453,7 @@ impl SpeedupEngine {
 
             let final_vsize = final_tx.vsize();
             if child_vsize >= final_vsize {
-                return Ok((final_tx, fee));
+                return Ok(Some((final_tx, fee)));
             }
             child_vsize = final_vsize;
         }
@@ -463,33 +482,16 @@ impl SpeedupEngine {
         }
     }
 
-    /// Store the completed CPFP/RBF, dispatch it immediately, and advance
-    /// the funding UTXO to the change output.
-    ///
-    /// Returns `Some(change_utxo)` on success, or `None` if the fee exceeds
-    /// the available balance (caller should emit `InsufficientFunds` and stop).
-    fn commit_speedup(
+    /// Persist a freshly-built CPFP/RBF as TO-DISPATCH and register it with the monitor.
+    fn save_speedup(
         &self,
         tx: Transaction,
-        fee_paid: u64,
         fee_info: FeeInfo,
         kind: SpeedupKind,
         current_height: BlockHeight,
-    ) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
-        let funding = &kind.context().funding_input;
-        if fee_paid >= funding.amount {
-            return Ok(None);
-        }
-
+    ) -> Result<(), BitcoinCoordinatorError> {
         let ctx_str = Self::ctx_for_kind(&kind);
         let txid = tx.compute_txid();
-        let vout_change = (tx.output.len() - 1) as u32;
-        let change_utxo = Utxo::new(
-            txid,
-            vout_change,
-            funding.amount.saturating_sub(fee_paid),
-            &funding.pub_key,
-        );
         let record = CoordinatedTx {
             txid,
             tx,
@@ -508,34 +510,54 @@ impl SpeedupEngine {
         self.ctx.storage.insert_speedup(record.clone())?;
         match record.speedup_kind()? {
             SpeedupKind::RBF { replaces, .. } => {
-                info!("Built RBF replacing {} | Txid({})", replaces, record.txid)
+                info!("Built RBF | Txid({}) | Replaces({})", record.txid, replaces)
             }
             SpeedupKind::CPFP { parents, .. } => info!(
-                "Built CPFP for parents {:?} | Txid({})",
-                parents, record.txid
+                "Built CPFP | Txid({}) | Parents({:?})",
+                record.txid, parents
             ),
         }
         self.ctx.monitor.monitor(
             TypesToMonitor::Transactions(vec![txid], ctx_str.to_string(), None),
             false,
         )?;
-        self.dispatch_speedup(&record, current_height)?;
-        Ok(Some(change_utxo))
+        Ok(())
     }
 
     /// Broadcast a single speedup transaction and update its state.
     ///
-    /// Returns `true` if the tx landed in the mempool (Success or AlreadyKnown),
-    /// `false` on failure — callers stop chained dispatch on `false`.
-    fn dispatch_speedup(
+    /// Returns `true` if the tx landed in the mempool (Success or AlreadyKnown).
+    /// Returns `false` for AlreadyConfirmed, Retryable (transient), and Fatal.
+    fn try_dispatch_speedup(
         &self,
         tx: &CoordinatedTx,
         current_height: BlockHeight,
-    ) -> Result<bool, BitcoinCoordinatorError> {
+    ) -> Result<(), BitcoinCoordinatorError> {
         let results = self.ctx.dispatcher.dispatch(vec![tx.tx.clone()]);
         let (txid, outcome) = verify_single_dispatch_result(tx.txid, results)?;
         self.ctx
             .handle_dispatch_result(tx, txid, outcome, current_height, tx.fee_info.clone())
+    }
+
+    /// Re-insert parents of failed txs at the head of PendingSpeedupParents so the next tick
+    /// RBF speedups are skipped because the speedup they replace is still live and still covers the parents.
+    fn requeue_failed_speedup_parents(
+        &self,
+        tx: &CoordinatedTx,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        if let TxKind::Speedup(SpeedupKind::CPFP { parents, .. }) = &tx.kind {
+            if !parents.is_empty() {
+                warn!(
+                    txid = %tx.txid,
+                    parents = ?parents,
+                    "speedup failed; re-queueing parents in PendingSpeedupParents",
+                );
+                self.ctx
+                    .storage
+                    .prepend_pending_speedup_parents(parents.clone())?;
+            }
+        }
+        Ok(())
     }
 
     /// Remove any replaced by RBF transactions from monitoring and mark them as failed
@@ -573,6 +595,53 @@ impl SpeedupEngine {
         }
         Ok(())
     }
+
+    // Verify the pre-built speedup's fee rate against the current `min_safe_fee_rate` setting.
+    fn verify_min_fee_rate(
+        &self,
+        txs: Vec<CoordinatedTx>,
+        current_height: BlockHeight,
+    ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        let min_safe_fee_rate = self.ctx.fee_manager.settings.min_safe_fee_rate;
+        let mut dispatchable = Vec::new();
+        for tx in txs {
+            if tx.fee_info.fee_rate < min_safe_fee_rate {
+                warn!(
+                    txid = %tx.txid,
+                    fee_rate = tx.fee_info.fee_rate,
+                    min_safe_fee_rate,
+                    "pre-built speedup fee_rate below min_safe_fee_rate; re-queueing parents",
+                );
+                self.ctx
+                    .storage
+                    .settle_tx(tx.txid, TransactionState::Failed, current_height)?;
+                self.requeue_failed_speedup_parents(&tx)?;
+                continue;
+            }
+            dispatchable.push(tx);
+        }
+        Ok(dispatchable)
+    }
+}
+
+// Funding too small. Emit FundingConsumed; also emit
+// InsufficientFunds when the queue is now empty.
+fn emit_funding_news_for_speedup(
+    ctx: &EngineContext,
+    funding: &Utxo,
+) -> Result<(), BitcoinCoordinatorError> {
+    ctx.storage.add_news(CoordinatorNews::FundingConsumed {
+        txid: funding.txid,
+        vout: funding.vout,
+        amount: funding.amount,
+    })?;
+    if ctx.funding_manager.advance_funding()?.is_none() {
+        ctx.storage.add_news(CoordinatorNews::InsufficientFunds {
+            available: funding.amount,
+            required: funding.amount,
+        })?;
+    }
+    Ok(())
 }
 
 fn amount_from_speedup_data(data: &SpeedupData) -> u64 {

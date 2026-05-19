@@ -20,7 +20,7 @@ use crate::{
 /// Shared service bundle held by both `SpeedupEngine` and `TransactionEngine`.
 ///
 /// Both engines receive an `Rc<EngineContext>` so they share exactly the same
-/// underlying storage, funding state, dispatcher, and fee engine — no copies.
+/// underlying storage, funding state, dispatcher, and fee engine.
 pub struct EngineContext {
     pub monitor: Monitor,
 
@@ -91,7 +91,7 @@ impl EngineContext {
         Ok(())
     }
 
-    /// Tx reached max confirmations — settle as `Finalized`.
+    /// Tx reached max confirmations. Settle as `Finalized`.
     pub fn handle_finalized(
         &self,
         txid: Txid,
@@ -102,14 +102,14 @@ impl EngineContext {
         Ok(())
     }
 
-    /// Tx confirmed — update state to `Confirmed`.
+    /// Tx confirmed. Update state to `Confirmed`.
     pub fn handle_confirmed(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         self.storage
             .update_tx_state(txid, TransactionState::Confirmed)?;
         Ok(())
     }
 
-    /// Tx orphaned — keep in `InMempool`.
+    /// Tx orphaned. Keep in `InMempool`.
     pub fn handle_orphan(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         self.storage
             .update_tx_state(txid, TransactionState::InMempool)?;
@@ -140,7 +140,7 @@ impl EngineContext {
         if has_retries && retry_ready {
             self.last_retry_at.set(Some(now_secs()));
         } else if has_retries {
-            debug!("Skipping retry txs — retry interval not elapsed");
+            debug!("Skipping retry txs, retry interval not elapsed");
         }
         filtered
     }
@@ -155,13 +155,10 @@ impl EngineContext {
         outcome: DispatchOutcome,
         current_height: BlockHeight,
         fee_info: FeeInfo,
-    ) -> Result<bool, BitcoinCoordinatorError> {
+    ) -> Result<(), BitcoinCoordinatorError> {
         tx.verify_tx_id(txid)?; // sanity check
         match outcome {
             DispatchOutcome::Success | DispatchOutcome::AlreadyKnown => {
-                if matches!(outcome, DispatchOutcome::AlreadyKnown) {
-                    warn!("tx({}) already known — treating as in-mempool", txid);
-                }
                 if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
                     if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
                         replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
@@ -169,13 +166,26 @@ impl EngineContext {
                     }
                 }
                 self.mark_dispatched(tx, current_height, fee_info)?;
-                info!("tx({}) dispatched at block height {}", txid, current_height);
-                Ok(true)
+                info!(
+                    "Transaction({}) dispatched at block height {}",
+                    txid, current_height
+                );
+            }
+            DispatchOutcome::AlreadyConfirmed => {
+                // If an RBF lands directly on-chain, mark the predecessor as replaced.
+                if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
+                    if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
+                        replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
+                        self.storage.update_tx(&replaced)?;
+                    }
+                }
+                debug!("Transaction({}) already confirmed on-chain", txid);
+                self.handle_confirmed(txid)?;
             }
             DispatchOutcome::Retryable(msg) => {
                 if tx.retry_count + 1 >= self.coordinator_config.retry_attempts_sending_tx {
                     warn!(
-                        "tx({}) failed after {} attempts: {}",
+                        "Transaction({}) failed after {} attempts: {}",
                         txid,
                         tx.retry_count + 1,
                         msg
@@ -185,7 +195,7 @@ impl EngineContext {
                     self.storage.add_news(Self::dispatch_error_news(tx, txid))?;
                 } else {
                     debug!(
-                        "tx({}) dispatch failed (attempt {}/{}) — will retry: {}",
+                        "Transaction({}) dispatch failed (attempt {}/{}), will retry: {}",
                         txid,
                         tx.retry_count + 1,
                         self.coordinator_config.retry_attempts_sending_tx,
@@ -193,16 +203,15 @@ impl EngineContext {
                     );
                     self.storage.mark_as_retry(txid)?;
                 }
-                Ok(false)
             }
             DispatchOutcome::Fatal(msg) => {
-                warn!("tx({}) fatal dispatch error: {}", txid, msg);
+                warn!("Transaction({}) fatal dispatch error: {}", txid, msg);
                 self.storage
                     .settle_tx(txid, TransactionState::Failed, current_height)?;
                 self.storage.add_news(Self::dispatch_error_news(tx, txid))?;
-                Ok(false)
             }
         }
+        Ok(())
     }
 
     fn dispatch_error_news(tx: &CoordinatedTx, txid: Txid) -> CoordinatorNews {

@@ -34,10 +34,13 @@ impl FeeManager {
         &self,
         monitor: &Monitor,
     ) -> Result<(u64, Option<CoordinatorNews>), BitcoinCoordinatorError> {
-        let mut network_fee_rate = match monitor.get_estimated_fee_rate() {
-            Ok(rate) => rate,
-            Err(_) => self.settings.min_network_fee_rate,
-        };
+        // `min_safe_fee_rate` doubles as the fallback when bitcoind's
+        // estimate is unavailable and as a hard lower clamp on the rate.
+        let mut network_fee_rate = monitor
+            .get_estimated_fee_rate()
+            .ok()
+            .filter(|rate| *rate >= self.settings.min_safe_fee_rate)
+            .unwrap_or(self.settings.min_safe_fee_rate);
 
         let mut news = None;
 
@@ -65,13 +68,12 @@ impl FeeManager {
         new_fee_rate: u64,
         unconfirmed_speedups: &[CoordinatedTx],
     ) -> (u64, usize) {
-        if unconfirmed_speedups.is_empty() {
-            return (0, 0);
-        }
-
-        // All previous speedups in the chain are assumed to have used the same fee rate
-        // (the last one's fee_rate is representative).
-        let last_fee_rate_used = unconfirmed_speedups.last().unwrap().fee_info.fee_rate; //TODO: dont use unwrap
+        let last_fee_rate_used = match unconfirmed_speedups.last() {
+            // All previous speedups in the chain are assumed to have used the same fee rate
+            // (the last one's fee_rate is representative).
+            Some(tx) => tx.fee_info.fee_rate,
+            None => return (0, 0),
+        };
 
         let mut fee_diff = 0u64;
         let mut chain_vsize = 0usize;
@@ -88,7 +90,7 @@ impl FeeManager {
 
     /// Compute the total fee (in sats) required for a CPFP/RBF speedup transaction.
     ///
-    /// `parent_entries` is a slice of `(output_amount_sats, parent_vsize)` pairs —
+    /// `parent_entries` is a slice of `(output_amount_sats, parent_vsize)` pairs,
     /// one per parent transaction being included in this speedup.
     pub fn compute_speedup_fee(
         &self,
@@ -144,11 +146,11 @@ mod tests {
         test_utils::{cpfp_coordinated_tx, dummy_tx, StorageTestConfig, TestBitcoind},
     };
 
-    fn settings(min: u64, max: u64) -> FeeSettings {
+    fn settings(min_safe: u64, max: u64) -> FeeSettings {
         FeeSettings {
-            min_network_fee_rate: min,
             max_feerate_sat_vb: max,
             base_fee_multiplier: 1.0,
+            min_safe_fee_rate: min_safe,
         }
     }
 
@@ -179,28 +181,53 @@ mod tests {
         bitcoind.stop().unwrap();
     }
 
+    /// `get_network_fee_rate` lifts a low network estimate (or the
+    /// fallback when no estimate is available) up to `min_safe_fee_rate`.
+    #[test]
+    fn test_get_network_fee_rate_honors_min_safe_floor() {
+        let manager = FeeManager::new(FeeSettings {
+            max_feerate_sat_vb: 1000,
+            base_fee_multiplier: 1.0,
+            min_safe_fee_rate: 25,
+        });
+        let storage = StorageTestConfig::new();
+        let bitcoind = TestBitcoind::default();
+        let monitor = bitcoind.create_monitor(storage.get_raw_storage());
+
+        let (fee_rate, _) = manager.get_network_fee_rate(&monitor).unwrap();
+        assert!(
+            fee_rate >= 25,
+            "get_network_fee_rate must clamp up to min_safe_fee_rate; got {}",
+            fee_rate
+        );
+
+        drop(monitor);
+        storage.remove().unwrap();
+        bitcoind.stop().unwrap();
+    }
+
     #[test]
     fn test_chain_fee_diff() {
         let manager = FeeManager::new(settings(1, 1000));
 
-        // Empty → (0, 0)
+        // Empty input returns (0, 0).
         assert_eq!(manager.chain_fee_diff(10, &[]), (0, 0));
 
         let tx = cpfp_coordinated_tx(1, 10);
         let tx_vsize = tx.tx.vsize();
 
-        // Same rate → 0 fee diff, correct chain vsize
+        // Same rate: 0 fee diff, correct chain vsize.
         let (diff, vsize) = manager.chain_fee_diff(10, &[tx.clone()]);
         assert_eq!(diff, 0);
         assert_eq!(vsize, tx_vsize);
 
-        // Rate increase 5 → 10: diff = vsize * (10 - 5)
+        // Rate increase 5 to 10: diff = vsize * (10 - 5).
         let tx2 = cpfp_coordinated_tx(2, 5);
         let (diff, chain_vsize) = manager.chain_fee_diff(10, &[tx2]);
         assert_eq!(diff, tx_vsize as u64 * (10 - 5));
         assert_eq!(chain_vsize, tx_vsize);
 
-        // Two txs at old rate → cumulative diff and vsize
+        // Two txs at old rate: cumulative diff and vsize.
         let tx3 = cpfp_coordinated_tx(3, 5);
         let tx4 = cpfp_coordinated_tx(4, 5); // Both are expected to have the same fee rate
         let (diff, chain_vsize) = manager.chain_fee_diff(10, &[tx3, tx4]);
@@ -211,17 +238,17 @@ mod tests {
     #[test]
     fn test_compute_speedup_fee() {
         let manager = FeeManager::new(FeeSettings {
-            min_network_fee_rate: 1,
             max_feerate_sat_vb: 1000,
             base_fee_multiplier: 1.0,
+            min_safe_fee_rate: 1,
         });
 
-        // Basic CPFP: parent 100 vB / 500 sat output; child 50 vB; rate 5; bump 1.0
-        // parent_total=500, child_total=250, total=750; fee = 750-500-100 = 150
+        // Basic CPFP: parent 100 vB / 500 sat output; child 50 vB; rate 5; bump 1.0.
+        // parent_total=500, child_total=250, total=750; fee = 750-500-100 = 150.
         let fee = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, false, 0, 0);
         assert_eq!(fee, 150);
 
-        // RBF bandwidth policy: total_fee(150) < child_total*2(500) → floor lifted to 500
+        // RBF bandwidth policy: total_fee(150) < child_total*2(500) -> floor lifted to 500.
         let fee = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, true, 0, 0);
         assert_eq!(fee, 500);
 

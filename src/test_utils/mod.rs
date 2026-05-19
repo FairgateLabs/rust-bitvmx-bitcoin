@@ -48,7 +48,7 @@ pub fn generate_random_string() -> String {
     (0..12).map(|_| rng.random_range('a'..='z')).collect()
 }
 
-/// An empty transaction — useful for testing coordinator API calls that only
+/// An empty transaction, useful for testing coordinator API calls that only
 /// need a `Transaction` argument and where the actual network broadcast is not
 /// the focus of the test.
 pub fn dummy_tx() -> Transaction {

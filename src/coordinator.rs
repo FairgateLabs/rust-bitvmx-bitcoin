@@ -4,14 +4,21 @@ use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::{
     bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
 };
-use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor, TransactionStatus};
+use bitvmx_transaction_monitor::{
+    monitor::Monitor,
+    types::{MonitorNews, TypesToMonitor},
+    TransactionStatus,
+};
 use key_manager::key_manager::KeyManager;
 use protocol_builder::types::{output::SpeedupData, Utxo};
 use storage_backend::storage::Storage;
 use tracing::{debug, info};
 
 use crate::{
-    config::config::BitcoinSettings,
+    config::{
+        config::BitcoinSettings,
+        settings::{CPFP_TRANSACTION_CONTEXT, RBF_TRANSACTION_CONTEXT},
+    },
     core::{
         dispatcher::Dispatcher, fee::FeeManager, funding::FundingManager,
         storage::CoordinatorStorage,
@@ -29,6 +36,13 @@ pub struct BitcoinCoordinator {
 }
 
 impl BitcoinCoordinator {
+    /// Builds a coordinator wired to the given RPC node and shared storage.
+    ///
+    /// * `rpc_config` - Bitcoin RPC endpoint and network.
+    /// * `storage` - Shared persistent backend used by every internal component.
+    /// * `key_manager` - Signer used to build CPFP/RBF speedup transactions.
+    /// * `settings` - Optional override for tuning constants. Defaults are used
+    ///   when `None`.
     pub fn new_with_paths(
         rpc_config: &RpcConfig,
         storage: Rc<Storage>,
@@ -74,8 +88,19 @@ impl BitcoinCoordinator {
         Ok(self.tx_engine.ctx.monitor.is_ready()?)
     }
 
-    /// Periodic processing: advances the monitor, then reviews and dispatches
-    /// all active transactions.
+    /// Advances the monitor and runs one tick of the coordinator. No-op while
+    /// [`Self::is_ready`] is `false`.
+    ///
+    /// The tick is a strict 6-step pipeline. Build/save and dispatch are split
+    /// across consecutive ticks so a crash between RPC send and storage commit
+    /// cannot leave an on-chain transaction without a local record.
+    ///
+    /// 1. Review in-flight non-speedups; no dispatch here.
+    /// 2. Review in-flight speedups; no dispatch here.
+    /// 3. Dispatch TO-DISPATCH speedups built in a previous tick.
+    /// 4. Dispatch TO-DISPATCH non-speedups (parents and plain txs).
+    /// 5. Boost the latest live speedup if stale; save TO-DISPATCH for next tick.
+    /// 6. Build one CPFP batch for pending parents; save TO-DISPATCH for next tick.
     pub fn tick(&self) -> Result<(), BitcoinCoordinatorError> {
         self.tx_engine.ctx.monitor.tick()?;
 
@@ -84,15 +109,26 @@ impl BitcoinCoordinator {
             return Ok(());
         }
 
-        self.speedup_engine.process_active_transactions()?;
-        let dispatched_parents = self.tx_engine.process_active_transactions()?;
-        self.speedup_engine
-            .create_cpfps_for_parents(&dispatched_parents)?;
+        self.tx_engine.review_active()?;
+        self.speedup_engine.review_speedups()?;
+        self.speedup_engine.dispatch_pending_speedups()?;
+        self.tx_engine.dispatch_pending()?;
+        self.speedup_engine.boost_if_stale()?;
+        self.speedup_engine.create_cpfp_batch()?;
 
         Ok(())
     }
 
-    /// Register a transaction to be dispatched (without speedup support).
+    /// Registers a transaction for dispatch without speedup support.
+    ///
+    /// * `tx` - Signed transaction to broadcast.
+    /// * `context` - Opaque client-defined tag echoed back in news for this tx.
+    /// * `target_block_height` - Earliest block at which to broadcast. `None`
+    ///   means dispatch as soon as possible.
+    /// * `confirmation_trigger` - Emit a confirmation news at this confirmation
+    ///   count. `None` disables it.
+    /// * `stuck_in_mempool_blocks` - Emit a `TransactionStuckInMempool` news
+    ///   after this many blocks in the mempool. `None` disables the check.
     pub fn dispatch_without_speedup(
         &self,
         tx: Transaction,
@@ -114,7 +150,18 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
-    /// Register a transaction for dispatch and enable CPFP speedup support.
+    /// Registers a transaction for dispatch with CPFP speedup support enabled.
+    ///
+    /// Stuck-in-mempool detection is always disabled: the coordinator boosts
+    /// the parent automatically when it persists in the mempool.
+    ///
+    /// * `tx` - Signed parent transaction.
+    /// * `speedup_data` - Signing/UTXO metadata used to build a CPFP for `tx`.
+    /// * `context` - Opaque client-defined tag echoed back in news for this tx.
+    /// * `target_block_height` - Earliest block at which to broadcast. `None`
+    ///   means dispatch as soon as possible.
+    /// * `confirmation_trigger` - Emit a confirmation news at this confirmation
+    ///   count. `None` disables it.
     pub fn dispatch_with_speedup(
         &self,
         tx: Transaction,
@@ -122,22 +169,65 @@ impl BitcoinCoordinator {
         context: String,
         target_block_height: Option<u32>,
         confirmation_trigger: Option<u32>,
-        stuck_in_mempool_blocks: Option<u32>,
     ) -> Result<(), BitcoinCoordinatorError> {
         let txid = tx.compute_txid();
+        // Stuck-in-mempool detection is not needed: the coordinator will create
+        // a boost (CPFP/RBF) when a speedup-enabled parent is stuck.
         self.register_tx(
             tx,
             TxKind::NeedsSpeedup(speedup_data),
             context,
             target_block_height,
             confirmation_trigger,
-            stuck_in_mempool_blocks,
+            None,
         )?;
         info!("Transaction({}) registered for dispatch with speedup", txid);
         Ok(())
     }
 
-    /// Cancel monitoring and remove a transaction from the coordinator.
+    /// Dispatches a transaction with or without speedup support, chosen by the
+    /// presence of `speedup_data`. Stuck-in-mempool detection is always
+    /// disabled through this entrypoint.
+    ///
+    /// * `tx` - Signed transaction to broadcast.
+    /// * `speedup_data` - Enables CPFP support when `Some`. Plain dispatch when
+    ///   `None`.
+    /// * `context` - Opaque client-defined tag echoed back in news for this tx.
+    /// * `target_block_height` - Earliest block at which to broadcast. `None`
+    ///   means dispatch as soon as possible.
+    /// * `confirmation_trigger` - Emit a confirmation news at this confirmation
+    ///   count. `None` disables it.
+    pub fn dispatch(
+        &self,
+        tx: Transaction,
+        speedup_data: Option<SpeedupData>,
+        context: String,
+        target_block_height: Option<u32>,
+        confirmation_trigger: Option<u32>,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        match speedup_data {
+            Some(data) => self.dispatch_with_speedup(
+                tx,
+                data,
+                context,
+                target_block_height,
+                confirmation_trigger,
+            ),
+            None => self.dispatch_without_speedup(
+                tx,
+                context,
+                target_block_height,
+                confirmation_trigger,
+                None,
+            ),
+        }
+    }
+
+    /// Cancels monitoring and removes the targeted transactions from coordinator
+    /// storage.
+    ///
+    /// * `data` - Monitoring entry to cancel. When it carries txids, those
+    ///   entries are also dropped from coordinator storage.
     pub fn cancel(&self, data: TypesToMonitor) -> Result<(), BitcoinCoordinatorError> {
         self.tx_engine.ctx.monitor.cancel(data.clone())?;
         if let TypesToMonitor::Transactions(txids, _, _) = data.clone() {
@@ -149,7 +239,11 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
-    /// Register a funding UTXO for potential future speedups.
+    /// Registers a funding UTXO available to pay future speedup fees. Emits an
+    /// `InvalidFundingUtxo` news item when the UTXO is below
+    /// `min_funding_amount_sats` instead of storing it.
+    ///
+    /// * `utxo` - Spendable UTXO to register as funding.
     pub fn add_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
         info!(
             "Funding added | Txid({}) | Vout({}) | Amount({})",
@@ -161,7 +255,10 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
-    /// Query the current blockchain status of a transaction via the monitor.
+    /// Queries the current blockchain status of a transaction via the monitor.
+    /// The mempool is also searched.
+    ///
+    /// * `txid` - Transaction to look up.
     pub fn get_transaction(
         &self,
         txid: Txid,
@@ -169,16 +266,35 @@ impl BitcoinCoordinator {
         Ok(self.tx_engine.ctx.monitor.get_tx_status(&txid, true)?)
     }
 
+    /// Returns all unacknowledged monitor and coordinator news. Internal
+    /// CPFP/RBF speedup news entries are filtered out.
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
         let monitor_news = self.tx_engine.ctx.monitor.get_news()?;
         let coordinator_news = self.tx_engine.ctx.storage.get_news()?;
+
+        // Filter out internal coordinator transactions (CPFP/RBF speedups),
+        // since the client's Context does not distinguish speedup variants.
+        let monitor_news: Vec<MonitorNews> = monitor_news
+            .into_iter()
+            .filter(|news| {
+                if let MonitorNews::Transaction(_, _, context) = news {
+                    !context.contains(CPFP_TRANSACTION_CONTEXT)
+                        && !context.contains(RBF_TRANSACTION_CONTEXT)
+                } else {
+                    true
+                }
+            })
+            .collect();
+
         Ok(News {
             monitor_news,
             coordinator_news,
         })
     }
 
-    /// Acknowledge a news item so it is not returned again.
+    /// Acknowledges a news item so it is not returned again.
+    ///
+    /// * `news` - Monitor or coordinator news entry to mark as consumed.
     pub fn ack_news(&self, news: AckNews) -> Result<(), BitcoinCoordinatorError> {
         match news {
             AckNews::Monitor(n) => self.tx_engine.ctx.monitor.ack_news(n)?,
@@ -187,9 +303,14 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
-    /// Register data to be monitored.
+    /// Registers data to be monitored without scheduling a dispatch. Mempool
+    /// search is disabled here; it is enabled internally once the related
+    /// transaction is broadcast.
+    ///
+    /// * `data` - Monitoring target (txids, output pattern, spending UTXO, or
+    ///   new block).
     pub fn monitor(&self, data: TypesToMonitor) -> Result<(), BitcoinCoordinatorError> {
-        self.tx_engine.ctx.monitor.monitor(data, true)?;
+        self.tx_engine.ctx.monitor.monitor(data, false)?;
         Ok(())
     }
 
@@ -225,7 +346,7 @@ impl BitcoinCoordinator {
         self.tx_engine.ctx.storage.insert_tx(CoordinatedTx {
             txid,
             tx,
-            kind,
+            kind: kind.clone(),
             state: TransactionState::ToDispatch,
             broadcast_block_height: None,
             target_block_height: target_height,
@@ -236,6 +357,13 @@ impl BitcoinCoordinator {
             fee_info,
             context,
         })?;
+
+        if matches!(kind, TxKind::NeedsSpeedup(_)) {
+            self.tx_engine
+                .ctx
+                .storage
+                .add_pending_speedup_parent(txid)?;
+        }
 
         Ok(())
     }

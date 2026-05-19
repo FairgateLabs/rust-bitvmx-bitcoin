@@ -22,8 +22,8 @@ settings:
     max_tx_weight: 400000
   fee:
     max_feerate_sat_vb: 1000
-    min_network_fee_rate: 1
     base_fee_multiplier: 1.0
+    min_safe_fee_rate: 1
   speedup:
     max_unconfirmed_speedups: 10
     max_rbf_attempts: 10

@@ -22,21 +22,21 @@ pub struct CoordinatedTx {
 
     pub state: TransactionState,
 
-    // lifecycle
-    pub target_block_height: BlockHeight, // earliest block at which to dispatch
-    pub confirmation_trigger: Option<u32>, // emit confirmation news at this confirmation count; None = disabled
-    pub stuck_in_mempool_blocks: Option<u32>, // emit StuckInMempool news after this many mempool blocks; None = disabled
-    pub settled_block_height: Option<BlockHeight>, // block when tx reached Finalized/Failed; None = not yet settled
-    pub broadcast_block_height: Option<BlockHeight>, // block when tx was broadcast; None = not yet broadcast
+    // Lifecycle
+    pub target_block_height: BlockHeight, // Earliest block at which to dispatch
+    pub confirmation_trigger: Option<u32>, // Emit confirmation news at this confirmation count; None = disabled
+    pub stuck_in_mempool_blocks: Option<u32>, // Emit StuckInMempool news after this many mempool blocks; None = disabled
+    pub settled_block_height: Option<BlockHeight>, // Block when tx reached Finalized/Failed; None = not yet settled
+    pub broadcast_block_height: Option<BlockHeight>, // Block when tx was broadcast; None = not yet broadcast
 
-    // retry
+    // Retry
     pub retry_count: u32,
     pub fee_info: FeeInfo,
 
     pub context: String,
 }
 
-// Compare by txid — txids uniquely identify transactions.
+// Compare by txid since txids uniquely identify transactions.
 impl PartialEq for CoordinatedTx {
     fn eq(&self, other: &Self) -> bool {
         self.txid == other.txid
@@ -128,6 +128,14 @@ pub enum CoordinatorNews {
     TransactionEvicted {
         txid: Txid,
         context: String,
+    },
+    /// A funding UTXO was consumed (too small to cover the speedup fee) and
+    /// the coordinator has advanced to the next entry in the queue. Emitted
+    /// once per consumed entry so the client can track funding depletion.
+    FundingConsumed {
+        txid: Txid,
+        vout: u32,
+        amount: u64,
     },
     /// Funding UTXO has insufficient balance to cover a speedup fee.
     InsufficientFunds {

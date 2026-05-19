@@ -1,5 +1,5 @@
 [package]
-name = "rust-bitvmx-bitcoin"
+name = "bitcoin-coordinator"
 version = "0.5.1"
 edition = "2021"
 
@@ -40,3 +40,6 @@ features = ["std", "std_rng"]
 [dev-dependencies]
 bitcoind = { git = "https://github.com/FairgateLabs/rust-bitcoind.git", tag = "v0.5.1" }
 bitcoin-indexer = { git = "https://github.com/FairgateLabs/rust-bitcoin-indexer.git", tag = "v0.5.1" }
+
+[features]
+testnet-test-delay = [] # Just for testing
