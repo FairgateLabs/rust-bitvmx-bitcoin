@@ -34,10 +34,13 @@ impl FeeManager {
         &self,
         monitor: &Monitor,
     ) -> Result<(u64, Option<CoordinatorNews>), BitcoinCoordinatorError> {
-        let mut network_fee_rate = match monitor.get_estimated_fee_rate() {
-            Ok(rate) => rate,
-            Err(_) => self.settings.min_network_fee_rate,
-        };
+        // `min_safe_fee_rate` doubles as the fallback when bitcoind's
+        // estimate is unavailable and as a hard lower clamp on the rate.
+        let mut network_fee_rate = monitor
+            .get_estimated_fee_rate()
+            .ok()
+            .filter(|rate| *rate >= self.settings.min_safe_fee_rate)
+            .unwrap_or(self.settings.min_safe_fee_rate);
 
         let mut news = None;
 
@@ -143,11 +146,11 @@ mod tests {
         test_utils::{cpfp_coordinated_tx, dummy_tx, StorageTestConfig, TestBitcoind},
     };
 
-    fn settings(min: u64, max: u64) -> FeeSettings {
+    fn settings(min_safe: u64, max: u64) -> FeeSettings {
         FeeSettings {
-            min_network_fee_rate: min,
             max_feerate_sat_vb: max,
             base_fee_multiplier: 1.0,
+            min_safe_fee_rate: min_safe,
         }
     }
 
@@ -172,6 +175,31 @@ mod tests {
         let (fee_rate, news) = manager.get_network_fee_rate(&monitor).unwrap();
         assert!(fee_rate <= 100);
         assert!(news.is_none());
+
+        drop(monitor);
+        storage.remove().unwrap();
+        bitcoind.stop().unwrap();
+    }
+
+    /// `get_network_fee_rate` lifts a low network estimate (or the
+    /// fallback when no estimate is available) up to `min_safe_fee_rate`.
+    #[test]
+    fn test_get_network_fee_rate_honors_min_safe_floor() {
+        let manager = FeeManager::new(FeeSettings {
+            max_feerate_sat_vb: 1000,
+            base_fee_multiplier: 1.0,
+            min_safe_fee_rate: 25,
+        });
+        let storage = StorageTestConfig::new();
+        let bitcoind = TestBitcoind::default();
+        let monitor = bitcoind.create_monitor(storage.get_raw_storage());
+
+        let (fee_rate, _) = manager.get_network_fee_rate(&monitor).unwrap();
+        assert!(
+            fee_rate >= 25,
+            "get_network_fee_rate must clamp up to min_safe_fee_rate; got {}",
+            fee_rate
+        );
 
         drop(monitor);
         storage.remove().unwrap();
@@ -210,9 +238,9 @@ mod tests {
     #[test]
     fn test_compute_speedup_fee() {
         let manager = FeeManager::new(FeeSettings {
-            min_network_fee_rate: 1,
             max_feerate_sat_vb: 1000,
             base_fee_multiplier: 1.0,
+            min_safe_fee_rate: 1,
         });
 
         // Basic CPFP: parent 100 vB / 500 sat output; child 50 vB; rate 5; bump 1.0.

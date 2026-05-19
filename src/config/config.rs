@@ -92,16 +92,19 @@ impl Default for DispatcherSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct FeeSettings {
     pub max_feerate_sat_vb: u64,
-    pub min_network_fee_rate: u64,
     pub base_fee_multiplier: f64,
+    /// Operator-set floor (sat/vB) applied to every speedup's effective fee
+    /// rate. Used both as the fallback when bitcoind's fee estimate is
+    /// unavailable and as the lower clamp on the resulting rate.
+    pub min_safe_fee_rate: u64,
 }
 
 impl Default for FeeSettings {
     fn default() -> Self {
         Self {
             max_feerate_sat_vb: DEFAULT_MAX_FEERATE_SAT_VB,
-            min_network_fee_rate: DEFAULT_MIN_NETWORK_FEE_RATE,
             base_fee_multiplier: DEFAULT_BASE_FEE_MULTIPLIER,
+            min_safe_fee_rate: DEFAULT_MIN_SAFE_FEE_RATE,
         }
     }
 }
@@ -215,13 +218,13 @@ impl BitcoinSettings {
         );
 
         ensure!(
-            self.fee.min_network_fee_rate >= 1,
-            "min_network_fee_rate must be at least 1"
+            self.fee.min_safe_fee_rate >= 1,
+            "min_safe_fee_rate must be at least 1 sat/vB"
         );
 
         ensure!(
-            self.fee.max_feerate_sat_vb >= self.fee.min_network_fee_rate,
-            "max_feerate_sat_vb must be greater than min_network_fee_rate"
+            self.fee.min_safe_fee_rate <= self.fee.max_feerate_sat_vb,
+            "min_safe_fee_rate cannot exceed max_feerate_sat_vb"
         );
         Ok(())
     }

@@ -68,6 +68,11 @@ impl FundingManager {
                 continue;
             }
             let k = tx.speedup_kind()?;
+            // Skip a speedup that has been superseded by an RBF: its change UTXO
+            // will be invalidated once the replacement lands.
+            if k.context().is_being_replaced() {
+                continue;
+            }
             if let Some(out) = tx.tx.output.last() {
                 let amount = out.value.to_sat();
                 if amount >= self.settings.min_funding_amount_sats {
@@ -105,17 +110,19 @@ impl FundingManager {
         Ok(queue.into_iter().next())
     }
 
-    /// Overwrite the head of the funding queue without validation. Only
-    /// for `Finalized` txs, so the head always holds a confirmed UTXO and is
-    /// resilient to mempool evictions and reorgs.
-    pub fn update_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
-        let mut queue = self.read_queue()?;
-        if queue.is_empty() {
-            queue.push(utxo);
-        } else {
-            queue[0] = utxo;
-        }
-        self.write_queue(&queue)?;
+    // Update the head of the queue with a new UTXO derived from a finalized speedup tx
+    pub fn update_funding_from_tx(
+        &self,
+        tx: &CoordinatedTx,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let k = tx.speedup_kind()?;
+        let (out, vout) = tx.last_output()?;
+        self.update_funding(Utxo::new(
+            tx.txid,
+            vout,
+            out.value.to_sat(),
+            &k.context().funding_input.pub_key,
+        ))?;
         Ok(())
     }
 
@@ -133,6 +140,20 @@ impl FundingManager {
     // -------------------------------------------------------------------------
     // Private helpers
     // -------------------------------------------------------------------------
+
+    /// Overwrite the head of the funding queue without validation. Only
+    /// for `Finalized` txs, so the head always holds a confirmed UTXO and is
+    /// resilient to mempool evictions and reorgs.
+    fn update_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
+        let mut queue = self.read_queue()?;
+        if queue.is_empty() {
+            queue.push(utxo);
+        } else {
+            queue[0] = utxo;
+        }
+        self.write_queue(&queue)?;
+        Ok(())
+    }
 
     fn read_queue(&self) -> Result<Vec<Utxo>, BitcoinCoordinatorError> {
         Ok(self.storage.get(FUNDING_KEY, None)?.unwrap_or_default())
@@ -550,6 +571,32 @@ mod tests {
         let result = mgr.get_funding(&[cpfp1]).unwrap().unwrap();
         assert_eq!(result.txid, fresh.txid);
         assert_eq!(result.amount, MIN * 4);
+        drop(mgr);
+        config.remove().unwrap();
+    }
+
+    #[test]
+    fn test_skip_being_replaced() {
+        let (mgr, config) = make_manager();
+        let root = utxo(MIN * 4);
+        let cpfp1 = speedup_tx(1, TransactionState::InMempool, root.clone(), MIN * 3);
+        let mut cpfp2 = speedup_tx(2, TransactionState::InMempool, change_of(&cpfp1), MIN * 2);
+        // Simulate cpfp1 being replaced by an RBF before it confirms.
+        cpfp2.kind = TxKind::Speedup(SpeedupKind::RBF {
+            replaces: cpfp1.txid,
+            context: SpeedupContext {
+                funding_input: change_of(&cpfp1),
+                replaced_by: None,
+                bump_fee_used: 1.0,
+                parent_data: vec![],
+            },
+        });
+        let result = mgr
+            .get_funding(&[cpfp1.clone(), cpfp2.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.txid, cpfp2.txid);
+        assert_eq!(result.amount, MIN * 2);
         drop(mgr);
         config.remove().unwrap();
     }

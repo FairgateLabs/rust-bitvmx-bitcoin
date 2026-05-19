@@ -155,7 +155,7 @@ impl EngineContext {
         outcome: DispatchOutcome,
         current_height: BlockHeight,
         fee_info: FeeInfo,
-    ) -> Result<bool, BitcoinCoordinatorError> {
+    ) -> Result<(), BitcoinCoordinatorError> {
         tx.verify_tx_id(txid)?; // sanity check
         match outcome {
             DispatchOutcome::Success | DispatchOutcome::AlreadyKnown => {
@@ -170,13 +170,17 @@ impl EngineContext {
                     "Transaction({}) dispatched at block height {}",
                     txid, current_height
                 );
-                Ok(true)
             }
             DispatchOutcome::AlreadyConfirmed => {
-                // Node reports the tx is already on-chain.
+                // If an RBF lands directly on-chain, mark the predecessor as replaced.
+                if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
+                    if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
+                        replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
+                        self.storage.update_tx(&replaced)?;
+                    }
+                }
                 debug!("Transaction({}) already confirmed on-chain", txid);
                 self.handle_confirmed(txid)?;
-                Ok(false)
             }
             DispatchOutcome::Retryable(msg) => {
                 if tx.retry_count + 1 >= self.coordinator_config.retry_attempts_sending_tx {
@@ -199,16 +203,15 @@ impl EngineContext {
                     );
                     self.storage.mark_as_retry(txid)?;
                 }
-                Ok(false)
             }
             DispatchOutcome::Fatal(msg) => {
                 warn!("Transaction({}) fatal dispatch error: {}", txid, msg);
                 self.storage
                     .settle_tx(txid, TransactionState::Failed, current_height)?;
                 self.storage.add_news(Self::dispatch_error_news(tx, txid))?;
-                Ok(false)
             }
         }
+        Ok(())
     }
 
     fn dispatch_error_news(tx: &CoordinatedTx, txid: Txid) -> CoordinatorNews {

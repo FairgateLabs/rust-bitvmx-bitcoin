@@ -88,8 +88,19 @@ impl BitcoinCoordinator {
         Ok(self.tx_engine.ctx.monitor.is_ready()?)
     }
 
-    /// Advances the monitor and runs one review/dispatch pass over all active
-    /// transactions and speedups. No-op while [`Self::is_ready`] is `false`.
+    /// Advances the monitor and runs one tick of the coordinator. No-op while
+    /// [`Self::is_ready`] is `false`.
+    ///
+    /// The tick is a strict 6-step pipeline. Build/save and dispatch are split
+    /// across consecutive ticks so a crash between RPC send and storage commit
+    /// cannot leave an on-chain transaction without a local record.
+    ///
+    /// 1. Review in-flight non-speedups; no dispatch here.
+    /// 2. Review in-flight speedups; no dispatch here.
+    /// 3. Dispatch TO-DISPATCH speedups built in a previous tick.
+    /// 4. Dispatch TO-DISPATCH non-speedups (parents and plain txs).
+    /// 5. Boost the latest live speedup if stale; save TO-DISPATCH for next tick.
+    /// 6. Build one CPFP batch for pending parents; save TO-DISPATCH for next tick.
     pub fn tick(&self) -> Result<(), BitcoinCoordinatorError> {
         self.tx_engine.ctx.monitor.tick()?;
 
@@ -98,9 +109,12 @@ impl BitcoinCoordinator {
             return Ok(());
         }
 
-        self.speedup_engine.process_active_transactions()?;
-        self.tx_engine.process_active_transactions()?;
-        self.speedup_engine.create_cpfps_for_parents()?;
+        self.tx_engine.review_active()?;
+        self.speedup_engine.review_speedups()?;
+        self.speedup_engine.dispatch_pending_speedups()?;
+        self.tx_engine.dispatch_pending()?;
+        self.speedup_engine.boost_if_stale()?;
+        self.speedup_engine.create_cpfp_batch()?;
 
         Ok(())
     }
@@ -345,7 +359,10 @@ impl BitcoinCoordinator {
         })?;
 
         if matches!(kind, TxKind::NeedsSpeedup(_)) {
-            self.tx_engine.ctx.storage.add_pending_speedup_parent(txid)?;
+            self.tx_engine
+                .ctx
+                .storage
+                .add_pending_speedup_parent(txid)?;
         }
 
         Ok(())

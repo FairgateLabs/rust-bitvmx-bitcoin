@@ -51,8 +51,9 @@ pub const MAX_RETRY_INTERVAL_SECONDS: u64 = 300; // 5 minutes
 // Retry attempts sending tx after an error
 pub const DEFAULT_RETRY_ATTEMPTS_SENDING_TX: u32 = 3;
 
-// Minimum network fee rate
-pub const DEFAULT_MIN_NETWORK_FEE_RATE: u64 = 1;
+// User-set safety floor applied to every speedup's effective fee rate.
+// Also used as the fallback when bitcoind's fee estimate is unavailable.
+pub const DEFAULT_MIN_SAFE_FEE_RATE: u64 = 1;
 
 // Fee percentage increase for RBF (% of original fee)
 pub const DEFAULT_RBF_FEE_MULTIPLIER: f64 = 1.5;

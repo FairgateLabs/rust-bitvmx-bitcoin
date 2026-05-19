@@ -19,59 +19,62 @@ impl TransactionEngine {
         Self { ctx }
     }
 
-    /// Review active normal transactions, dispatch pending ones, and return
-    /// the list of successfully-dispatched `NeedsSpeedup` parents so the caller
-    /// can route CPFP creation to `SpeedupEngine`.
-    pub fn process_active_transactions(
-        &self,
-    ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+    /// Step 4 of `tick`: broadcast every non-speedup transaction currently in
+    /// `ToDispatch` whose `target_block_height` has been reached.
+    pub fn dispatch_pending(&self) -> Result<(), BitcoinCoordinatorError> {
+        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let active_txs = self.ctx.storage.get_active_txs()?;
+        if active_txs.is_empty() {
+            return Ok(());
+        }
+
+        let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
+        for tx in active_txs {
+            if matches!(tx.kind, TxKind::Speedup(_)) {
+                continue;
+            }
+            if tx.state == TransactionState::ToDispatch && tx.is_ready_to_dispatch(current_height) {
+                to_dispatch.push(tx);
+            }
+        }
+
+        if to_dispatch.is_empty() {
+            return Ok(());
+        }
+
+        debug!("Dispatching {} pending transactions", to_dispatch.len());
+        self.dispatch_batch(to_dispatch, current_height)?;
+        Ok(())
+    }
+
+    /// Step 1 of `tick`: walk in-flight non-speedup transactions and update
+    /// their state from the chain. Never dispatches.
+    pub fn review_active(&self) -> Result<(), BitcoinCoordinatorError> {
         let current_height = self.ctx.monitor.get_monitor_height()?;
         self.ctx.storage.evict_stale_txs(current_height)?;
 
         let active_txs = self.ctx.storage.get_active_txs()?;
         if active_txs.is_empty() {
-            return Ok(vec![]);
+            return Ok(());
         }
 
-        debug!("Processing {} active transactions", active_txs.len());
-
-        let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
-        let mut to_review: Vec<CoordinatedTx> = Vec::new();
-
-        for tx in active_txs {
-            if matches!(tx.kind, TxKind::Speedup(_)) {
-                continue;
-            }
-            match tx.state {
-                TransactionState::ToDispatch => {
-                    if tx.is_ready_to_dispatch(current_height) {
-                        to_dispatch.push(tx);
-                    }
-                }
-                TransactionState::InMempool | TransactionState::Confirmed => {
-                    to_review.push(tx);
-                }
-                _ => {
-                    error!(
-                        "Inconsistent error: transaction {} in unexpected state {:?}",
-                        tx.txid, tx.state
-                    );
-                }
-            }
-        }
-
-        self.review_transactions(to_review, &mut to_dispatch, current_height)?;
-        if to_dispatch.is_empty() {
-            return Ok(vec![]);
-        }
-        let dispatched = self.dispatch_pending(to_dispatch, current_height)?;
-
-        let speedup_parents: Vec<CoordinatedTx> = dispatched
+        let to_review: Vec<CoordinatedTx> = active_txs
             .into_iter()
-            .filter(|tx| matches!(tx.kind, TxKind::NeedsSpeedup(_)))
+            .filter(|tx| {
+                !matches!(tx.kind, TxKind::Speedup(_))
+                    && matches!(
+                        tx.state,
+                        TransactionState::InMempool | TransactionState::Confirmed
+                    )
+            })
             .collect();
 
-        Ok(speedup_parents)
+        if to_review.is_empty() {
+            return Ok(());
+        }
+
+        self.review_transactions(to_review, current_height)?;
+        Ok(())
     }
 
     // =========================================================================
@@ -81,7 +84,6 @@ impl TransactionEngine {
     fn review_transactions(
         &self,
         txs: Vec<CoordinatedTx>,
-        to_dispatch: &mut Vec<CoordinatedTx>,
         current_height: BlockHeight,
     ) -> Result<(), BitcoinCoordinatorError> {
         let max_confs = self.ctx.monitor.settings.max_monitoring_confirmations;
@@ -119,13 +121,20 @@ impl TransactionEngine {
 
             if status.is_not_found() {
                 debug!(
-                    "Transaction({}) not found, re-queuing for dispatch",
+                    "Transaction({}) not found, re-queuing for dispatch next tick",
                     tx.txid
                 );
                 self.ctx
                     .storage
                     .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
-                to_dispatch.push(tx);
+                // A NeedsSpeedup parent that has lost its mempool placement also loses its CPFP coverage
+                // Re-add the parent so that once the re-dispatch puts it back into InMempool, `create_cpfp_batch`
+                // will build a fresh CPFP
+                if matches!(tx.kind, TxKind::NeedsSpeedup(_)) {
+                    self.ctx
+                        .storage
+                        .prepend_pending_speedup_parents(vec![tx.txid])?;
+                }
                 continue;
             }
 
@@ -150,17 +159,23 @@ impl TransactionEngine {
             if status.is_orphan() {
                 debug!("Transaction({}) orphaned, keeping InMempool", tx.txid);
                 self.ctx.handle_orphan(tx.txid)?;
+                continue;
             }
+
+            error!(
+                "Inconsistent state: transaction {} in unexpected chain status",
+                tx.txid
+            );
         }
 
         Ok(())
     }
 
-    fn dispatch_pending(
+    fn dispatch_batch(
         &self,
         txs: Vec<CoordinatedTx>,
         current_height: BlockHeight,
-    ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+    ) -> Result<(), BitcoinCoordinatorError> {
         // Update fee rates before dispatching to ensure we are using the latest network conditions.
         let (fee_rate, fee_news) = self
             .ctx
@@ -173,19 +188,14 @@ impl TransactionEngine {
         let txs = self.ctx.apply_retry_rate_limit(txs);
         let raw_txs: Vec<Transaction> = txs.iter().map(|t| t.tx.clone()).collect();
         let results = self.ctx.dispatcher.dispatch(raw_txs);
-        let mut dispatched = Vec::new();
 
         for (txid, outcome) in results {
             let tx = find_tx_in_batch(&txs, txid)?;
             let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&tx.tx, fee_rate);
-            if self
-                .ctx
-                .handle_dispatch_result(tx, txid, outcome, current_height, fee_info)?
-            {
-                dispatched.push(tx.clone());
-            }
+            self.ctx
+                .handle_dispatch_result(tx, txid, outcome, current_height, fee_info)?;
         }
 
-        Ok(dispatched)
+        Ok(())
     }
 }
