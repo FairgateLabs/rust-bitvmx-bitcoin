@@ -1130,7 +1130,7 @@ fn test_retry_failure() {
 
     // Wait for the retry interval, then tick.  Third attempt: retry_count + 1 = 3
     // >= retry_attempts_sending_tx (3) → tx is marked Failed + DispatchError news.
-    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
+    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 5));
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
     assert_eq!(

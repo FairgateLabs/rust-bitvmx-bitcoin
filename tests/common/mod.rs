@@ -519,7 +519,7 @@ pub fn tick_until_all_states(
 }
 
 /// Evict all transactions from the mempool by advancing the node's mock clock
-/// past the default 336-hour mempool expiry window
+/// past the default mempool-expiry window (336 h) and triggering the sweep.
 pub fn expire_mempool(bitcoin_client: &BitcoinClient, address: &Address) -> anyhow::Result<()> {
     let best_hash = bitcoin_client
         .client
@@ -529,16 +529,34 @@ pub fn expire_mempool(bitcoin_client: &BitcoinClient, address: &Address) -> anyh
         .client
         .get_block_header_info(&best_hash)
         .map_err(|e| anyhow::anyhow!("get_block_header_info failed: {:?}", e))?;
-    // Jump past the Bitcoin Core default mempoolexpiry of 336 hours.
-    let eviction_time = header.time as i64 + 336 * 3600 + 1;
+
+    // Jump 15 days ahead — comfortably past the default 336 h (14 d) expiry.
+    let eviction_time = header.time as i64 + 15 * 24 * 3600;
     bitcoin_client
         .client
         .call::<serde_json::Value>(
-            "setmocktime", //TODO: abstract this behind a `set_mock_time` method on `BitcoinClient`
+            "setmocktime",
             &[serde_json::Value::Number(eviction_time.into())],
         )
         .map_err(|e| anyhow::anyhow!("setmocktime failed: {:?}", e))?;
-    // Connecting a new block triggers expiry.
+
+    // Trigger the eviction sweep by pushing a fresh wallet tx through the
+    // mempool. The wallet was funded with mined blocks in `setup_wallet_and_mine_blocks`.
+    let wallet_addr = bitcoin_client
+        .init_wallet("test_wallet")
+        .map_err(|e| anyhow::anyhow!("init_wallet failed: {:?}", e))?;
+    bitcoin_client
+        .client
+        .call::<serde_json::Value>(
+            "sendtoaddress",
+            &[
+                serde_json::Value::String(format!("{}", wallet_addr)),
+                serde_json::Value::String("0.00001".to_string()),
+            ],
+        )
+        .map_err(|e| anyhow::anyhow!("sendtoaddress failed: {:?}", e))?;
+
+    // Advance height once so the coordinator sees a new block tick.
     mine_empty_blocks(bitcoin_client, 1, address)
 }
 

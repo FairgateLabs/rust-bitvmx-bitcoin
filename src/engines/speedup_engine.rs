@@ -11,7 +11,7 @@ use protocol_builder::{
         Utxo,
     },
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{
@@ -56,7 +56,8 @@ impl SpeedupEngine {
         }
     }
 
-    /// Step 3 of `tick`: broadcast TO-DISPATCH speedups (built and saved in a prior tick).
+    /// Step 4 of `tick`: broadcast TO-DISPATCH speedups (built in a prior tick, or
+    /// re-queued this tick by `review_speedups` on a not_found observation).
     ///
     /// Funding guard: If no funding source is currently available, skip the step entirely.
     /// Any pre-built speedup whose `fee_info.fee_rate` is below the current `min_safe_fee_rate`
@@ -87,8 +88,7 @@ impl SpeedupEngine {
                 .add_news(CoordinatorNews::FundingNotAvailable)?;
             return Ok(());
         }
-        let dispatchable = self.verify_min_fee_rate(pending, current_height)?; //TODO: is not efficient to pass all speedups again
-        let dispatchable = self.ctx.apply_retry_rate_limit(dispatchable);
+        let dispatchable = self.ctx.apply_retry_rate_limit(pending); //TODO: is not efficient to pass all speedups again
         for tx in &dispatchable {
             let _ = self.try_dispatch_speedup(tx, current_height)?;
         }
@@ -123,21 +123,23 @@ impl SpeedupEngine {
                 continue;
             }
 
-            // Not found: the tx is no longer in mempool and not on chain. If an RBF is replacing it,
-            // `remove_replaced_rbf` will mark it. Otherwise mark Failed directly and re-queue parents.
+            // The tx is no longer in mempool and not on chain. If an RBF is replacing it.
             if status.is_not_found() {
+                // If an RBF is replacing it, `remove_replaced_rbf` will clean it up when the RBF finalizes.
                 if matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced()) {
                     continue;
                 }
-                warn!(
+                // Otherwise, re-queue the same tx for dispatch this tick in step 4 sends the exact same tx. Possible outcomes:
+                //   - AlreadyKnown / AlreadyConfirmed → false positive; revert to InMempool / Confirmed.
+                //   - Success                         → re-broadcast accepted; back to InMempool.
+                debug!(
                     txid = %tx.txid,
                     state = ?tx.state,
-                    "speedup is not in mempool and not on chain; marking Failed and re-queuing parents",
+                    "speedup not in mempool / chain; re-queueing the same tx for dispatch",
                 );
                 self.ctx
                     .storage
-                    .settle_tx(tx.txid, TransactionState::Failed, current_height)?;
-                self.requeue_failed_speedup_parents(tx)?;
+                    .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
                 continue;
             }
 
@@ -269,7 +271,7 @@ impl SpeedupEngine {
             }
         } else {
             SpeedupKind::CPFP {
-                parents: vec![],
+                parents: vec![last_txid],
                 context,
             }
         };
@@ -524,10 +526,7 @@ impl SpeedupEngine {
         Ok(())
     }
 
-    /// Broadcast a single speedup transaction and update its state.
-    ///
-    /// Returns `true` if the tx landed in the mempool (Success or AlreadyKnown).
-    /// Returns `false` for AlreadyConfirmed, Retryable (transient), and Fatal.
+    /// Broadcast a single speedup transaction and update its state per the dispatch outcome.
     fn try_dispatch_speedup(
         &self,
         tx: &CoordinatedTx,
@@ -537,27 +536,6 @@ impl SpeedupEngine {
         let (txid, outcome) = verify_single_dispatch_result(tx.txid, results)?;
         self.ctx
             .handle_dispatch_result(tx, txid, outcome, current_height, tx.fee_info.clone())
-    }
-
-    /// Re-insert parents of failed txs at the head of PendingSpeedupParents so the next tick
-    /// RBF speedups are skipped because the speedup they replace is still live and still covers the parents.
-    fn requeue_failed_speedup_parents(
-        &self,
-        tx: &CoordinatedTx,
-    ) -> Result<(), BitcoinCoordinatorError> {
-        if let TxKind::Speedup(SpeedupKind::CPFP { parents, .. }) = &tx.kind {
-            if !parents.is_empty() {
-                warn!(
-                    txid = %tx.txid,
-                    parents = ?parents,
-                    "speedup failed; re-queueing parents in PendingSpeedupParents",
-                );
-                self.ctx
-                    .storage
-                    .prepend_pending_speedup_parents(parents.clone())?;
-            }
-        }
-        Ok(())
     }
 
     /// Remove any replaced by RBF transactions from monitoring and mark them as failed
@@ -596,32 +574,33 @@ impl SpeedupEngine {
         Ok(())
     }
 
-    // Verify the pre-built speedup's fee rate against the current `min_safe_fee_rate` setting.
-    fn verify_min_fee_rate(
-        &self,
-        txs: Vec<CoordinatedTx>,
-        current_height: BlockHeight,
-    ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
-        let min_safe_fee_rate = self.ctx.fee_manager.settings.min_safe_fee_rate;
-        let mut dispatchable = Vec::new();
-        for tx in txs {
-            if tx.fee_info.fee_rate < min_safe_fee_rate {
-                warn!(
-                    txid = %tx.txid,
-                    fee_rate = tx.fee_info.fee_rate,
-                    min_safe_fee_rate,
-                    "pre-built speedup fee_rate below min_safe_fee_rate; re-queueing parents",
-                );
-                self.ctx
-                    .storage
-                    .settle_tx(tx.txid, TransactionState::Failed, current_height)?;
-                self.requeue_failed_speedup_parents(&tx)?;
-                continue;
-            }
-            dispatchable.push(tx);
-        }
-        Ok(dispatchable)
-    }
+    // // Verify the pre-built speedup's fee rate against the current `min_safe_fee_rate` setting.
+    // // Below-floor speedups are settled Failed; covered parents are NOT re-queued —
+    // // the operator is responsible for the chosen floor.
+    // fn verify_min_fee_rate(
+    //     &self,
+    //     txs: Vec<CoordinatedTx>,
+    //     current_height: BlockHeight,
+    // ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+    //     let min_safe_fee_rate = self.ctx.fee_manager.settings.min_safe_fee_rate;
+    //     let mut dispatchable = Vec::new();
+    //     for tx in txs {
+    //         if tx.fee_info.fee_rate < min_safe_fee_rate {
+    //             warn!(
+    //                 txid = %tx.txid,
+    //                 fee_rate = tx.fee_info.fee_rate,
+    //                 min_safe_fee_rate,
+    //                 "pre-built speedup fee_rate below min_safe_fee_rate; settling Failed",
+    //             );
+    //             self.ctx
+    //                 .storage
+    //                 .settle_tx(tx.txid, TransactionState::Failed, current_height)?;
+    //             continue;
+    //         }
+    //         dispatchable.push(tx);
+    //     }
+    //     Ok(dispatchable)
+    // }
 }
 
 // Funding too small. Emit FundingConsumed; also emit

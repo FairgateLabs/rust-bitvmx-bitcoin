@@ -19,7 +19,7 @@ impl TransactionEngine {
         Self { ctx }
     }
 
-    /// Step 4 of `tick`: broadcast every non-speedup transaction currently in
+    /// Step 3 of `tick`: broadcast every non-speedup transaction currently in
     /// `ToDispatch` whose `target_block_height` has been reached.
     pub fn dispatch_pending(&self) -> Result<(), BitcoinCoordinatorError> {
         let current_height = self.ctx.monitor.get_monitor_height()?;
@@ -121,20 +121,14 @@ impl TransactionEngine {
 
             if status.is_not_found() {
                 debug!(
-                    "Transaction({}) not found, re-queuing for dispatch next tick",
+                    "Transaction({}) not found, re-queuing for dispatch this tick",
                     tx.txid
                 );
                 self.ctx
                     .storage
                     .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
-                // A NeedsSpeedup parent that has lost its mempool placement also loses its CPFP coverage
-                // Re-add the parent so that once the re-dispatch puts it back into InMempool, `create_cpfp_batch`
-                // will build a fresh CPFP
-                if matches!(tx.kind, TxKind::NeedsSpeedup(_)) {
-                    self.ctx
-                        .storage
-                        .prepend_pending_speedup_parents(vec![tx.txid])?;
-                }
+                // No need to re-add a NeedsSpeedup parent to PendingSpeedupParents here: the
+                // covering CPFP is independently re-queued in `review_speedups`'s not_found arm
                 continue;
             }
 

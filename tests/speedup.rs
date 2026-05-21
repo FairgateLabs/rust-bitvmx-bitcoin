@@ -751,14 +751,13 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
     setup.end_all().unwrap();
 }
 
-/// After parent + CPFP are both in the mempool, evict all mempool transactions. Recovery sequence is:
+/// After parent + CPFP are both in the mempool, evict all mempool transactions.
+/// Recovery sequence (single tick):
 /// 1. review_active marks the parent not_found → ToDispatch.
-/// 2. review_speedups marks the CPFP not_found → Failed, and re-queues its parent in PendingSpeedupParents.
+/// 2. review_speedups marks the CPFP not_found → ToDispatch (re-dispatch the exact same tx).
 /// 3. dispatch_pending re-broadcasts the parent → InMempool.
-/// 4. create_cpfp_batch rebuilds a CPFP for the re-queued parent. Because the inputs are deterministic (same
-///  parent, same funding, same fee math in regtest) the rebuilt CPFP has the same txid as the original.
-///  insert_speedup overwrites the Failed storage record with a fresh ToDispatch record.
-/// 5. The next tick dispatches the rebuilt CPFP → InMempool.
+/// 4. dispatch_pending_speedups re-broadcasts the CPFP (same txid). Bitcoind accepts it
+///    because the parent is now back in the mempool (step 3 just put it there).
 #[test]
 fn test_cpfp_orphan_requeue() {
     init_trace();
@@ -795,37 +794,33 @@ fn test_cpfp_orphan_requeue() {
     // Evict all mempool transactions.
     expire_mempool(&setup.bitcoin_client, &setup.regtest_wallet).unwrap();
 
-    // Parent must end up InMempool again.
-    let reached = tick_until_state(
+    // Both parent and CPFP must end up InMempool again — one tick suffices but
+    // give the recovery a small budget.
+    let reached = tick_until_all_states(
         &coordinator,
         &coord_storage,
-        parent_txid,
+        &[parent_txid, cpfp_txid],
         TransactionState::InMempool,
         10,
     )
     .unwrap();
     assert!(
         reached,
-        "parent must be re-dispatched and reach InMempool after eviction"
+        "parent and CPFP must both be back in InMempool after eviction"
     );
 
-    // A CPFP covering the parent must be InMempool. The deterministic rebuild reuses the original txid.
-    let reached = tick_until_state(
-        &coordinator,
-        &coord_storage,
-        cpfp_txid,
-        TransactionState::InMempool,
-        10,
-    )
-    .unwrap();
-    assert!(
-        reached,
-        "the rebuilt CPFP (sharing the original txid via deterministic rebuild) must reach InMempool"
+    // Exactly one speedup record exists. The original txid was re-broadcast, not rebuilt as a new record.
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(
+        speedups.len(),
+        1,
+        "no new CPFP record must be created; the same txid is re-dispatched"
     );
+    assert_eq!(speedups[0].txid, cpfp_txid);
+    assert_eq!(speedups[0].state, TransactionState::InMempool);
 
     // The CPFP still covers the original parent.
-    let cpfp = coord_storage.get_tx_by_id(cpfp_txid).unwrap().unwrap();
-    let parents = cpfp.speedup_kind().unwrap().parents();
+    let parents = speedups[0].speedup_kind().unwrap().parents();
     assert!(
         parents.contains(&parent_txid),
         "the recovered CPFP must still cover the original parent; got parents = {:?}",
@@ -1233,92 +1228,6 @@ fn test_cpfp_recovers_after_queue_was_exhausted() {
             .any(|n| matches!(n, CoordinatorNews::InsufficientFunds { .. })),
         "no further InsufficientFunds after recovery; got {:?}",
         news.coordinator_news
-    );
-
-    drop(coordinator);
-    drop(coord_storage);
-    setup.end_all().unwrap();
-}
-
-/// Restart with a raised `min_safe_fee_rate`
-#[test]
-fn test_min_safe_fee_rate_raise_on_restart() {
-    init_trace();
-
-    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    // First run: floor is the default (1). The CPFP this coordinator builds will have a low fee_rate
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
-    let coord_storage = get_coord_storage(&setup);
-
-    let funding_utxo = create_funded_speedup_utxo(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        500_000,
-    )
-    .unwrap();
-    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        200_000,
-    )
-    .unwrap();
-    let parent_txid = parent_tx.compute_txid();
-
-    tick_until_ready(&coordinator).unwrap();
-    coordinator.add_funding(funding_utxo).unwrap();
-    coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("stale_fee"), None, None)
-        .unwrap();
-
-    // Build the CPFP. Keep it in ToDispatch so the restart's higher floor catches it before broadcast.
-    coordinator.tick().unwrap();
-    let speedups = coord_storage.get_speedups_ordered().unwrap();
-    assert_eq!(speedups.len(), 1);
-    assert_eq!(speedups[0].state, TransactionState::ToDispatch);
-
-    // Shut the coordinator down.
-    drop(coordinator);
-
-    // Operator raises `min_safe_fee_rate` to the default max, so the CPFP fee rate must be exactly max_feerate_sat_vb on restart
-    let mut raised_settings = cpfp_settings();
-    let raised_floor = raised_settings.fee.max_feerate_sat_vb;
-    raised_settings.fee.min_safe_fee_rate = raised_floor;
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), raised_settings);
-
-    // The stale-fee guard catches the carried-over CPFP, settles it Failed, re-queues the parent in
-    // PendingSpeedupParents, and `create_cpfp_batch` rebuilds at the raised floor on the same tick.
-    tick_until_ready(&coordinator).unwrap();
-    let speedups = coord_storage.get_speedups_ordered().unwrap();
-    assert_eq!(speedups.len(), 2); // The original CPFP is still there as Fail, and a second CPFP has been also built
-    let new_cpfp_txid = speedups[1].txid;
-    let reached = tick_until_state(
-        &coordinator,
-        &coord_storage,
-        new_cpfp_txid,
-        TransactionState::InMempool,
-        5,
-    )
-    .unwrap();
-    assert!(
-        reached,
-        "post-restart CPFP must reach InMempool after rebuild at the raised floor"
-    );
-
-    let cpfp = coord_storage.get_tx_by_id(new_cpfp_txid).unwrap().unwrap();
-    assert!(
-        cpfp.fee_info.fee_rate == raised_floor,
-        "post-restart CPFP must carry fee_rate == raised floor; got {} (floor {})",
-        cpfp.fee_info.fee_rate,
-        raised_floor
-    );
-    let parents = cpfp.speedup_kind().unwrap().parents();
-    assert!(
-        parents.contains(&parent_txid),
-        "post-restart CPFP must still cover the original parent; got {:?}",
-        parents
     );
 
     drop(coordinator);

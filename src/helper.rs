@@ -142,6 +142,9 @@ impl TransactionState {
             // Reorg: confirmed block rolled back
             (Confirmed, InMempool) => true,
 
+            // Deep reorg of a previously-Confirmed speedup whose tx is now
+            (Confirmed, ToDispatch) => true,
+
             // Any state can fail
             (_, Failed) => true,
 

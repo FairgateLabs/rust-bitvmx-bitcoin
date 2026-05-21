@@ -97,8 +97,9 @@ impl BitcoinCoordinator {
     ///
     /// 1. Review in-flight non-speedups; no dispatch here.
     /// 2. Review in-flight speedups; no dispatch here.
-    /// 3. Dispatch TO-DISPATCH speedups built in a previous tick.
-    /// 4. Dispatch TO-DISPATCH non-speedups (parents and plain txs).
+    /// 3. Dispatch TO-DISPATCH non-speedups (parents and plain txs).
+    /// 4. Dispatch TO-DISPATCH speedups built in a previous tick (or
+    ///    re-queued by step 2's not_found path).
     /// 5. Boost the latest live speedup if stale; save TO-DISPATCH for next tick.
     /// 6. Build one CPFP batch for pending parents; save TO-DISPATCH for next tick.
     pub fn tick(&self) -> Result<(), BitcoinCoordinatorError> {
@@ -111,8 +112,8 @@ impl BitcoinCoordinator {
 
         self.tx_engine.review_active()?;
         self.speedup_engine.review_speedups()?;
-        self.speedup_engine.dispatch_pending_speedups()?;
         self.tx_engine.dispatch_pending()?;
+        self.speedup_engine.dispatch_pending_speedups()?;
         self.speedup_engine.boost_if_stale()?;
         self.speedup_engine.create_cpfp_batch()?;
 

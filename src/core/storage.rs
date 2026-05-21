@@ -229,13 +229,9 @@ impl CoordinatorStorage {
             .collect())
     }
 
-    /// Remove transactions that have been in a terminal state for at least `max_tracking_confirmations`
-    /// blocks, emitting a `TransactionEvicted` news item for each one.
-    ///
-    /// `NeedsSpeedup` parents that still appear in the pending-speedup-parents set are NEVER evicted,
-    /// regardless of age. Their `SpeedupData` is required to build the corresponding CPF. Once the CPFP
-    /// is built, `create_cpfp_batch` removes the parent from PendingSpeedupParents; the parent then
-    /// becomes eligible for normal eviction on subsequent ticks.
+    /// Remove transactions that have been in a terminal state for at least `max_tracking_confirmations` blocks, emitting
+    /// a `TransactionEvicted` news item for each one. `NeedsSpeedup` parents are protected from eviction while they are
+    /// still in the pending-speedup-parents set (no CPFP built yet).
     pub fn evict_stale_txs(
         &self,
         current_height: BlockHeight,
@@ -251,7 +247,8 @@ impl CoordinatorStorage {
                     >= self.settings.max_tracking_confirmations
                 {
                     if matches!(tx.kind, TxKind::NeedsSpeedup(_)) && psp.contains(&tx.txid) {
-                        // CPFP not built yet; keep the parent so its SpeedupData survives for the next build attempt.
+                        // CPFP not yet built, or a covering CPFP is still in flight.
+                        // Keep the parent so its SpeedupData survives for a potential rebuild.
                         continue;
                     }
                     self.remove_tx(tx.txid)?;
@@ -336,25 +333,6 @@ impl CoordinatorStorage {
             list.push(txid);
             self.storage.set(&key, &list, None)?;
         }
-        Ok(())
-    }
-
-    /// Re-insert `txids` at the head of the pending set, in front of any already-queued parents.
-    /// Duplicates already present anywhere in the queue are skipped.
-    pub fn prepend_pending_speedup_parents(
-        &self,
-        txids: Vec<Txid>,
-    ) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::PendingSpeedupParents);
-        let existing: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
-        let mut new_list: Vec<Txid> = Vec::with_capacity(existing.len() + txids.len());
-        for txid in txids {
-            if !existing.contains(&txid) && !new_list.contains(&txid) {
-                new_list.push(txid);
-            }
-        }
-        new_list.extend(existing);
-        self.storage.set(&key, &new_list, None)?;
         Ok(())
     }
 
@@ -451,6 +429,31 @@ impl CoordinatorStorage {
     // ================================
     // INTERNAL HELPERS
     // ================================
+
+    /// Return the set of `NeedsSpeedup` parent txids that are directly listed
+    /// in `SpeedupKind::CPFP::parents` of at least one speedup record whose
+    /// state is neither `Failed` nor `Finalized`.
+    // fn parents_with_live_cpfp(&self) -> Result<HashSet<Txid>, BitcoinCoordinatorError> {
+    //     let mut out = HashSet::new();
+    //     for s in self.get_speedups_ordered()? {
+    //         if matches!(
+    //             s.state,
+    //             TransactionState::Failed | TransactionState::Finalized
+    //         ) {
+    //             continue;
+    //         }
+    //         if let TxKind::Speedup(SpeedupKind::CPFP { parents, .. }) = &s.kind {
+    //             for p in parents {
+    //                 if let Some(tx) = self.get_tx_by_id(*p)? {
+    //                     if matches!(tx.kind, TxKind::NeedsSpeedup(_)) {
+    //                         out.insert(*p);
+    //                     }
+    //                 }
+    //             }
+    //         }
+    //     }
+    //     Ok(out)
+    // }
 
     fn tx_prefix(&self) -> String {
         format!("{TX_PREFIX}/txs/")
@@ -581,20 +584,14 @@ mod tests {
         assert_eq!(updated.state, TransactionState::Confirmed);
         assert!(storage.get_news().unwrap().is_empty());
 
-        // Invalid: Confirmed -> ToDispatch (not a valid transition)
+        // Valid: Confirmed -> ToDispatch (deep-reorg recovery — the speedup
+        // engine re-queues a not_found Confirmed speedup for re-dispatch).
         storage
             .update_tx_state(txid, TransactionState::ToDispatch)
             .unwrap();
-        let news = storage.get_news().unwrap();
-        assert_eq!(news.len(), 1);
-        assert_eq!(
-            news[0],
-            CoordinatorNews::InvalidStateTransition {
-                from: TransactionState::Confirmed,
-                to: TransactionState::ToDispatch,
-                txid,
-            }
-        );
+        let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
+        assert_eq!(updated.state, TransactionState::ToDispatch);
+        assert!(storage.get_news().unwrap().is_empty());
 
         drop(storage);
         storage_backend.remove().unwrap();
