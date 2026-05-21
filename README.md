@@ -53,9 +53,17 @@ The coordinator is composed of small, focused components wired together inside
 
 Each call to `tick()` runs one pass: it advances the monitor, reviews
 in-flight transactions, dispatches anything ready, and schedules speedups for
-parents that need them.
+parents that need them. Build/save of a new speedup happens in one tick and
+the broadcast happens in the next, with at most one pre-built speedup in
+flight at a time.
 
 ## Public API
+
+> ⚠️ **Indirect dependencies must wait for finality.** If transaction B
+> indirectly depends on transaction A, do NOT register B until A has reached
+> `Finalized`. While A is still in flight it may disappear from the mempool
+> and be re-dispatched, and the coordinator does not preserve any ordering
+> between independently registered transactions.
 
 The `BitcoinCoordinator` struct exposes the following methods (see
 `src/coordinator.rs` for full Rustdoc):
