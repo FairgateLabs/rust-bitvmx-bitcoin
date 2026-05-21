@@ -70,6 +70,29 @@ fn multi_funding_settings() -> BitcoinSettings {
     }
 }
 
+/// Settings with an aggressive bump and a moderate `max_feerate_sat_vb`, so
+/// the cap is reached within a few boosts. The network rate is set high
+/// enough (and the parent output small enough in the test below) for the
+/// initial CPFP to have a non-zero effective rate, so the bump-doubling
+/// model holds from the start.
+fn cap_settings() -> BitcoinSettings {
+    BitcoinSettings {
+        fee: FeeSettings {
+            min_safe_fee_rate: 10,
+            max_feerate_sat_vb: 100,
+            base_fee_multiplier: 1.0,
+        },
+        speedup: SpeedupSettings {
+            max_unconfirmed_speedups: 5,
+            max_rbf_attempts: 10,
+            min_blocks_before_resend_speedup: 1,
+            rbf_fee_multiplier: 1.5,
+            bump_fee_percentage: 2.0,
+        },
+        ..cpfp_settings()
+    }
+}
+
 /// Drive the coordinator through the build-then-dispatch sequence and return
 /// the CPFP txid once it is InMempool. Asserts that:
 /// - After the first tick, the CPFP exists in storage as `ToDispatch`.
@@ -631,6 +654,128 @@ fn test_cpfp_fee_escalates_across_boosts() {
         b2
     );
     assert_eq!(speedups[0].txid, cpfp1_txid);
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Boost escalation stops once `max_feerate_sat_vb` is reached. The boost that
+/// would exceed the cap is saved at the cap, a `MaxFeeRateReached` news item
+/// is emitted, and subsequent stale-tip ticks must not produce any new
+/// speedup record.
+#[test]
+fn test_boost_cap_reached() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = dummy_key_manager();
+    let settings = cap_settings();
+    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), settings.clone());
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        2_000_000,
+    )
+    .unwrap();
+    // Small parent output so `parent_amount_outputs` doesn't dominate the fee.
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000,
+    )
+    .unwrap();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("cap_stops_boost"), None, None)
+        .unwrap();
+
+    // Build & dispatch the initial CPFP, then read its measured effective rate.
+    let cpfp1_id = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+    let initial_rate = coord_storage
+        .get_tx_by_id(cpfp1_id)
+        .unwrap()
+        .unwrap()
+        .fee_info
+        .fee_rate;
+    let max_rate = settings.fee.max_feerate_sat_vb;
+    let bump_pct = settings.speedup.bump_fee_percentage;
+    assert!(
+        initial_rate > 0 && initial_rate < max_rate,
+        "initial CPFP must start strictly between 0 and the cap to exercise the boost flow; got rate={} cap={}",
+        initial_rate,
+        max_rate
+    );
+
+    // Each boost multiplies the effective rate by `bump_fee_percentage`, so the
+    // smallest N with `initial_rate * bump_pct^N >= max_rate` is an upper bound
+    // on the boosts needed to reach the cap. Extra iterations past the cap are
+    // no-ops because `boost_if_stale` skips a tip already at cap.
+    let boosts_until_cap =
+        ((max_rate as f64 / initial_rate as f64).log(bump_pct).ceil() as u32).max(1);
+
+    for _ in 0..boosts_until_cap {
+        mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+        coordinator.tick().unwrap();
+        let latest_txid = coord_storage
+            .get_speedups_ordered()
+            .unwrap()
+            .last()
+            .unwrap()
+            .txid;
+        let _ = tick_until_state(
+            &coordinator,
+            &coord_storage,
+            latest_txid,
+            TransactionState::InMempool,
+            3,
+        )
+        .unwrap();
+    }
+
+    // The latest speedup must now be sitting at the cap.
+    let speedups_at_cap = coord_storage.get_speedups_ordered().unwrap();
+    let capped_tx = speedups_at_cap.last().unwrap();
+    assert_eq!(
+        capped_tx.fee_info.fee_rate, max_rate,
+        "the capped speedup's effective rate must equal max_feerate_sat_vb; got {}",
+        capped_tx.fee_info.fee_rate,
+    );
+
+    // The `MaxFeeRateReached` news must reference the capped txid.
+    let news = coord_storage.get_news().unwrap();
+    let cap_news = news
+        .iter()
+        .find(|n| matches!(n, CoordinatorNews::MaxFeeRateReached { .. }))
+        .expect("MaxFeeRateReached must be present");
+    if let CoordinatorNews::MaxFeeRateReached {
+        txid,
+        effective_fee_rate,
+        ..
+    } = cap_news
+    {
+        assert_eq!(*txid, capped_tx.txid);
+        assert_eq!(*effective_fee_rate, settings.fee.max_feerate_sat_vb);
+    }
+
+    // After the cap, additional stale-tip ticks must not produce any new speedup.
+    let count_at_cap = speedups_at_cap.len();
+    for _ in 0..4 {
+        mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+        coordinator.tick().unwrap();
+    }
+    let speedups_after = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(
+        speedups_after.len(),
+        count_at_cap,
+        "boost_if_stale must not save any new speedup once the cap is reached"
+    );
 
     drop(coordinator);
     drop(coord_storage);

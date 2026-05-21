@@ -89,9 +89,12 @@ impl FeeManager {
     }
 
     /// Compute the total fee (in sats) required for a CPFP/RBF speedup transaction.
-    ///
     /// `parent_entries` is a slice of `(output_amount_sats, parent_vsize)` pairs,
     /// one per parent transaction being included in this speedup.
+    ///
+    /// Returns `(fee, capped)`. `capped == true` means the final fee would have
+    /// exceeded `max_feerate_sat_vb * child_vsize` and was clamped down to that
+    /// limit.
     pub fn compute_speedup_fee(
         &self,
         parent_entries: &[(u64, usize)],
@@ -101,7 +104,7 @@ impl FeeManager {
         is_rbf: bool,
         chain_diff_fee: u64,
         chain_vsize: usize,
-    ) -> u64 {
+    ) -> (u64, bool) {
         // Minimum relay fee that each parent already paid (1 sat/vB).
         let min_relay_fee_rate: usize = 1; //ASK: why 1 sat/vB? Cant assume a constant value for this
 
@@ -134,7 +137,16 @@ impl FeeManager {
             total_fee += chain_vsize * min_relay_fee_rate;
         }
 
-        (total_fee as f64 * bump_fee).ceil() as u64
+        let final_fee = (total_fee as f64 * bump_fee).ceil() as u64;
+        let cap = self
+            .settings
+            .max_feerate_sat_vb
+            .saturating_mul(child_vsize as u64);
+        if final_fee > cap {
+            (cap, true)
+        } else {
+            (final_fee, false)
+        }
     }
 }
 
@@ -245,15 +257,49 @@ mod tests {
 
         // Basic CPFP: parent 100 vB / 500 sat output; child 50 vB; rate 5; bump 1.0.
         // parent_total=500, child_total=250, total=750; fee = 750-500-100 = 150.
-        let fee = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, false, 0, 0);
+        let (fee, capped) = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, false, 0, 0);
         assert_eq!(fee, 150);
+        assert!(!capped);
 
         // RBF bandwidth policy: total_fee(150) < child_total*2(500) -> floor lifted to 500.
-        let fee = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, true, 0, 0);
+        let (fee, capped) = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, true, 0, 0);
         assert_eq!(fee, 500);
+        assert!(!capped);
 
         // Bump multiplier 1.5: ceil(150 * 1.5) = 225
-        let fee = manager.compute_speedup_fee(&[(500, 100)], 50, 1.5, 5, false, 0, 0);
+        let (fee, capped) = manager.compute_speedup_fee(&[(500, 100)], 50, 1.5, 5, false, 0, 0);
         assert_eq!(fee, 225);
+        assert!(!capped);
+    }
+
+    /// When the computed fee would exceed `max_feerate_sat_vb * child_vsize`,
+    /// the result is clamped at that limit and the cap flag is set.
+    #[test]
+    fn test_compute_speedup_fee_caps_at_max() {
+        // Cap at 2 sat/vB and child vsize 50 → cap = 100 sats.
+        let manager = FeeManager::new(FeeSettings {
+            max_feerate_sat_vb: 2,
+            base_fee_multiplier: 1.0,
+            min_safe_fee_rate: 1,
+        });
+
+        // Same baseline as the basic CPFP case → unclamped fee would be 150.
+        let (fee, capped) = manager.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, false, 0, 0);
+        assert_eq!(fee, 100, "fee must be clamped to max * child_vsize");
+        assert!(capped, "cap flag must be set when clamping occurs");
+
+        // A configuration whose unclamped fee is exactly at the cap → not flagged.
+        let manager_exact = FeeManager::new(FeeSettings {
+            max_feerate_sat_vb: 3,
+            base_fee_multiplier: 1.0,
+            min_safe_fee_rate: 1,
+        });
+        let (fee, capped) =
+            manager_exact.compute_speedup_fee(&[(500, 100)], 50, 1.0, 5, false, 0, 0);
+        assert_eq!(fee, 150);
+        assert!(
+            !capped,
+            "cap flag must be clear when final == cap-1 / below"
+        );
     }
 }

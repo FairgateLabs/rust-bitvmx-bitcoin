@@ -196,6 +196,11 @@ impl SpeedupEngine {
                 return Ok(());
             }
 
+            // If the live tip is already paying at the max-fee-rate cap, do not boost it any further.
+            if last.fee_info.fee_rate >= self.ctx.fee_manager.settings.max_feerate_sat_vb {
+                return Ok(());
+            }
+
             // Short-circuit if any speedup is already TO-DISPATCH to avoid building multiple boosts in the same tick
             if all_speedups
                 .iter()
@@ -261,7 +266,7 @@ impl SpeedupEngine {
         let (chain_diff_fee, chain_vsize) =
             self.ctx.fee_manager.chain_fee_diff(fee_rate, &unconfirmed);
 
-        let Some((new_tx, _fee_paid)) = self.build_speedup(
+        let Some((new_tx, fee_paid, capped)) = self.build_speedup(
             &parent_entries,
             &funding,
             next_bump,
@@ -276,7 +281,12 @@ impl SpeedupEngine {
         };
 
         let context = Self::make_speedup_context(&funding, next_bump, &parent_entries);
-        let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&new_tx, fee_rate);
+        let new_txid = new_tx.compute_txid();
+        let fee_info = FeeInfo {
+            fee: fee_paid,
+            fee_rate: fee_paid / new_tx.vsize() as u64,
+            weight: new_tx.weight().to_wu() as u64,
+        };
         let kind = if use_rbf {
             SpeedupKind::RBF {
                 replaces: last_txid,
@@ -288,7 +298,18 @@ impl SpeedupEngine {
                 context,
             }
         };
+        let ctx_str = Self::ctx_for_kind(&kind).to_string();
+        let effective_rate = fee_info.fee_rate;
         self.save_speedup(new_tx, fee_info, kind, current_height)?;
+        if capped {
+            self.ctx
+                .storage
+                .add_news(CoordinatorNews::MaxFeeRateReached {
+                    txid: new_txid,
+                    effective_fee_rate: effective_rate,
+                    context: ctx_str,
+                })?;
+        }
 
         Ok(())
     }
@@ -368,7 +389,7 @@ impl SpeedupEngine {
 
         let parent_txids: Vec<Txid> = batch.iter().map(|p| p.txid).collect();
 
-        let Some((cpfp_tx, _fee_paid)) = self.build_speedup(
+        let Some((cpfp_tx, fee_paid, capped)) = self.build_speedup(
             &parent_entries,
             &funding,
             bump_fee,
@@ -390,11 +411,24 @@ impl SpeedupEngine {
         }
 
         let context = Self::make_speedup_context(&funding, bump_fee, &parent_entries);
-        let fee_info = self.ctx.fee_manager.compute_fee_for_tx(&cpfp_tx, fee_rate);
+        let fee_info = FeeInfo {
+            fee: fee_paid,
+            fee_rate: fee_paid / cpfp_tx.vsize() as u64,
+            weight: cpfp_tx.weight().to_wu() as u64,
+        };
         let kind = SpeedupKind::CPFP {
             parents: parent_txids,
             context,
         };
+        if capped {
+            self.ctx
+                .storage
+                .add_news(CoordinatorNews::MaxFeeRateReached {
+                    txid: cpfp_tx.compute_txid(),
+                    effective_fee_rate: fee_info.fee_rate,
+                    context: Self::ctx_for_kind(&kind).to_string(),
+                })?;
+        }
         self.save_speedup(cpfp_tx, fee_info, kind, current_height)?;
 
         Ok(())
@@ -405,7 +439,8 @@ impl SpeedupEngine {
     // =========================================================================
 
     /// Build a CPFP or RBF transaction via the fee convergence loop.
-    /// Returns `Ok(Some((tx, fee)))` on success.
+    /// Returns `Ok(Some((tx, fee, capped)))` on success. `capped == true` means
+    /// the fee was clamped at the max-fee-rate cap.
     fn build_speedup(
         &self,
         parent_entries: &[(SpeedupData, usize)],
@@ -415,7 +450,7 @@ impl SpeedupEngine {
         fee_rate: u64,
         chain_diff_fee: u64,
         chain_vsize: usize,
-    ) -> Result<Option<(Transaction, u64)>, BitcoinCoordinatorError> {
+    ) -> Result<Option<(Transaction, u64, bool)>, BitcoinCoordinatorError> {
         let speedups_data: Vec<SpeedupData> =
             parent_entries.iter().map(|(d, _)| d.clone()).collect();
 
@@ -442,7 +477,7 @@ impl SpeedupEngine {
                 child_vsize = dummy_vsize;
             }
 
-            let fee = self.ctx.fee_manager.compute_speedup_fee(
+            let (fee, capped) = self.ctx.fee_manager.compute_speedup_fee(
                 &fee_entries,
                 child_vsize,
                 bump_fee,
@@ -468,7 +503,7 @@ impl SpeedupEngine {
 
             let final_vsize = final_tx.vsize();
             if child_vsize >= final_vsize {
-                return Ok(Some((final_tx, fee)));
+                return Ok(Some((final_tx, fee, capped)));
             }
             child_vsize = final_vsize;
         }

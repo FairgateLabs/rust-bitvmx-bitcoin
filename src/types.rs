@@ -147,6 +147,13 @@ pub enum CoordinatorNews {
         txid: Txid,
         context: String,
     },
+    /// A speedup transaction was saved at the `max_feerate_sat_vb` cap.
+    /// No further boosts will be applied to it.
+    MaxFeeRateReached {
+        txid: Txid,
+        effective_fee_rate: u64,
+        context: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
