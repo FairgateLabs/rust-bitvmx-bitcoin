@@ -68,12 +68,11 @@ impl SpeedupEngine {
     pub fn dispatch_pending_speedups(&self) -> Result<(), BitcoinCoordinatorError> {
         let current_height = self.ctx.monitor.get_monitor_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
-        let pending: Vec<CoordinatedTx> = all_speedups
+
+        if !all_speedups
             .iter()
-            .filter(|tx| tx.state == TransactionState::ToDispatch)
-            .cloned()
-            .collect();
-        if pending.is_empty() {
+            .any(|tx| tx.state == TransactionState::ToDispatch)
+        {
             return Ok(());
         }
 
@@ -88,7 +87,12 @@ impl SpeedupEngine {
                 .add_news(CoordinatorNews::FundingNotAvailable)?;
             return Ok(());
         }
-        let dispatchable = self.ctx.apply_retry_rate_limit(pending); //TODO: is not efficient to pass all speedups again
+
+        let pending: Vec<CoordinatedTx> = all_speedups
+            .into_iter()
+            .filter(|tx| tx.state == TransactionState::ToDispatch)
+            .collect();
+        let dispatchable = self.ctx.apply_retry_rate_limit(pending);
         for tx in &dispatchable {
             let _ = self.try_dispatch_speedup(tx, current_height)?;
         }
@@ -172,39 +176,63 @@ impl SpeedupEngine {
         let current_height = self.ctx.monitor.get_monitor_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
-        let last = match all_speedups.iter().rev().find(|tx| {
-            tx.state == TransactionState::InMempool
-                && !matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
-        }) {
-            Some(t) => t,
-            None => return Ok(()),
-        };
+        let (last_txid, next_bump, use_rbf, parent_entries) = {
+            let last = match all_speedups.iter().rev().find(|tx| {
+                tx.state == TransactionState::InMempool
+                    && !matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
+            }) {
+                Some(t) => t,
+                None => return Ok(()),
+            };
 
-        let broadcast_height = match last.broadcast_block_height {
-            Some(h) => h,
-            None => return Ok(()),
-        };
+            let broadcast_height = match last.broadcast_block_height {
+                Some(h) => h,
+                None => return Ok(()),
+            };
 
-        if current_height.saturating_sub(broadcast_height)
-            < self.settings.min_blocks_before_resend_speedup
-        {
-            return Ok(());
-        }
-
-        // Short-circuit if any speedup is already TO-DISPATCH to avoid building multiple boosts in the same tick
-        if all_speedups
-            .iter()
-            .any(|tx| tx.state == TransactionState::ToDispatch)
-        {
-            return Ok(());
-        }
-
-        let last_context = match &last.kind {
-            TxKind::Speedup(k) => k.context(),
-            _ => {
-                warn!(txid = %last.txid, "expected Speedup kind in boost_if_stale; skipping");
+            if current_height.saturating_sub(broadcast_height)
+                < self.settings.min_blocks_before_resend_speedup
+            {
                 return Ok(());
             }
+
+            // Short-circuit if any speedup is already TO-DISPATCH to avoid building multiple boosts in the same tick
+            if all_speedups
+                .iter()
+                .any(|tx| tx.state == TransactionState::ToDispatch)
+            {
+                return Ok(());
+            }
+
+            let last_context = match &last.kind {
+                TxKind::Speedup(k) => k.context(),
+                _ => {
+                    warn!(txid = %last.txid, "expected Speedup kind in boost_if_stale; skipping");
+                    return Ok(());
+                }
+            };
+
+            let inmempool_count = all_speedups
+                .iter()
+                .filter(|tx| tx.state == TransactionState::InMempool)
+                .count() as u32;
+            let use_rbf = inmempool_count >= self.settings.max_unconfirmed_speedups;
+            let parent_entries: Vec<(SpeedupData, usize)> = if use_rbf {
+                last_context
+                    .parent_data
+                    .iter()
+                    .map(|(sd, _, vs)| (sd.clone(), *vs))
+                    .collect()
+            } else {
+                vec![]
+            };
+
+            (
+                last.txid,
+                last_context.bump_fee_used * self.settings.bump_fee_percentage,
+                use_rbf,
+                parent_entries,
+            )
         };
 
         let (fee_rate, fee_news) = self
@@ -225,28 +253,13 @@ impl SpeedupEngine {
             }
         };
 
-        let next_bump = last_context.bump_fee_used * self.settings.bump_fee_percentage;
-        let last_txid = last.txid;
-
-        let unconfirmed: Vec<_> = all_speedups
-            .iter()
+        let unconfirmed: Vec<CoordinatedTx> = all_speedups
+            .into_iter()
             .filter(|tx| tx.state == TransactionState::InMempool)
-            .cloned() //TODO: try to avoid cloning all along this file
             .collect();
 
-        let use_rbf = (unconfirmed.len() as u32) >= self.settings.max_unconfirmed_speedups;
         let (chain_diff_fee, chain_vsize) =
             self.ctx.fee_manager.chain_fee_diff(fee_rate, &unconfirmed);
-
-        let parent_entries: Vec<(SpeedupData, usize)> = if use_rbf {
-            last_context
-                .parent_data
-                .iter()
-                .map(|(sd, _, vs)| (sd.clone(), *vs))
-                .collect()
-        } else {
-            vec![]
-        };
 
         let Some((new_tx, _fee_paid)) = self.build_speedup(
             &parent_entries,
