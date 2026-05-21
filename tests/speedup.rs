@@ -14,7 +14,6 @@ use bitcoin_coordinator::{
 use bitcoincore_rpc::RpcApi as _;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::config::MonitorSettingsConfig;
-use std::rc::Rc;
 
 // =============================================================================
 // Helpers
@@ -143,8 +142,8 @@ fn test_cpfp_lifecycle() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -261,8 +260,8 @@ fn test_cpfp_two_parents() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -354,8 +353,8 @@ fn test_cpfp_no_funding() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     tick_until_ready(&coordinator).unwrap();
 
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
@@ -411,8 +410,8 @@ fn test_cpfp_reorg() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -499,8 +498,8 @@ fn test_cpfp_boost() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -580,10 +579,9 @@ fn test_cpfp_fee_escalates_across_boosts() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
+    let key_manager = TestKeyManager::new();
     // max_unconfirmed=3 so both boosts stay as CPFP (not RBF).
-    let coordinator =
-        create_coordinator_with_km(&setup, Rc::clone(&key_manager), boost_settings(3));
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), boost_settings(3));
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -669,9 +667,9 @@ fn test_boost_cap_reached() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
+    let key_manager = TestKeyManager::new();
     let settings = cap_settings();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), settings.clone());
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings.clone());
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -793,8 +791,8 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -908,8 +906,8 @@ fn test_cpfp_orphan_requeue() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -986,8 +984,8 @@ fn test_cpfp_funding_restored_after_finalization() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -1111,9 +1109,9 @@ fn test_cpfp_advances_to_next_funding() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
+    let key_manager = TestKeyManager::new();
     let coordinator =
-        create_coordinator_with_km(&setup, Rc::clone(&key_manager), multi_funding_settings());
+        create_coordinator_with_km(&setup, key_manager.rc(), multi_funding_settings());
     let coord_storage = get_coord_storage(&setup);
 
     // Funding A: exactly at min_funding_amount_sats (10 000). Will pass the
@@ -1257,9 +1255,9 @@ fn test_cpfp_recovers_after_queue_was_exhausted() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
+    let key_manager = TestKeyManager::new();
     let coordinator =
-        create_coordinator_with_km(&setup, Rc::clone(&key_manager), multi_funding_settings());
+        create_coordinator_with_km(&setup, key_manager.rc(), multi_funding_settings());
     let coord_storage = get_coord_storage(&setup);
 
     // Create both UTXOs up front (each mines a block) so no block is mined between ticks.
@@ -1389,8 +1387,8 @@ fn test_cpfp_built_for_parent_confirmed_before_funding() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = dummy_key_manager();
-    let coordinator = create_coordinator_with_km(&setup, Rc::clone(&key_manager), cpfp_settings());
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
     let coord_storage = get_coord_storage(&setup);
 
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(

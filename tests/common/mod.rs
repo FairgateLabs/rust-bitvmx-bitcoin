@@ -33,12 +33,66 @@ impl Default for TestSetupConfig {
     }
 }
 
+/// Wrapper around an `Rc<KeyManager>` that owns its on-disk storage
+/// directory under `temp-runs/` and removes it on drop
+pub struct TestKeyManager {
+    km: Option<Rc<KeyManager>>,
+    path: String,
+}
+
+impl TestKeyManager {
+    pub fn new() -> Self {
+        let path = format!("temp-runs/km_{}", Uuid::new_v4());
+        let config = StorageConfig {
+            path: path.clone(),
+            password: None,
+        };
+        let km = Rc::new(
+            KeyManager::new(bitcoin::Network::Regtest, None, None, &config)
+                .expect("TestKeyManager: failed to construct KeyManager"),
+        );
+        Self { km: Some(km), path }
+    }
+
+    pub fn rc(&self) -> Rc<KeyManager> {
+        Rc::clone(
+            self.km
+                .as_ref()
+                .expect("TestKeyManager: already cleaned up"),
+        )
+    }
+}
+
+impl Default for TestKeyManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for TestKeyManager {
+    type Target = KeyManager;
+    fn deref(&self) -> &Self::Target {
+        self.km
+            .as_ref()
+            .expect("TestKeyManager: already cleaned up")
+    }
+}
+
+impl Drop for TestKeyManager {
+    fn drop(&mut self) {
+        self.km.take();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Test setup components that are commonly used across tests
 pub struct TestSetup {
     pub storage: StorageTestConfig,
     pub bitcoind: TestBitcoind,
     pub bitcoin_client: Rc<BitcoinClient>,
     pub regtest_wallet: Address,
+    pub key_manager: TestKeyManager,
 }
 
 impl TestSetup {
@@ -53,12 +107,14 @@ impl TestSetup {
             bitcoind.rpc_config.network,
             config.blocks_mined,
         )?;
+        let key_manager = TestKeyManager::new();
 
         Ok(TestSetup {
             bitcoind,
             storage,
             bitcoin_client,
             regtest_wallet,
+            key_manager,
         })
     }
 
@@ -104,7 +160,7 @@ pub fn create_coordinator(setup: &TestSetup) -> BitcoinCoordinator {
     BitcoinCoordinator::new_with_paths(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
-        dummy_key_manager(),
+        setup.key_manager.rc(),
         None,
     )
     .expect("Failed to create BitcoinCoordinator")
@@ -135,7 +191,7 @@ pub fn create_coordinator_with_settings(
     BitcoinCoordinator::new_with_paths(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
-        dummy_key_manager(),
+        setup.key_manager.rc(),
         Some(settings),
     )
     .expect("Failed to create BitcoinCoordinator with settings")
