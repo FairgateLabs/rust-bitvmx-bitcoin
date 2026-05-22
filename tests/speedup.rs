@@ -975,6 +975,120 @@ fn test_cpfp_orphan_requeue() {
     setup.end_all().unwrap();
 }
 
+/// `EngineContext::last_retry_at` is shared between the transaction engine and the speedup engine.
+///  When a non-speedup retry consumes the rate-limit slot, a speedup retry queued in the same tick
+///  must be blocked until the configured interval elapses.
+#[test]
+fn test_retry_rate_limit_shared_across_engines() {
+    init_trace();
+    let retry_interval_seconds = 8u64;
+
+    let settings = BitcoinSettings {
+        coordinator: CoordinatorSettings {
+            retry_interval_seconds,
+            retry_attempts_sending_tx: 10,
+        },
+        ..cpfp_settings()
+    };
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings);
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        500_000,
+    )
+    .unwrap();
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+    let parent_txid = parent_tx.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("shared_rate"), None, None)
+        .unwrap();
+
+    // Build & dispatch the CPFP; parent reaches InMempool alongside it.
+    let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "parent must be InMempool before the rate-limit test starts"
+    );
+
+    // Flip both back to ToDispatch with retry_count = 1. Bitcoind still has
+    // them in mempool, so the eventual redispatch will return AlreadyKnown.
+    coord_storage.mark_as_retry(parent_txid).unwrap();
+    coord_storage.mark_as_retry(cpfp_txid).unwrap();
+
+    // Single tick: phase 3 redispatches the parent (consumes the rate-limit
+    // slot), phase 4 sees the just-set `last_retry_at` and rate-limits the
+    // CPFP retry.
+    coordinator.tick().unwrap();
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "non-speedup retry must dispatch (no prior retry had armed the window)"
+    );
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(cpfp_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::ToDispatch,
+        "CPFP retry must be blocked by the shared last_retry_at slot the parent just consumed"
+    );
+
+    // Tick again immediately; the interval has NOT elapsed so the CPFP is
+    // still rate-limited.
+    coordinator.tick().unwrap();
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(cpfp_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::ToDispatch,
+        "CPFP retry must remain blocked while the interval has not elapsed"
+    );
+
+    // After the interval, the CPFP retry passes.
+    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
+    coordinator.tick().unwrap();
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(cpfp_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "CPFP retry must redispatch once the shared retry interval has elapsed"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
 /// When a CPFP is finalized the coordinator advances the base funding UTXO to
 /// the confirmed change output of that CPFP. A second parent dispatched later
 /// must produce a new CPFP whose funding input is the first CPFP's change
