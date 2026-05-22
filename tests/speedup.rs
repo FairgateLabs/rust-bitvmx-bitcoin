@@ -704,6 +704,7 @@ fn test_boost_cap_reached() {
         .fee_rate;
     let max_rate = settings.fee.max_feerate_sat_vb;
     let bump_pct = settings.speedup.bump_fee_percentage;
+    let network_rate = settings.fee.min_safe_fee_rate; // bitcoind regtest estimate falls back to this floor
     assert!(
         initial_rate > 0 && initial_rate < max_rate,
         "initial CPFP must start strictly between 0 and the cap to exercise the boost flow; got rate={} cap={}",
@@ -711,12 +712,12 @@ fn test_boost_cap_reached() {
         max_rate
     );
 
-    // Each boost multiplies the effective rate by `bump_fee_percentage`, so the
-    // smallest N with `initial_rate * bump_pct^N >= max_rate` is an upper bound
-    // on the boosts needed to reach the cap. Extra iterations past the cap are
-    // no-ops because `boost_if_stale` skips a tip already at cap.
+    // A boost CPFP-of-CPFP has the `network_rate * bump_pct^N` (N = boost number).
+    // The smallest N with `network_rate * bump_pct^N >= max_rate` is exactly
+    // the boost on which the cap is hit. Any extra iterations past that point
+    // are no-ops because `boost_if_stale` skips a tip already at cap.
     let boosts_until_cap =
-        ((max_rate as f64 / initial_rate as f64).log(bump_pct).ceil() as u32).max(1);
+        ((max_rate as f64 / network_rate as f64).log(bump_pct).ceil() as u32).max(1);
 
     for _ in 0..boosts_until_cap {
         mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
@@ -780,12 +781,135 @@ fn test_boost_cap_reached() {
     setup.end_all().unwrap();
 }
 
-/// Once the in-mempool speedup count reaches max_unconfirmed_speedups, the next
-/// boost switches from CPFP to RBF. After the RBF is dispatched, the predecessor
-/// must have its `replaced_by` set so the funding walk-back and boost_if_stale
-/// skip it.
-///
-/// cpfp_settings: max_unconfirmed_speedups = 2.
+/// When `boost_if_stale` selects RBF (in-mempool count reached `max_unconfirmed_speedups`) and
+/// the BIP-125 bandwidth floor would exceed the configured  `max_feerate_sat_vb` cap, the RBF
+/// is still built, clamped at the cap, but bitcoind will reject the broadcast for being below
+/// the floor. To break the doomed-retry busy-loop, `boost_if_stale` marks the predecessor at-cap
+/// so subsequent stale intervals skip via the existing tip-at-cap check. A `MaxFeeRateReached`
+/// news item is emitted referencing the new RBF.
+#[test]
+fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
+    init_trace();
+
+    // Network rate floors at 6; cap is 10. RBF bandwidth floor would be
+    // 6 × 2 = 12 sat/vB, above the cap. max_unconfirmed_speedups = 1 forces
+    // the first boost to be an RBF.
+    let settings = BitcoinSettings {
+        fee: FeeSettings {
+            min_safe_fee_rate: 6,
+            max_feerate_sat_vb: 10,
+            base_fee_multiplier: 1.0,
+        },
+        speedup: SpeedupSettings {
+            max_unconfirmed_speedups: 1,
+            max_rbf_attempts: 10,
+            min_blocks_before_resend_speedup: 1,
+            rbf_fee_multiplier: 1.5,
+            bump_fee_percentage: 1.5,
+        },
+        ..cpfp_settings()
+    };
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings);
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        2_000_000,
+    )
+    .unwrap();
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000,
+    )
+    .unwrap();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(
+            parent_tx,
+            speedup_data,
+            ctx("rbf_floor_above_cap"),
+            None,
+            None,
+        )
+        .unwrap();
+
+    // Build + dispatch the initial CPFP. unconfirmed.len() == 1 == max_unconfirmed so the next stale-interval boost will choose RBF.
+    let cpfp1_id = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+
+    // Drive boost_if_stale: mine a block (stale check passes) and tick.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+
+    // A capped RBF was built and saved (count grows to 2).
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(
+        speedups.len(),
+        2,
+        "RBF must be built and saved (clamped at the cap); got {} speedups",
+        speedups.len()
+    );
+    let rbf_id = speedups[1].txid;
+    assert_eq!(
+        speedups[1].fee_info.fee_rate, 10,
+        "RBF effective rate must be clamped at max_feerate_sat_vb"
+    );
+
+    // The predecessor CPFP is marked at-cap (`fee_info.fee_rate = max`) so `boost_if_stale` will skip it
+    // on subsequent stale intervals via the existing tip-at-cap check.
+    let predecessor = coord_storage.get_tx_by_id(cpfp1_id).unwrap().unwrap();
+    assert_eq!(
+        predecessor.fee_info.fee_rate, 10,
+        "predecessor must be marked at-cap so the chain stops attempting further RBFs"
+    );
+
+    // News log must contain MaxFeeRateReached referencing the new RBF.
+    let news = coord_storage.get_news().unwrap();
+    let cap_news = news
+        .iter()
+        .find(|n| matches!(n, CoordinatorNews::MaxFeeRateReached { txid, .. } if *txid == rbf_id))
+        .expect("MaxFeeRateReached news must be emitted against the new RBF");
+    if let CoordinatorNews::MaxFeeRateReached {
+        effective_fee_rate, ..
+    } = cap_news
+    {
+        assert_eq!(
+            *effective_fee_rate, 10,
+            "news effective_fee_rate must equal the cap"
+        );
+    }
+
+    // Subsequent stale intervals must not introduce any new txids.
+    let known_txids: std::collections::HashSet<_> = speedups.iter().map(|tx| tx.txid).collect();
+    for _ in 0..3 {
+        mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+        coordinator.tick().unwrap();
+    }
+    let speedups_after = coord_storage.get_speedups_ordered().unwrap();
+    for tx in &speedups_after {
+        assert!(
+            known_txids.contains(&tx.txid),
+            "no new speedup must be built once the predecessor is marked at-cap; found unexpected txid {}",
+            tx.txid
+        );
+    }
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Once the in-mempool speedup count reaches max_unconfirmed_speedups, the next boost switches from CPFP to RBF.
+/// After the RBF is dispatched, the predecessor must have its `replaced_by` set so the funding walk-back and
+/// boost_if_stale skip it. cpfp_settings: max_unconfirmed_speedups = 2.
 #[test]
 fn test_cpfp_rbf_after_max_unconfirmed_reached() {
     init_trace();

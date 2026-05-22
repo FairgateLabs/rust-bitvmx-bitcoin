@@ -263,7 +263,7 @@ impl SpeedupEngine {
             .filter(|tx| tx.state == TransactionState::InMempool)
             .collect();
 
-        let (chain_diff_fee, chain_vsize) =
+        let (chain_diff_fee, _chain_vsize) =
             self.ctx.fee_manager.chain_fee_diff(fee_rate, &unconfirmed);
 
         let Some((new_tx, fee_paid, capped)) = self.build_speedup(
@@ -273,20 +273,14 @@ impl SpeedupEngine {
             use_rbf,
             fee_rate,
             chain_diff_fee,
-            chain_vsize,
         )?
         else {
-            emit_funding_news_for_speedup(&self.ctx, &funding)?;
             return Ok(());
         };
 
         let context = Self::make_speedup_context(&funding, next_bump, &parent_entries);
         let new_txid = new_tx.compute_txid();
-        let fee_info = FeeInfo {
-            fee: fee_paid,
-            fee_rate: fee_paid / new_tx.vsize() as u64,
-            weight: new_tx.weight().to_wu() as u64,
-        };
+        let fee_info = self.ctx.fee_manager.fee_info_for_paid_tx(&new_tx, fee_paid);
         let kind = if use_rbf {
             SpeedupKind::RBF {
                 replaces: last_txid,
@@ -309,6 +303,16 @@ impl SpeedupEngine {
                     effective_fee_rate: effective_rate,
                     context: ctx_str,
                 })?;
+            // For a capped RBF, the broadcast may fail BIP-125 rule 4 Mark the predecessor at-cap too so
+            // `boost_if_stale`'s tip-at-cap check skips it on subsequent stale intervals, preventing a
+            // busy-loop of doomed RBF attempts if the dispatch indeed fails.
+            if use_rbf {
+                let max = self.ctx.fee_manager.settings.max_feerate_sat_vb;
+                if let Some(mut predecessor) = self.ctx.storage.get_tx_by_id(last_txid)? {
+                    predecessor.fee_info.fee_rate = max;
+                    self.ctx.storage.update_tx(&predecessor)?;
+                }
+            }
         }
 
         Ok(())
@@ -361,7 +365,7 @@ impl SpeedupEngine {
             self.ctx.storage.add_news(news)?;
         }
 
-        let (chain_diff_fee, chain_vsize) =
+        let (chain_diff_fee, _chain_vsize) =
             self.ctx.fee_manager.chain_fee_diff(fee_rate, &unconfirmed);
         let bump_fee = self.ctx.fee_manager.base_fee_multiplier();
 
@@ -396,10 +400,8 @@ impl SpeedupEngine {
             false,
             fee_rate,
             chain_diff_fee,
-            chain_vsize,
         )?
         else {
-            emit_funding_news_for_speedup(&self.ctx, &funding)?;
             return Ok(());
         };
 
@@ -411,11 +413,10 @@ impl SpeedupEngine {
         }
 
         let context = Self::make_speedup_context(&funding, bump_fee, &parent_entries);
-        let fee_info = FeeInfo {
-            fee: fee_paid,
-            fee_rate: fee_paid / cpfp_tx.vsize() as u64,
-            weight: cpfp_tx.weight().to_wu() as u64,
-        };
+        let fee_info = self
+            .ctx
+            .fee_manager
+            .fee_info_for_paid_tx(&cpfp_tx, fee_paid);
         let kind = SpeedupKind::CPFP {
             parents: parent_txids,
             context,
@@ -439,8 +440,8 @@ impl SpeedupEngine {
     // =========================================================================
 
     /// Build a CPFP or RBF transaction via the fee convergence loop.
-    /// Returns `Ok(Some((tx, fee, capped)))` on success. `capped == true` means
-    /// the fee was clamped at the max-fee-rate cap.
+    /// Returns `Ok(Some((tx, fee, capped)))` on success. Returns `Ok(None)`
+    /// when the funding cannot cover the fee with a non-dust change output.
     fn build_speedup(
         &self,
         parent_entries: &[(SpeedupData, usize)],
@@ -449,15 +450,11 @@ impl SpeedupEngine {
         is_rbf: bool,
         fee_rate: u64,
         chain_diff_fee: u64,
-        chain_vsize: usize,
     ) -> Result<Option<(Transaction, u64, bool)>, BitcoinCoordinatorError> {
         let speedups_data: Vec<SpeedupData> =
             parent_entries.iter().map(|(d, _)| d.clone()).collect();
 
-        let fee_entries: Vec<(u64, usize)> = parent_entries
-            .iter()
-            .map(|(data, vsize)| (amount_from_speedup_data(data), *vsize))
-            .collect();
+        let parent_vsizes: Vec<usize> = parent_entries.iter().map(|(_, vs)| *vs).collect();
 
         let mut child_vsize = 0usize;
         loop {
@@ -478,18 +475,18 @@ impl SpeedupEngine {
             }
 
             let (fee, capped) = self.ctx.fee_manager.compute_speedup_fee(
-                &fee_entries,
+                &parent_vsizes,
                 child_vsize,
                 bump_fee,
                 fee_rate,
                 is_rbf,
                 chain_diff_fee,
-                chain_vsize,
             );
 
             // If the fee would leave a below dust change output,
             // signal insufficient funding.
             if funding.amount.saturating_sub(fee) < MAX_DUST_LIMIT {
+                emit_funding_news_for_speedup(&self.ctx, &funding, fee + MAX_DUST_LIMIT)?;
                 return Ok(None);
             }
 
@@ -656,6 +653,7 @@ impl SpeedupEngine {
 fn emit_funding_news_for_speedup(
     ctx: &EngineContext,
     funding: &Utxo,
+    required: u64,
 ) -> Result<(), BitcoinCoordinatorError> {
     ctx.storage.add_news(CoordinatorNews::FundingConsumed {
         txid: funding.txid,
@@ -665,7 +663,7 @@ fn emit_funding_news_for_speedup(
     if ctx.funding_manager.advance_funding()?.is_none() {
         ctx.storage.add_news(CoordinatorNews::InsufficientFunds {
             available: funding.amount,
-            required: funding.amount,
+            required,
         })?;
     }
     Ok(())
