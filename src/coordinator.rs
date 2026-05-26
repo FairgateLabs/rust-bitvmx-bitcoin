@@ -12,7 +12,7 @@ use bitvmx_transaction_monitor::{
 use key_manager::key_manager::KeyManager;
 use protocol_builder::types::{output::SpeedupData, Utxo};
 use storage_backend::storage::Storage;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{
@@ -330,6 +330,16 @@ impl BitcoinCoordinator {
         stuck_in_mempool_blocks: Option<u32>,
     ) -> Result<(), BitcoinCoordinatorError> {
         let txid = tx.compute_txid();
+
+        // Check if the txid is already registered before doing any work.
+        if let Some(tx) = self.tx_engine.ctx.storage.get_tx_by_id(txid)? {
+            warn!(
+                "Transaction({}) is already registered, skipping. Transaction info: {:?}",
+                txid, tx
+            );
+            return Ok(());
+        }
+
         let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
         let target_height = target_block_height.unwrap_or(current_height);
         let fee_manager = &self.tx_engine.ctx.fee_manager;

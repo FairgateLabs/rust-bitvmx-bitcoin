@@ -145,8 +145,11 @@ impl TransactionState {
             // Deep reorg of a previously-Confirmed speedup whose tx is now
             (Confirmed, ToDispatch) => true,
 
-            // Any state can fail
-            (_, Failed) => true,
+            // Settle to Failed only from live states.
+            //   - `ToDispatch → Failed`: `handle_dispatch_result` on Fatal or retries-exhausted Retryable.
+            //   - `InMempool → Failed`: `remove_replaced_rbf` walks the `replaces` chain when an RBF finalizes.
+            (ToDispatch, Failed) => true,
+            (InMempool, Failed) => true,
 
             // Idempotency
             (a, b) if a == b => true,

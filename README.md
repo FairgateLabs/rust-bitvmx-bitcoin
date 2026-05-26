@@ -65,6 +65,9 @@ flight at a time.
 > and be re-dispatched, and the coordinator does not preserve any ordering
 > between independently registered transactions.
 
+> ⚠️ **`add_funding` UTXOs must be effectively final.** Only pass UTXOs whose funding transaction is
+> deep enough on-chain that you accept it as `Finalized` (i.e., no longer reorgable in practice).
+
 The `BitcoinCoordinator` struct exposes the following methods (see
 `src/coordinator.rs` for full Rustdoc):
 

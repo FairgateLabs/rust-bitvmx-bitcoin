@@ -573,15 +573,25 @@ fn test_cpfp_boost() {
     setup.end_all().unwrap();
 }
 
-/// Each successive boost must have a higher fee multiplier than the previous boost.
 #[test]
+/// Drive a deep boost chain (initial CPFP + N boost CPFP-of-CPFP layers, all
+/// covering the same original parent) and verify:
+/// * `bump_fee_used` strictly escalates across every speedup
+/// * Effective `fee_info.fee_rate` (= `fee_paid / vsize`) strictly escalates
+/// * The initial CPFP's `parents` field references the original NeedsSpeedup parent.
+/// * Every boost CPFP's `parents = [previous_cpfp.txid]`
+/// * Each boost CPFP's tx spends the previous CPFP's last output
+/// * Initial CPFP has 2 inputs (parent anchor + funding); boost CPFPs have only the
+/// funding-chain input.
+/// * A single confirming block carries the entire package (parent + all N
+///   boosts) into `Confirmed` together.
 fn test_cpfp_fee_escalates_across_boosts() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let key_manager = TestKeyManager::new();
-    // max_unconfirmed=3 so both boosts stay as CPFP (not RBF).
-    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), boost_settings(3));
+    // max_unconfirmed_speedups large enough that every boost stays CPFP (not RBF).
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), boost_settings(20));
     let coord_storage = get_coord_storage(&setup);
 
     let funding_utxo = create_funded_speedup_utxo(
@@ -598,6 +608,7 @@ fn test_cpfp_fee_escalates_across_boosts() {
         200_000,
     )
     .unwrap();
+    let parent_txid = parent_tx.compute_txid();
 
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
@@ -605,53 +616,145 @@ fn test_cpfp_fee_escalates_across_boosts() {
         .dispatch_with_speedup(parent_tx, speedup_data, ctx("escalate"), None, None)
         .unwrap();
 
-    // CPFP1 built + dispatched.
-    let cpfp1_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+    // Initial CPFP (covers the NeedsSpeedup parent directly).
+    let _cpfp1_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
 
-    // Boost 1: build + dispatch.
-    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
-    coordinator.tick().unwrap();
-    let speedups = coord_storage.get_speedups_ordered().unwrap();
-    assert_eq!(speedups.len(), 2, "boost 1 must add CPFP2");
-    let cpfp2_txid = speedups[1].txid;
-    let reached = tick_until_state(
-        &coordinator,
-        &coord_storage,
-        cpfp2_txid,
-        TransactionState::InMempool,
-        3,
-    )
-    .unwrap();
-    assert!(reached, "CPFP2 must reach InMempool");
+    // Drive N boost iterations. Bump escalation is 1.0 → 2.0 → 4.0 → … so with
+    // default max_feerate_sat_vb we can stack quite a few without hitting the cap.
+    let boost_iters = 5u32;
+    for i in 0..boost_iters {
+        mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+        coordinator.tick().unwrap();
+        let speedups = coord_storage.get_speedups_ordered().unwrap();
+        let expected_len = 2 + i as usize;
+        assert_eq!(
+            speedups.len(),
+            expected_len,
+            "boost {} must produce CPFP{} (chain length {})",
+            i + 1,
+            expected_len,
+            expected_len
+        );
+        let latest_txid = speedups[expected_len - 1].txid;
+        let reached = tick_until_state(
+            &coordinator,
+            &coord_storage,
+            latest_txid,
+            TransactionState::InMempool,
+            3,
+        )
+        .unwrap();
+        assert!(
+            reached,
+            "boost {} (CPFP{}) must reach InMempool",
+            i + 1,
+            expected_len
+        );
+    }
 
-    // Boost 2: build + dispatch.
-    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
-    coordinator.tick().unwrap();
+    // Verify the entire boost chain's structure
     let speedups = coord_storage.get_speedups_ordered().unwrap();
-    assert_eq!(speedups.len(), 3, "boost 2 must add CPFP3");
-    let cpfp3_txid = speedups[2].txid;
-    let reached = tick_until_state(
-        &coordinator,
-        &coord_storage,
-        cpfp3_txid,
-        TransactionState::InMempool,
-        3,
-    )
-    .unwrap();
-    assert!(reached, "CPFP3 must reach InMempool");
+    assert_eq!(speedups.len(), boost_iters as usize + 1,);
 
-    let speedups = coord_storage.get_speedups_ordered().unwrap();
-    let b0 = speedups[0].speedup_kind().unwrap().context().bump_fee_used;
-    let b1 = speedups[1].speedup_kind().unwrap().context().bump_fee_used;
-    let b2 = speedups[2].speedup_kind().unwrap().context().bump_fee_used;
-    assert!(
-        b0 < b1 && b1 < b2,
-        "fee multiplier must escalate with each boost: {} < {} < {}",
-        b0,
-        b1,
-        b2
+    // Initial CPFP's `parents` references the original NeedsSpeedup parent.
+    let init_parents = speedups[0].speedup_kind().unwrap().parents();
+    assert_eq!(
+        init_parents,
+        vec![parent_txid],
+        "initial CPFP's parents must reference the NeedsSpeedup parent (got {:?})",
+        init_parents
     );
-    assert_eq!(speedups[0].txid, cpfp1_txid);
+
+    // Initial CPFP has 2 inputs (parent anchor + funding utxo).
+    assert_eq!(
+        speedups[0].tx.input.len(),
+        2,
+        "initial CPFP must have 2 inputs (anchor + funding)"
+    );
+
+    // Walk the boost chain.
+    let mut prev_bump = speedups[0].speedup_kind().unwrap().context().bump_fee_used;
+    let mut prev_rate: Option<u64> = None;
+    for i in 1..speedups.len() {
+        let s = &speedups[i];
+        let prev = &speedups[i - 1];
+
+        // Boost CPFP-of-CPFP: parents = [previous_cpfp.txid], NOT the original parent.
+        let parents = s.speedup_kind().unwrap().parents();
+        assert_eq!(
+            parents,
+            vec![prev.txid],
+            "boost {}'s parents must reference the immediate predecessor (got {:?})",
+            i,
+            parents
+        );
+
+        // Boost CPFP has exactly 1 input (the funding-chain link).
+        assert_eq!(
+            s.tx.input.len(),
+            1,
+            "boost CPFP {} must have a single funding-chain input",
+            i
+        );
+
+        // That input must point to the previous CPFP's last output (its change).
+        let inp = &s.tx.input[0];
+        let prev_last_vout = (prev.tx.output.len() - 1) as u32;
+        assert_eq!(
+            inp.previous_output.txid, prev.txid,
+            "boost {} must spend predecessor {}, got {}",
+            i, prev.txid, inp.previous_output.txid
+        );
+        assert_eq!(
+            inp.previous_output.vout, prev_last_vout,
+            "boost {} must spend predecessor's last output (change at vout {})",
+            i, prev_last_vout
+        );
+
+        // bump_fee_used strictly escalates.
+        let bump = s.speedup_kind().unwrap().context().bump_fee_used;
+        assert!(
+            bump > prev_bump,
+            "bump_fee must strictly escalate at boost {}: {} -> {}",
+            i,
+            prev_bump,
+            bump
+        );
+        prev_bump = bump;
+
+        // Effective fee_rate strictly escalates across the boost portion of
+        // the chain (skip initial→boost1: their fee shapes differ, see doc).
+        if let Some(pr) = prev_rate {
+            assert!(
+                s.fee_info.fee_rate > pr,
+                "effective fee_rate must strictly escalate at boost {}: {} -> {}",
+                i,
+                pr,
+                s.fee_info.fee_rate
+            );
+        }
+        prev_rate = Some(s.fee_info.fee_rate);
+    }
+
+    // Confirming block: parent + every speedup must reach Confirmed in lockstep.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let mut all_txids = vec![parent_txid];
+    for s in &speedups {
+        all_txids.push(s.txid);
+    }
+    let reached = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &all_txids,
+        TransactionState::Confirmed,
+        10,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "parent + all {} speedups in the chain must confirm together as one package",
+        speedups.len()
+    );
 
     drop(coordinator);
     drop(coord_storage);
