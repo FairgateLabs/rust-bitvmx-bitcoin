@@ -41,6 +41,8 @@ impl FeeManager {
         }
     }
 
+    /// Returns the current network fee rate, clamped to `max_feerate_sat_vb` and with a floor of
+    /// `min_safe_fee_rate`.
     pub fn get_network_fee_rate(
         &self,
         monitor: &Monitor,
@@ -237,7 +239,7 @@ mod tests {
     }
 
     /// A CPFP must pay for `parent_vsize + child_vsize` bytes at `fee_rate`. The parents' already-paid
-    /// fee is intentionally NOT credited: the speedup overpays slightly rather than risk under-paying.
+    /// fee is intentionally not credited: the speedup overpays slightly rather than risk under-paying.
     #[test]
     fn test_compute_speedup_fee_basic_cpfp() {
         let manager = FeeManager::new(settings(1, 10_000));

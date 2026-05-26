@@ -19,34 +19,6 @@ impl TransactionEngine {
         Self { ctx }
     }
 
-    /// Step 3 of `tick`: broadcast every non-speedup transaction currently in
-    /// `ToDispatch` whose `target_block_height` has been reached.
-    pub fn dispatch_pending(&self) -> Result<(), BitcoinCoordinatorError> {
-        let current_height = self.ctx.monitor.get_monitor_height()?;
-        let active_txs = self.ctx.storage.get_active_txs()?;
-        if active_txs.is_empty() {
-            return Ok(());
-        }
-
-        let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
-        for tx in active_txs {
-            if matches!(tx.kind, TxKind::Speedup(_)) {
-                continue;
-            }
-            if tx.state == TransactionState::ToDispatch && tx.is_ready_to_dispatch(current_height) {
-                to_dispatch.push(tx);
-            }
-        }
-
-        if to_dispatch.is_empty() {
-            return Ok(());
-        }
-
-        debug!("Dispatching {} pending transactions", to_dispatch.len());
-        self.dispatch_batch(to_dispatch, current_height)?;
-        Ok(())
-    }
-
     /// Step 1 of `tick`: walk in-flight non-speedup transactions and update
     /// their state from the chain. Never dispatches.
     pub fn review_active(&self) -> Result<(), BitcoinCoordinatorError> {
@@ -74,6 +46,34 @@ impl TransactionEngine {
         }
 
         self.review_transactions(to_review, current_height)?;
+        Ok(())
+    }
+
+    /// Step 3 of `tick`: broadcast every non-speedup transaction currently in
+    /// `ToDispatch` whose `target_block_height` has been reached.
+    pub fn dispatch_pending(&self) -> Result<(), BitcoinCoordinatorError> {
+        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let active_txs = self.ctx.storage.get_active_txs()?;
+        if active_txs.is_empty() {
+            return Ok(());
+        }
+
+        let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
+        for tx in active_txs {
+            if matches!(tx.kind, TxKind::Speedup(_)) {
+                continue;
+            }
+            if tx.state == TransactionState::ToDispatch && tx.is_ready_to_dispatch(current_height) {
+                to_dispatch.push(tx);
+            }
+        }
+
+        if to_dispatch.is_empty() {
+            return Ok(());
+        }
+
+        debug!("Dispatching {} pending transactions", to_dispatch.len());
+        self.dispatch_batch(to_dispatch, current_height)?;
         Ok(())
     }
 

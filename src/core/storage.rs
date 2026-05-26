@@ -1030,7 +1030,7 @@ mod tests {
 
         assert!(
             storage.get_tx_by_id(txid).unwrap().is_some(),
-            "NeedsSpeedup parent in PendingSpeedupParents must NOT be evicted (SpeedupData must survive)"
+            "NeedsSpeedup parent in PendingSpeedupParents must not be evicted (SpeedupData must survive)"
         );
         assert!(
             storage.get_news().unwrap().is_empty(),

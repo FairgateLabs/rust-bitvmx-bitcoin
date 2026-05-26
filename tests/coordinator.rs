@@ -971,7 +971,7 @@ fn test_coordinator_restart() {
     setup.end_all().unwrap();
 }
 
-/// A transaction in retry state is NOT dispatched until `retry_interval_seconds`
+/// A transaction in retry state is not dispatched until `retry_interval_seconds`
 /// has elapsed since the last retry batch.
 #[test]
 fn test_retry_dispatches_after_rate_limit() {

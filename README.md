@@ -60,7 +60,7 @@ flight at a time.
 ## Public API
 
 > ⚠️ **Indirect dependencies must wait for finality.** If transaction B
-> indirectly depends on transaction A, do NOT register B until A has reached
+> indirectly depends on transaction A, do not register B until A has reached
 > `Finalized`. While A is still in flight it may disappear from the mempool
 > and be re-dispatched, and the coordinator does not preserve any ordering
 > between independently registered transactions.

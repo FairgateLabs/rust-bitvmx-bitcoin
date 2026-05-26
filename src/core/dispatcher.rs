@@ -90,9 +90,8 @@ impl Dispatcher {
     // Private helpers
     // -------------------------------------------------------------------------
 
-    /// Split `txs` into those that pass the weight limit and those that don't.
-    /// Oversized transactions receive a `Fatal` outcome immediately; valid ones
-    /// are returned.
+    /// Split `txs` into those that pass the weight limit and those that don't. Oversized
+    /// transactions receive a `Fatal` outcome immediately; valid ones are returned.
     fn validate(&self, txs: Vec<Transaction>) -> (Vec<Transaction>, Vec<(Txid, DispatchOutcome)>) {
         let mut valid = Vec::new();
         let mut failures = Vec::new();
@@ -116,13 +115,9 @@ impl Dispatcher {
     }
 }
 
-/// Order `txs` so that any tx whose input references another tx in the same
-/// batch appears after that referenced tx. Order between independent txs is
-/// preserved. Cycles cannot occur for valid Bitcoin txs, but if the
-/// algorithm gets stuck the remaining txs are appended in input order so
-/// bitcoind can reject them individually.
-/// If no input refers to another txid in the batch, returns `txs`
-/// unchanged after a single linear scan.
+/// Order `txs` so that any tx whose input references another tx in the same batch
+/// appears after that referenced tx. If no input refers to another txid in the batch,
+///  returns `txs` unchanged after a  single linear scan.
 fn topological_sort(txs: Vec<Transaction>) -> Vec<Transaction> {
     if txs.len() < 2 {
         return txs;

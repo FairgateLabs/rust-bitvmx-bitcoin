@@ -53,8 +53,7 @@ impl EngineContext {
         }
     }
 
-    /// Transition a successfully-dispatched tx to `InMempool` and enable
-    /// monitor mempool search.
+    /// Transition a successfully-dispatched tx to `InMempool` and enable monitor mempool search.
     pub fn mark_dispatched(
         &self,
         tx: &CoordinatedTx,
@@ -145,9 +144,7 @@ impl EngineContext {
         filtered
     }
 
-    /// Handle a single dispatch outcome.
-    ///
-    /// Returns `true` if the tx was accepted into the mempool.
+    /// Handle a single dispatch outcome. Returns `true` if the tx was accepted into the mempool.
     pub fn handle_dispatch_result(
         &self,
         tx: &CoordinatedTx,

@@ -679,7 +679,7 @@ fn test_cpfp_fee_escalates_across_boosts() {
         let s = &speedups[i];
         let prev = &speedups[i - 1];
 
-        // Boost CPFP-of-CPFP: parents = [previous_cpfp.txid], NOT the original parent.
+        // Boost CPFP-of-CPFP: parents = [previous_cpfp.txid], not the original parent.
         let parents = s.speedup_kind().unwrap().parents();
         assert_eq!(
             parents,
@@ -1285,8 +1285,7 @@ fn test_retry_rate_limit_shared_across_engines() {
         "CPFP retry must be blocked by the shared last_retry_at slot the parent just consumed"
     );
 
-    // Tick again immediately; the interval has NOT elapsed so the CPFP is
-    // still rate-limited.
+    // Tick again immediately; the interval has not elapsed so the CPFP is still rate-limited.
     coordinator.tick().unwrap();
     assert_eq!(
         coord_storage
