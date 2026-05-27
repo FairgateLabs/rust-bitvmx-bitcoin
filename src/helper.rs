@@ -295,6 +295,22 @@ mod tests {
         let mut speedup_mut = cpfp_coordinated_tx(4, 1);
         let k = speedup_mut.speedup_kind_mut().unwrap();
         assert!(!k.is_rbf());
+
+        // RBF: exercises context_mut and parents RBF arms.
+        let mut rbf = cpfp_coordinated_tx(5, 1);
+        let replaced_txid = rbf.txid;
+        let context = match &rbf.kind {
+            TxKind::Speedup(SpeedupKind::CPFP { context, .. }) => context.clone(),
+            _ => panic!("expected CPFP"),
+        };
+        rbf.kind = TxKind::Speedup(SpeedupKind::RBF {
+            replaces: replaced_txid,
+            context,
+        });
+        let k = rbf.speedup_kind_mut().unwrap();
+        assert!(k.is_rbf());
+        assert!(k.parents().is_empty());
+        k.context_mut().replaced_by = Some(replaced_txid);
     }
 
     #[test]
@@ -372,5 +388,23 @@ mod tests {
 
         let other = Txid::from_raw_hash(sha256d::Hash::hash(&[99u8; 32]));
         assert!(tx.verify_tx_id(other).is_err());
+    }
+
+    #[test]
+    fn test_can_transition_to() {
+        use crate::types::TransactionState::*;
+
+        // InMempool → Failed is valid (RBF chain cleanup).
+        assert!(InMempool.can_transition_to(&Failed));
+
+        // Idempotent transitions are always valid.
+        assert!(ToDispatch.can_transition_to(&ToDispatch));
+        assert!(Finalized.can_transition_to(&Finalized));
+
+        // Invalid transitions return false.
+        assert!(!Finalized.can_transition_to(&ToDispatch));
+        assert!(!Finalized.can_transition_to(&InMempool));
+        assert!(!Failed.can_transition_to(&InMempool));
+        assert!(!Confirmed.can_transition_to(&Failed));
     }
 }

@@ -305,6 +305,44 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_by_weight_limits_and_splits() {
+        use crate::test_utils::normal_coordinated_tx;
+
+        let p1 = normal_coordinated_tx(1);
+        let p2 = normal_coordinated_tx(2);
+        let p3 = normal_coordinated_tx(3);
+
+        // Weight of an empty tx in wu; used to set max_tx_weight just below 2×.
+        let single_weight = p1.tx.weight().to_wu();
+
+        // Case A — weight overflow: two parents each of `single_weight` but
+        // max_tx_weight = single_weight + 1 (fits first, overflows on second).
+        // Expect: two batches of 1 each (up to max_batches=10).
+        let (d, bitcoind) = dispatcher(single_weight + 1);
+        let two = vec![p1.clone(), p2.clone()];
+        let batches = d.batch_by_weight(&two, 10);
+        assert_eq!(batches.len(), 2, "weight overflow must open a new batch");
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
+
+        // Case B — max_batches limit: three parents, max_batches = 2.
+        // The third parent triggers `batches.len() >= max_batches` → break.
+        let three = vec![p1.clone(), p2.clone(), p3.clone()];
+        let batches = d.batch_by_weight(&three, 2);
+        assert_eq!(
+            batches.len(),
+            2,
+            "batch count must not exceed max_batches"
+        );
+        // Only the first two parents (one per batch due to weight) are present.
+        assert_eq!(batches[0].len(), 1);
+        assert_eq!(batches[1].len(), 1);
+
+        drop(d);
+        bitcoind.stop().unwrap();
+    }
+
+    #[test]
     /// Topological sort orders child after parent
     fn topological_sort_dependent() {
         let external = Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros());

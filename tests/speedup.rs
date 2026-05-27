@@ -165,7 +165,7 @@ fn test_cpfp_lifecycle() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("lifecycle"), None, None)
+        .dispatch(parent_tx, Some(speedup_data), ctx("lifecycle"), None, None)
         .unwrap();
 
     // Tick 1: parent → InMempool, CPFP saved as ToDispatch.
@@ -1114,6 +1114,124 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
     assert!(
         reached,
         "parent, CPFP1, CPFP2, and RBF must all confirm after the boosts"
+    );
+    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+    // Mine the second confirming block (max_monitoring_confirmations=2) so the RBF
+    // reaches is_finalized. review_speedups then calls remove_replaced_rbf(rbf, height),
+    // which walks the `replaces` chain and settles each predecessor as Failed.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        rbf_txid,
+        TransactionState::Finalized,
+        10,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "RBF must reach Finalized after the second confirming block (exercises remove_replaced_rbf)"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// When the RBF speedup is manually broadcast and confirmed before the coordinator
+/// dispatches it, `handle_dispatch_result` fires the `AlreadyConfirmed` path, which
+/// must mark the predecessor CPFP's `replaced_by` field.
+/// Covers `engines/common.rs`: `AlreadyConfirmed` RBF branch →
+/// `if let Some(mut replaced) = storage.get_tx_by_id(*replaces)?`.
+#[test]
+fn test_rbf_already_confirmed_marks_predecessor() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        2_000_000,
+    )
+    .unwrap();
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+    let parent_txid = parent_tx.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("rbf_already_confirmed"), None, None)
+        .unwrap();
+
+    // CPFP1 built + dispatched (1 unconfirmed).
+    let cpfp1_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+
+    // Boost 1: 1 unconfirmed < 2 → CPFP2.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 2, "boost 1 must create CPFP2");
+    let cpfp2_txid = speedups[1].txid;
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        cpfp2_txid,
+        TransactionState::InMempool,
+        3,
+    )
+    .unwrap();
+    assert!(reached, "CPFP2 must reach InMempool");
+
+    // Boost 2: 2 unconfirmed >= 2 → RBF built as ToDispatch. The coordinator
+    // has not dispatched it yet; the build tick saves it as ToDispatch only.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 3, "boost 2 must add RBF");
+    let rbf_txid = speedups[2].txid;
+    let rbf_tx = speedups[2].tx.clone();
+    assert!(speedups[2].speedup_kind().unwrap().is_rbf());
+    assert_eq!(speedups[2].state, TransactionState::ToDispatch);
+
+    // Manually broadcast the RBF before the coordinator's next tick dispatches it.
+    // The RBF spends CPFP2's change output so parent + CPFP1 + CPFP2 + RBF can
+    // all confirm in the same block.
+    setup.bitcoin_client.send_transaction(&rbf_tx).unwrap();
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+
+    // Tick: review_speedups marks CPFP1/CPFP2 Confirmed (skips ToDispatch RBF);
+    // dispatch_pending_speedups dispatches the RBF → AlreadyConfirmed → sets
+    // CPFP2.replaced_by = Some(rbf_txid) and transitions RBF to Confirmed.
+    let reached = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent_txid, cpfp1_txid, cpfp2_txid, rbf_txid],
+        TransactionState::Confirmed,
+        5,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "parent, CPFP1, CPFP2, and RBF must all reach Confirmed"
+    );
+
+    let cpfp2 = coord_storage.get_tx_by_id(cpfp2_txid).unwrap().unwrap();
+    assert_eq!(
+        cpfp2.speedup_kind().unwrap().context().replaced_by,
+        Some(rbf_txid),
+        "AlreadyConfirmed path must set CPFP2.replaced_by = Some(rbf_txid)"
     );
 
     drop(coordinator);

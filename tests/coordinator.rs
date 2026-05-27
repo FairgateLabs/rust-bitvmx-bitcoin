@@ -38,7 +38,7 @@ fn test_tick_until_ready() {
 
 /// Verifies the registration-to-dispatch lifecycle in a single test:
 ///
-/// 1. `dispatch_without_speedup` immediately persists the transaction in storage
+/// 1. `dispatch` immediately persists the transaction in storage
 /// 2. The first tick broadcasts the transaction, advancing its state to `InMempool`
 #[test]
 fn test_tx_dispatch_to_mempool() {
@@ -51,7 +51,16 @@ fn test_tx_dispatch_to_mempool() {
     let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let txid = tx.compute_txid();
     coordinator
-        .dispatch_without_speedup(tx, ctx("registration"), None, None, None)
+        .dispatch(tx, None, ctx("registration"), None, None)
+        .unwrap();
+
+    // `monitor` registers an additional txid for observation without dispatching it. Unnecessary for this test.
+    coordinator
+        .monitor(TypesToMonitor::Transactions(
+            vec![txid],
+            ctx("extra_monitor"),
+            None,
+        ))
         .unwrap();
 
     // Step 1: tx must be in storage as ToDispatch before any tick.
@@ -968,6 +977,52 @@ fn test_coordinator_restart() {
         );
     }
 
+    setup.end_all().unwrap();
+}
+
+/// A transaction that stays in the mempool for more than `stuck_in_mempool_blocks`
+/// blocks emits a `TransactionStuckInMempool` news item.
+#[test]
+fn test_stuck_in_mempool_news() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid = tx.compute_txid();
+
+    coordinator
+        .dispatch_without_speedup(tx, ctx("stuck"), None, None, Some(1))
+        .unwrap();
+    coordinator.tick().unwrap(); // dispatches → InMempool
+
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage.get_tx_by_id(txid).unwrap().unwrap().state,
+        TransactionState::InMempool
+    );
+
+    // Set broadcast_block_height = 0 so the current chain height always exceeds
+    // the stuck threshold of 1 block without needing to mine extra blocks.
+    let mut record = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    record.broadcast_block_height = Some(0);
+    coord_storage.update_tx(&record).unwrap();
+
+    coordinator.tick().unwrap();
+
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.coordinator_news.iter().any(|n| {
+            matches!(n, CoordinatorNews::TransactionStuckInMempool { txid: id, .. } if *id == txid)
+        }),
+        "expected TransactionStuckInMempool news; got {:?}",
+        news.coordinator_news
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
     setup.end_all().unwrap();
 }
 

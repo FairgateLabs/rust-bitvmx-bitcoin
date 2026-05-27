@@ -263,10 +263,7 @@ mod tests {
     fn change_of(tx: &CoordinatedTx) -> Utxo {
         let out = tx.tx.output.last().unwrap();
         let vout = (tx.tx.output.len() - 1) as u32;
-        let pub_key = match &tx.kind {
-            TxKind::Speedup(k) => k.context().funding_input.pub_key,
-            _ => panic!("expected Speedup"),
-        };
+        let pub_key = tx.speedup_kind().unwrap().context().funding_input.pub_key;
         Utxo::new(tx.txid, vout, out.value.to_sat(), &pub_key)
     }
 
@@ -571,6 +568,26 @@ mod tests {
         let result = mgr.get_funding(&[cpfp1]).unwrap().unwrap();
         assert_eq!(result.txid, fresh.txid);
         assert_eq!(result.amount, MIN * 4);
+        drop(mgr);
+        config.remove().unwrap();
+    }
+
+    // Pass 1 skips a live speedup whose `replaced_by` is set (`is_being_replaced()` == true)
+    // and falls back to the next older live entry.
+    #[test]
+    fn test_get_funding_skips_being_replaced() {
+        let (mgr, config) = make_manager();
+        let root = utxo(MIN * 4);
+        let cpfp1 = speedup_tx(1, TransactionState::InMempool, root, MIN * 3);
+        let mut cpfp2 = speedup_tx(2, TransactionState::InMempool, change_of(&cpfp1), MIN * 2);
+        // Mark cpfp2 as being replaced by an RBF.
+        if let TxKind::Speedup(SpeedupKind::CPFP { ref mut context, .. }) = cpfp2.kind {
+            context.replaced_by = Some(det_txid(99));
+        }
+        // Pass 1 (newest first): cpfp2 is_being_replaced → skip; cpfp1 is live → use its change.
+        let result = mgr.get_funding(&[cpfp1.clone(), cpfp2]).unwrap().unwrap();
+        assert_eq!(result.txid, cpfp1.txid);
+        assert_eq!(result.amount, MIN * 3);
         drop(mgr);
         config.remove().unwrap();
     }

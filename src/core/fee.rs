@@ -169,6 +169,17 @@ mod tests {
     }
 
     #[test]
+    fn test_compute_fee() {
+        let manager = FeeManager::new(settings(1, 1000));
+        let tx = cpfp_coordinated_tx(1, 5);
+        let via_wrapper = manager.compute_fee(&tx, 10);
+        let direct = manager.compute_fee_for_tx(&tx.tx, 10);
+        assert_eq!(via_wrapper.fee, direct.fee);
+        assert_eq!(via_wrapper.fee_rate, direct.fee_rate);
+        assert_eq!(via_wrapper.weight, direct.weight);
+    }
+
+    #[test]
     fn test_get_network_fee_rate_below_max() {
         let manager = FeeManager::new(settings(10, 100));
         let storage = StorageTestConfig::new();
@@ -203,6 +214,40 @@ mod tests {
             "get_network_fee_rate must clamp up to min_safe_fee_rate; got {}",
             fee_rate
         );
+
+        drop(monitor);
+        storage.remove().unwrap();
+        bitcoind.stop().unwrap();
+    }
+
+    /// When `min_safe_fee_rate` exceeds `max_feerate_sat_vb`, the network rate
+    /// is clamped down to the cap and `EstimateFeerateTooHigh` news is emitted.
+    /// This is just to ensure the manager behaves predictably even with a misconfigured fee range.
+    #[test]
+    fn test_get_network_fee_rate_clamps_above_max() {
+        let manager = FeeManager::new(FeeSettings {
+            min_safe_fee_rate: 20,
+            max_feerate_sat_vb: 10,
+            base_fee_multiplier: 1.0,
+        });
+        let storage = StorageTestConfig::new();
+        let bitcoind = TestBitcoind::default();
+        let monitor = bitcoind.create_monitor(storage.get_raw_storage());
+
+        let (fee_rate, news) = manager.get_network_fee_rate(&monitor).unwrap();
+        assert_eq!(
+            fee_rate, 10,
+            "fee rate must be clamped to max_feerate_sat_vb"
+        );
+        let Some(CoordinatorNews::EstimateFeerateTooHigh {
+            max_fee_rate: 10, ..
+        }) = news
+        else {
+            panic!(
+                "EstimateFeerateTooHigh must be emitted when clamping; got {:?}",
+                news
+            );
+        };
 
         drop(monitor);
         storage.remove().unwrap();

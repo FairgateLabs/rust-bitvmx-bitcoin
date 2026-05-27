@@ -28,7 +28,7 @@ settings:
     max_unconfirmed_speedups: 10
     max_rbf_attempts: 10
     min_blocks_before_resend_speedup: 1
-    rbf_fee_percentage: 1.5
+    rbf_fee_multiplier: 1.5
     bump_fee_percentage: 1.5
   funding:
     min_funding_amount_sats: 10000

@@ -282,18 +282,18 @@ impl CoordinatorStorage {
     }
 
     /// Return in-flight speedups (`InMempool` or `Confirmed`) in creation order.
-    pub fn get_active_speedups(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
-        Ok(self
-            .get_speedups_ordered()?
-            .into_iter()
-            .filter(|tx| {
-                matches!(
-                    tx.state,
-                    TransactionState::InMempool | TransactionState::Confirmed
-                )
-            })
-            .collect())
-    }
+    // pub fn get_active_speedups(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+    //     Ok(self
+    //         .get_speedups_ordered()?
+    //         .into_iter()
+    //         .filter(|tx| {
+    //             matches!(
+    //                 tx.state,
+    //                 TransactionState::InMempool | TransactionState::Confirmed
+    //             )
+    //         })
+    //         .collect())
+    // }
 
     /// Return speedup transactions in creation order (oldest first).
     /// Txids that no longer exist in storage are skipped as a safety net against
@@ -1046,6 +1046,101 @@ mod tests {
             storage.get_tx_by_id(txid).unwrap().is_none(),
             "parent must be evicted once removed from PendingSpeedupParents"
         );
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    #[test]
+    fn test_get_by_state_and_exists() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let id1 = random_txid();
+        let id2 = random_txid();
+        storage
+            .insert_tx(dummy_tx(id1, TransactionState::ToDispatch))
+            .unwrap();
+        storage
+            .insert_tx(dummy_tx(id2, TransactionState::InMempool))
+            .unwrap();
+
+        assert_eq!(
+            storage
+                .get_by_state(TransactionState::ToDispatch)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            storage
+                .get_by_state(TransactionState::InMempool)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(storage
+            .get_by_state(TransactionState::Confirmed)
+            .unwrap()
+            .is_empty());
+
+        assert!(storage.exists(id1).unwrap());
+        assert!(storage.exists(id2).unwrap());
+        storage.remove_tx(id1).unwrap();
+        assert!(!storage.exists(id1).unwrap());
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    #[test]
+    fn test_invalid_state_and_retry_error_paths() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        // update_tx_state: missing tx emits TxNotFound
+        let missing = random_txid();
+        storage
+            .update_tx_state(missing, TransactionState::InMempool)
+            .unwrap();
+        let news = storage.get_news().unwrap();
+        assert!(matches!(&news[0], CoordinatorNews::TxNotFound { txid } if *txid == missing));
+        storage.clear_news().unwrap();
+
+        // update_tx_state: invalid transition emits InvalidStateTransition and leaves state unchanged
+        let txid = random_txid();
+        let mut tx = dummy_tx(txid, TransactionState::Finalized);
+        tx.settled_block_height = Some(1);
+        storage.insert_tx(tx).unwrap();
+        storage
+            .update_tx_state(txid, TransactionState::InMempool)
+            .unwrap();
+        let news = storage.get_news().unwrap();
+        assert!(matches!(&news[0],
+            CoordinatorNews::InvalidStateTransition { txid: id, from, to }
+            if *id == txid && *from == TransactionState::Finalized && *to == TransactionState::InMempool
+        ));
+        assert_eq!(
+            storage.get_tx_by_id(txid).unwrap().unwrap().state,
+            TransactionState::Finalized
+        );
+        storage.clear_news().unwrap();
+
+        // mark_as_retry: missing tx emits TxNotFound
+        let missing2 = random_txid();
+        storage.mark_as_retry(missing2).unwrap();
+        let news = storage.get_news().unwrap();
+        assert!(matches!(&news[0], CoordinatorNews::TxNotFound { txid } if *txid == missing2));
+        storage.clear_news().unwrap();
+
+        // mark_as_retry: invalid transition (Finalized → ToDispatch) emits InvalidStateTransition
+        storage.mark_as_retry(txid).unwrap();
+        let news = storage.get_news().unwrap();
+        assert!(matches!(&news[0],
+            CoordinatorNews::InvalidStateTransition { txid: id, from, to }
+            if *id == txid && *from == TransactionState::Finalized && *to == TransactionState::ToDispatch
+        ));
+        assert_eq!(storage.get_tx_by_id(txid).unwrap().unwrap().retry_count, 0);
 
         drop(storage);
         storage_backend.remove().unwrap();
