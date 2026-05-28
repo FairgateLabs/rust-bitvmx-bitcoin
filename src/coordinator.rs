@@ -110,6 +110,9 @@ impl BitcoinCoordinator {
             return Ok(());
         }
 
+        let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
+        self.tx_engine.ctx.storage.cleanup_news(current_height)?; // Cleanup acknowledged news
+
         self.tx_engine.review_active()?;
         self.speedup_engine.review_speedups()?;
         self.tx_engine.dispatch_pending()?;
@@ -270,8 +273,13 @@ impl BitcoinCoordinator {
     /// Returns all unacknowledged monitor and coordinator news. Internal
     /// CPFP/RBF speedup news entries are filtered out.
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
+        let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
         let monitor_news = self.tx_engine.ctx.monitor.get_news()?;
-        let coordinator_news = self.tx_engine.ctx.storage.get_news()?;
+        let coordinator_news = self
+            .tx_engine
+            .ctx
+            .storage
+            .get_and_mark_news(current_height)?;
 
         // Filter out internal coordinator transactions (CPFP/RBF speedups),
         // since the client's Context does not distinguish speedup variants.
@@ -299,7 +307,10 @@ impl BitcoinCoordinator {
     pub fn ack_news(&self, news: AckNews) -> Result<(), BitcoinCoordinatorError> {
         match news {
             AckNews::Monitor(n) => self.tx_engine.ctx.monitor.ack_news(n)?,
-            AckNews::Coordinator(n) => self.tx_engine.ctx.storage.ack_news(n)?,
+            AckNews::Coordinator(n) => {
+                let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
+                self.tx_engine.ctx.storage.ack_news(n, current_height)?;
+            }
         }
         Ok(())
     }

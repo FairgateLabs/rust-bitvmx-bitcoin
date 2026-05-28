@@ -858,6 +858,10 @@ fn test_selective_ack() {
         .ack_news(AckNews::Coordinator(dispatch_err))
         .unwrap();
 
+    // Advance to a new block so unacknowledged items become visible again.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+
     // Only the InvalidFundingUtxo must remain.
     let remaining = coordinator.get_news().unwrap().coordinator_news;
     assert_eq!(

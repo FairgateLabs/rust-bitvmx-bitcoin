@@ -851,8 +851,9 @@ fn test_boost_cap_reached() {
     );
 
     // The `MaxFeeRateReached` news must reference the capped txid.
-    let news = coord_storage.get_news().unwrap();
+    let news = coordinator.get_news().unwrap();
     let cap_news = news
+        .coordinator_news
         .iter()
         .find(|n| matches!(n, CoordinatorNews::MaxFeeRateReached { .. }))
         .expect("MaxFeeRateReached must be present");
@@ -975,8 +976,9 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
     );
 
     // News log must contain MaxFeeRateReached referencing the new RBF.
-    let news = coord_storage.get_news().unwrap();
+    let news = coordinator.get_news().unwrap();
     let cap_news = news
+        .coordinator_news
         .iter()
         .find(|n| matches!(n, CoordinatorNews::MaxFeeRateReached { txid, .. } if *txid == rbf_id))
         .expect("MaxFeeRateReached news must be emitted against the new RBF");
@@ -1880,9 +1882,10 @@ fn test_cpfp_built_for_parent_confirmed_before_funding() {
         "no CPFP can be built before funding is registered"
     );
     assert!(
-        coord_storage
+        coordinator
             .get_news()
             .unwrap()
+            .coordinator_news
             .iter()
             .any(|n| matches!(n, CoordinatorNews::FundingNotAvailable)),
         "FundingNotAvailable news must be emitted while funding is absent"

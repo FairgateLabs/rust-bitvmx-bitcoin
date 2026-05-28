@@ -5,8 +5,16 @@ use crate::{
 };
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
+use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 use storage_backend::storage::{KeyValueStore, Storage};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct StoredNewsItem {
+    news: CoordinatorNews,
+    acked_at_block: Option<BlockHeight>,
+    shown_at_block: Option<BlockHeight>,
+}
 
 const TX_PREFIX: &str = "bitcoin_coordinator";
 
@@ -392,36 +400,78 @@ impl CoordinatorStorage {
     //  NEWS
     // ================================
 
-    /// Store `news` if an identical item is not already present.
+    /// Store `news` unless any item with the same value already exists (acked or not).
+    /// This prevents duplicate entries even while a previously-acked copy is still
+    /// waiting for its next-block cleanup.
     pub fn add_news(&self, news: CoordinatorNews) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        let mut all: Vec<CoordinatorNews> = self.storage.get(&key, None)?.unwrap_or_default();
-
-        if all.contains(&news) {
-            return Ok(()); // exact duplicate already stored
+        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
+        if all.iter().any(|item| item.news == news) {
+            return Ok(());
         }
-
-        all.push(news);
+        all.push(StoredNewsItem {
+            news,
+            acked_at_block: None,
+            shown_at_block: None,
+        });
         self.storage.set(&key, &all, None)?;
         Ok(())
     }
 
-    /// Return all pending news items.
-    pub fn get_news(&self) -> Result<Vec<CoordinatorNews>, BitcoinCoordinatorError> {
+    /// Return unacked news not yet shown at `current_height` and mark them shown.
+    /// A second call with the same `current_height` returns empty (already shown this block).
+    /// When the next block arrives, unacked items become visible again.
+    pub fn get_and_mark_news(
+        &self,
+        current_height: BlockHeight,
+    ) -> Result<Vec<CoordinatorNews>, BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        Ok(self.storage.get(&key, None)?.unwrap_or_default())
+        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
+        let mut pending = Vec::new();
+        let mut changed = false;
+        for item in &mut all {
+            if item.acked_at_block.is_some() {
+                continue;
+            }
+            if item.shown_at_block == Some(current_height) {
+                continue;
+            }
+            item.shown_at_block = Some(current_height);
+            pending.push(item.news.clone());
+            changed = true;
+        }
+        if changed {
+            self.storage.set(&key, &all, None)?;
+        }
+        Ok(pending)
     }
 
-    pub fn clear_news(&self) -> Result<(), BitcoinCoordinatorError> {
+    /// Mark `news` as acknowledged at `current_height`. The item is hidden from
+    /// `get_and_mark_news` immediately but stays in storage until `cleanup_news`
+    /// runs at a strictly later block.
+    pub fn ack_news(
+        &self,
+        news: CoordinatorNews,
+        current_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        self.storage.remove(&key, None)?;
+        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
+        for item in &mut all {
+            if item.acked_at_block.is_none() && item.news == news {
+                item.acked_at_block = Some(current_height);
+                break;
+            }
+        }
+        self.storage.set(&key, &all, None)?;
         Ok(())
     }
 
-    pub fn ack_news(&self, news: CoordinatorNews) -> Result<(), BitcoinCoordinatorError> {
+    /// Remove items that were acknowledged in a strictly earlier block
+    /// (`acked_at_block < current_height`). Called at the start of each tick.
+    pub fn cleanup_news(&self, current_height: BlockHeight) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
-        let mut all: Vec<CoordinatorNews> = self.storage.get(&key, None)?.unwrap_or_default();
-        all.retain(|n| n != &news);
+        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
+        all.retain(|item| item.acked_at_block.map_or(true, |h| h >= current_height));
         self.storage.set(&key, &all, None)?;
         Ok(())
     }
@@ -574,7 +624,7 @@ mod tests {
             .unwrap();
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::InMempool);
-        assert!(storage.get_news().unwrap().is_empty());
+        assert!(storage.get_and_mark_news(1).unwrap().is_empty());
 
         // Valid: InMempool -> Confirmed
         storage
@@ -582,7 +632,7 @@ mod tests {
             .unwrap();
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::Confirmed);
-        assert!(storage.get_news().unwrap().is_empty());
+        assert!(storage.get_and_mark_news(2).unwrap().is_empty());
 
         // Valid: Confirmed -> ToDispatch (deep-reorg recovery — the speedup
         // engine re-queues a not_found Confirmed speedup for re-dispatch).
@@ -591,7 +641,7 @@ mod tests {
             .unwrap();
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::ToDispatch);
-        assert!(storage.get_news().unwrap().is_empty());
+        assert!(storage.get_and_mark_news(3).unwrap().is_empty());
 
         drop(storage);
         storage_backend.remove().unwrap();
@@ -610,7 +660,7 @@ mod tests {
         storage
             .settle_tx(txid1, TransactionState::Finalized, 0)
             .unwrap();
-        assert!(storage.get_news().unwrap().is_empty());
+        assert!(storage.get_and_mark_news(1).unwrap().is_empty());
 
         // ToDispatch -> Confirmed (restart after dispatch, tx already on-chain)
         let txid2 = random_txid();
@@ -620,7 +670,7 @@ mod tests {
         storage
             .update_tx_state(txid2, TransactionState::Confirmed)
             .unwrap();
-        assert!(storage.get_news().unwrap().is_empty());
+        assert!(storage.get_and_mark_news(2).unwrap().is_empty());
 
         // ToDispatch -> Finalized (restart after dispatch, tx already finalized)
         let txid3 = random_txid();
@@ -630,7 +680,7 @@ mod tests {
         storage
             .settle_tx(txid3, TransactionState::Finalized, 0)
             .unwrap();
-        assert!(storage.get_news().unwrap().is_empty());
+        assert!(storage.get_and_mark_news(3).unwrap().is_empty());
 
         drop(storage);
         storage_backend.remove().unwrap();
@@ -647,7 +697,7 @@ mod tests {
             .update_tx_state(txid, TransactionState::InMempool)
             .unwrap();
 
-        let news = storage.get_news().unwrap();
+        let news = storage.get_and_mark_news(1).unwrap();
         assert_eq!(news.len(), 1);
         assert_eq!(news[0], CoordinatorNews::TxNotFound { txid: txid });
 
@@ -677,40 +727,27 @@ mod tests {
     }
 
     #[test]
-    fn test_add_get_clear_news() {
+    fn test_add_and_get_news() {
         let storage_backend = StorageTestConfig::new();
         let storage = new_storage(&storage_backend);
 
         let news_item = CoordinatorNews::TxNotFound {
             txid: random_txid(),
         };
-
         storage.add_news(news_item.clone()).unwrap();
 
-        let news = storage.get_news().unwrap();
+        // First call at block 10 shows the item.
+        let news = storage.get_and_mark_news(10).unwrap();
         assert_eq!(news.len(), 1);
         assert_eq!(news[0], news_item);
 
-        storage.clear_news().unwrap();
-        assert!(storage.get_news().unwrap().is_empty());
+        // Second call at same block returns empty (already shown this block).
+        assert!(storage.get_and_mark_news(10).unwrap().is_empty());
 
-        drop(storage);
-        storage_backend.remove().unwrap();
-    }
-
-    #[test]
-    fn test_clear_news() {
-        let storage_backend = StorageTestConfig::new();
-        let storage = new_storage(&storage_backend);
-
-        storage
-            .add_news(CoordinatorNews::TxNotFound {
-                txid: random_txid(),
-            })
-            .unwrap();
-        storage.clear_news().unwrap();
-
-        assert!(storage.get_news().unwrap().is_empty());
+        // Next block shows it again (unacked).
+        let news2 = storage.get_and_mark_news(11).unwrap();
+        assert_eq!(news2.len(), 1);
+        assert_eq!(news2[0], news_item);
 
         drop(storage);
         storage_backend.remove().unwrap();
@@ -733,17 +770,29 @@ mod tests {
         storage.add_news(news_item1.clone()).unwrap();
         storage.add_news(news_item2.clone()).unwrap();
 
-        storage.ack_news(news_item1.clone()).unwrap();
+        // Acking item1 hides it immediately.
+        storage.ack_news(news_item1.clone(), 10).unwrap();
 
-        let news = storage.get_news().unwrap();
+        let news = storage.get_and_mark_news(10).unwrap();
         assert_eq!(news.len(), 1);
         assert_eq!(news[0], news_item2);
+
+        // item1 is still in storage (not yet cleaned up), not returned.
+        assert!(storage.get_and_mark_news(10).unwrap().is_empty());
+
+        // Cleanup at block 11 removes item1 (acked_at=10 < 11).
+        storage.cleanup_news(11).unwrap();
+        // item2 was shown at 10, re-appears at 11.
+        let news3 = storage.get_and_mark_news(11).unwrap();
+        assert_eq!(news3.len(), 1);
+        assert_eq!(news3[0], news_item2);
 
         drop(storage);
         storage_backend.remove().unwrap();
     }
 
     /// Adding the same item multiple times stores it only once.
+    /// Repeated get_and_mark_news at the same block returns empty after the first call.
     #[test]
     fn test_add_news_dedup() {
         let storage_backend = StorageTestConfig::new();
@@ -755,18 +804,20 @@ mod tests {
         storage.add_news(news.clone()).unwrap();
         storage.add_news(news.clone()).unwrap();
 
-        let returned = storage.get_news().unwrap();
+        let returned = storage.get_and_mark_news(5).unwrap();
         assert_eq!(returned.len(), 1);
 
-        // get_news is idempotent: calling it again returns the same items.
-        let returned_again = storage.get_news().unwrap();
-        assert_eq!(returned_again.len(), 1);
+        // Same block: already shown.
+        assert!(storage.get_and_mark_news(5).unwrap().is_empty());
+
+        // Next block: shows again.
+        assert_eq!(storage.get_and_mark_news(6).unwrap().len(), 1);
 
         drop(storage);
         storage_backend.remove().unwrap();
     }
 
-    /// Two distinct items are both stored and always returned together.
+    /// Two distinct items are both stored and returned together in the same call.
     #[test]
     fn test_add_news_distinct_items_both_stored() {
         let storage_backend = StorageTestConfig::new();
@@ -781,7 +832,7 @@ mod tests {
         storage.add_news(item1.clone()).unwrap();
         storage.add_news(item2.clone()).unwrap();
 
-        let returned = storage.get_news().unwrap();
+        let returned = storage.get_and_mark_news(1).unwrap();
         assert_eq!(returned.len(), 2);
         assert!(returned.contains(&item1));
         assert!(returned.contains(&item2));
@@ -790,22 +841,60 @@ mod tests {
         storage_backend.remove().unwrap();
     }
 
-    /// After ack the item is removed; re-adding it makes it visible again.
+    /// Acked item blocks re-add until cleanup; after cleanup the same news
+    /// can be stored and shown again.
     #[test]
-    fn test_ack_then_readd_is_visible() {
+    fn test_ack_blocks_readd_until_cleanup() {
         let storage_backend = StorageTestConfig::new();
         let storage = new_storage(&storage_backend);
 
         let news = CoordinatorNews::FundingNotAvailable;
         storage.add_news(news.clone()).unwrap();
-        assert_eq!(storage.get_news().unwrap().len(), 1);
+        storage.get_and_mark_news(10).unwrap();
+        storage.ack_news(news.clone(), 10).unwrap();
 
-        storage.ack_news(news.clone()).unwrap();
-        assert!(storage.get_news().unwrap().is_empty());
+        // Acked item no longer shown.
+        assert!(storage.get_and_mark_news(10).unwrap().is_empty());
+        assert!(storage.get_and_mark_news(11).unwrap().is_empty());
 
-        // Re-add: no longer a duplicate, so it is stored and returned.
+        // Re-add is blocked: the acked record still exists in storage.
         storage.add_news(news.clone()).unwrap();
-        assert_eq!(storage.get_news().unwrap().len(), 1);
+        assert!(storage.get_and_mark_news(11).unwrap().is_empty());
+
+        // Cleanup at block 11 removes the acked item (acked_at=10 < 11).
+        storage.cleanup_news(11).unwrap();
+        assert!(storage.get_and_mark_news(12).unwrap().is_empty());
+
+        // Now re-add succeeds and the item is visible.
+        storage.add_news(news.clone()).unwrap();
+        assert_eq!(storage.get_and_mark_news(12).unwrap().len(), 1);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// cleanup_news at the same block as ack does not remove the item;
+    /// only a strictly later block triggers removal.
+    #[test]
+    fn test_cleanup_same_block_keeps_item() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let news = CoordinatorNews::FundingNotAvailable;
+        storage.add_news(news.clone()).unwrap();
+        storage.ack_news(news.clone(), 5).unwrap();
+
+        // Cleanup at same block: acked_at (5) >= current (5) → retained.
+        storage.cleanup_news(5).unwrap();
+        // Item is acked, not shown.
+        assert!(storage.get_and_mark_news(5).unwrap().is_empty());
+
+        // Cleanup at block 6: acked_at (5) < 6 → removed.
+        storage.cleanup_news(6).unwrap();
+
+        // Now re-add works.
+        storage.add_news(news.clone()).unwrap();
+        assert_eq!(storage.get_and_mark_news(7).unwrap().len(), 1);
 
         drop(storage);
         storage_backend.remove().unwrap();
@@ -829,7 +918,7 @@ mod tests {
         let updated = storage.get_tx_by_id(txid).unwrap().unwrap();
         assert_eq!(updated.state, TransactionState::Finalized);
         assert_eq!(updated.settled_block_height, Some(42));
-        assert!(storage.get_news().unwrap().is_empty());
+        assert!(storage.get_and_mark_news(0).unwrap().is_empty());
 
         drop(storage);
         storage_backend.remove().unwrap();
@@ -862,7 +951,7 @@ mod tests {
         assert!(storage.get_tx_by_id(txid_fresh).unwrap().is_some());
 
         // One eviction news item for the stale tx
-        let news = storage.get_news().unwrap();
+        let news = storage.get_and_mark_news(1).unwrap();
         assert_eq!(news.len(), 1);
         assert!(matches!(
             &news[0],
@@ -1033,7 +1122,7 @@ mod tests {
             "NeedsSpeedup parent in PendingSpeedupParents must not be evicted (SpeedupData must survive)"
         );
         assert!(
-            storage.get_news().unwrap().is_empty(),
+            storage.get_and_mark_news(1).unwrap().is_empty(),
             "no TransactionEvicted news while the parent is still in PendingSpeedupParents"
         );
 
@@ -1103,9 +1192,10 @@ mod tests {
         storage
             .update_tx_state(missing, TransactionState::InMempool)
             .unwrap();
-        let news = storage.get_news().unwrap();
+        let news = storage.get_and_mark_news(1).unwrap();
         assert!(matches!(&news[0], CoordinatorNews::TxNotFound { txid } if *txid == missing));
-        storage.clear_news().unwrap();
+        storage.ack_news(news[0].clone(), 1).unwrap();
+        storage.cleanup_news(2).unwrap();
 
         // update_tx_state: invalid transition emits InvalidStateTransition and leaves state unchanged
         let txid = random_txid();
@@ -1115,7 +1205,7 @@ mod tests {
         storage
             .update_tx_state(txid, TransactionState::InMempool)
             .unwrap();
-        let news = storage.get_news().unwrap();
+        let news = storage.get_and_mark_news(2).unwrap();
         assert!(matches!(&news[0],
             CoordinatorNews::InvalidStateTransition { txid: id, from, to }
             if *id == txid && *from == TransactionState::Finalized && *to == TransactionState::InMempool
@@ -1124,18 +1214,20 @@ mod tests {
             storage.get_tx_by_id(txid).unwrap().unwrap().state,
             TransactionState::Finalized
         );
-        storage.clear_news().unwrap();
+        storage.ack_news(news[0].clone(), 2).unwrap();
+        storage.cleanup_news(3).unwrap();
 
         // mark_as_retry: missing tx emits TxNotFound
         let missing2 = random_txid();
         storage.mark_as_retry(missing2).unwrap();
-        let news = storage.get_news().unwrap();
+        let news = storage.get_and_mark_news(3).unwrap();
         assert!(matches!(&news[0], CoordinatorNews::TxNotFound { txid } if *txid == missing2));
-        storage.clear_news().unwrap();
+        storage.ack_news(news[0].clone(), 3).unwrap();
+        storage.cleanup_news(4).unwrap();
 
         // mark_as_retry: invalid transition (Finalized → ToDispatch) emits InvalidStateTransition
         storage.mark_as_retry(txid).unwrap();
-        let news = storage.get_news().unwrap();
+        let news = storage.get_and_mark_news(4).unwrap();
         assert!(matches!(&news[0],
             CoordinatorNews::InvalidStateTransition { txid: id, from, to }
             if *id == txid && *from == TransactionState::Finalized && *to == TransactionState::ToDispatch
