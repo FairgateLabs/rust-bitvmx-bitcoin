@@ -403,11 +403,12 @@ impl CoordinatorStorage {
     /// Store `news` unless any item with the same value already exists (acked or not).
     /// This prevents duplicate entries even while a previously-acked copy is still
     /// waiting for its next-block cleanup.
-    pub fn add_news(&self, news: CoordinatorNews) -> Result<(), BitcoinCoordinatorError> {
+    /// Returns `true` if the item was inserted, `false` if it was a duplicate.
+    pub fn add_news(&self, news: CoordinatorNews) -> Result<bool, BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
         let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
         if all.iter().any(|item| item.news == news) {
-            return Ok(());
+            return Ok(false);
         }
         all.push(StoredNewsItem {
             news,
@@ -415,7 +416,7 @@ impl CoordinatorStorage {
             shown_at_block: None,
         });
         self.storage.set(&key, &all, None)?;
-        Ok(())
+        Ok(true)
     }
 
     /// Return unacked news not yet shown at `current_height` and mark them shown.

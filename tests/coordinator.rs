@@ -1030,6 +1030,103 @@ fn test_stuck_in_mempool_news() {
     setup.end_all().unwrap();
 }
 
+/// A stuck transaction can be unblocked by dispatching a CPFP via
+/// `dispatch_without_speedup`. The coordinator tracks both independently,
+/// dispatches them in topological order, and both reach `Confirmed` once a
+/// block is mined.
+#[test]
+fn test_stuck_in_mempool_cpfp_resolution() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Parent (will be stuck) + CPFP spending parent:0.
+    let (parent_tx, cpfp_tx) = create_parent_and_child_signed_txs(&setup.bitcoin_client);
+    let parent_txid = parent_tx.compute_txid();
+    let cpfp_txid = cpfp_tx.compute_txid();
+
+    coordinator
+        .dispatch_without_speedup(parent_tx, ctx("stuck_parent"), None, None, Some(1))
+        .unwrap();
+    coordinator.tick().unwrap(); // dispatches → InMempool
+
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool
+    );
+
+    // Force stuck: set broadcast_block_height to 0 so the threshold of 1 block
+    // is always exceeded without needing to mine extra blocks.
+    let mut record = coord_storage.get_tx_by_id(parent_txid).unwrap().unwrap();
+    record.broadcast_block_height = Some(0);
+    coord_storage.update_tx(&record).unwrap();
+
+    coordinator.tick().unwrap();
+
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.coordinator_news.iter().any(|n| {
+            matches!(n, CoordinatorNews::TransactionStuckInMempool { txid: id, .. } if *id == parent_txid)
+        }),
+        "expected TransactionStuckInMempool before CPFP; got {:?}",
+        news.coordinator_news
+    );
+
+    // Another tick without the CPFP should not change anything.
+    let status = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        parent_txid,
+        TransactionState::Confirmed,
+        5,
+    )
+    .unwrap();
+    assert!(
+        !status,
+        "parent should not reach Confirmed without CPFP resolution"
+    );
+
+    // Dispatch the CPFP spending parent:0. Both are now ToDispatch / InMempool.
+    coordinator
+        .dispatch_without_speedup(cpfp_tx, ctx("cpfp"), None, None, None)
+        .unwrap();
+    coordinator.tick().unwrap(); // dispatches CPFP → InMempool
+
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(cpfp_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "CPFP must reach InMempool after dispatch"
+    );
+
+    // Mine one block: parent + CPFP confirm together.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+
+    let both_confirmed = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent_txid, cpfp_txid],
+        TransactionState::Confirmed,
+        5,
+    )
+    .unwrap();
+    assert!(both_confirmed, "both parent and CPFP must reach Confirmed");
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
 /// A transaction in retry state is not dispatched until `retry_interval_seconds`
 /// has elapsed since the last retry batch.
 #[test]

@@ -101,20 +101,28 @@ impl TransactionEngine {
                     info!("Transaction({}) reorged back to mempool", tx.txid);
                     self.ctx.handle_reorg(&tx, current_height)?;
                 } else if tx.is_stuck_in_mempool(current_height) {
-                    warn!(
-                        "Transaction({}) stuck in mempool for {} blocks (threshold: {})",
-                        tx.txid,
-                        tx.broadcast_block_height
-                            .map(|h| current_height.saturating_sub(h))
-                            .unwrap_or(0),
-                        tx.stuck_in_mempool_blocks.unwrap_or(0),
-                    );
-                    self.ctx
-                        .storage
-                        .add_news(CoordinatorNews::TransactionStuckInMempool {
-                            txid: tx.txid,
-                            context: tx.context.clone(),
-                        })?;
+                    let news_was_added =
+                        self.ctx
+                            .storage
+                            .add_news(CoordinatorNews::TransactionStuckInMempool {
+                                txid: tx.txid,
+                                context: tx.context.clone(),
+                            })?;
+                    if news_was_added {
+                        warn!(
+                            "Transaction({}) stuck in mempool for {} blocks (threshold: {}). \
+                            This news will repeat once per block until the transaction is mined. \
+                            Options: (1) cancel() to stop tracking: the transaction remains in the \
+                            mempool but will no longer be monitored; (2) dispatch a CPFP via \
+                            dispatch_without_speedup() spending one of its outputs to raise the \
+                            effective fee rate: the coordinator will track both and mine them together.",
+                            tx.txid,
+                            tx.broadcast_block_height
+                                .map(|h| current_height.saturating_sub(h))
+                                .unwrap_or(0),
+                            tx.stuck_in_mempool_blocks.unwrap_or(0),
+                        );
+                    }
                 }
                 continue;
             }

@@ -68,8 +68,11 @@ flight at a time.
 > ⚠️ **`add_funding` UTXOs must be effectively final.** Only pass UTXOs whose funding transaction is
 > deep enough on-chain that you accept it as `Finalized` (i.e., no longer reorgable in practice).
 
-The `BitcoinCoordinator` struct exposes the following methods (see
-`src/coordinator.rs` for full Rustdoc):
+> 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold.
+> To unblock: call `cancel()` to abandon tracking, or dispatch a CPFP spending one of its outputs via
+> `dispatch_without_speedup`. The coordinator tracks both and mines them together.
+
+The `BitcoinCoordinator` struct exposes the following methods:
 
 | Method | Purpose |
 |---|---|
