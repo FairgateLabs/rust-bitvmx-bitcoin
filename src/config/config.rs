@@ -165,18 +165,19 @@ impl BitcoinSettings {
         );
 
         ensure!(
-            self.dispatcher.max_tx_weight > 0 && self.dispatcher.max_tx_weight <= MAX_MAX_TX_WEIGHT,
+            self.dispatcher.max_tx_weight > 0
+                && self.dispatcher.max_tx_weight <= MAX_LIMIT_TX_WEIGHT,
             "invalid max_tx_weight"
         );
 
         ensure!(
             self.speedup.max_rbf_attempts > 0
-                && self.speedup.max_rbf_attempts <= MAX_MAX_RBF_ATTEMPTS,
+                && self.speedup.max_rbf_attempts <= MAX_LIMIT_RBF_ATTEMPTS,
             "invalid max_rbf_attempts"
         );
 
         ensure!(
-            self.funding.min_funding_amount_sats >= MIN_MIN_FUNDING_AMOUNT_SATS,
+            self.funding.min_funding_amount_sats >= MIN_LIMIT_FUNDING_AMOUNT_SATS,
             "funding below dust threshold"
         );
 
@@ -195,7 +196,7 @@ impl BitcoinSettings {
 
         ensure!(
             self.fee.max_feerate_sat_vb > 0
-                && self.fee.max_feerate_sat_vb <= MAX_MAX_FEERATE_SAT_VB,
+                && self.fee.max_feerate_sat_vb <= MAX_LIMIT_FEERATE_SAT_VB,
             "invalid max_feerate_sat_vb"
         );
 
@@ -267,19 +268,19 @@ mod tests {
             ..Default::default()
         });
 
-        // max_tx_weight: must be 1..=MAX_MAX_TX_WEIGHT
+        // max_tx_weight: must be 1..=MAX_LIMIT_TX_WEIGHT
         check(BitcoinSettings {
             dispatcher: DispatcherSettings { max_tx_weight: 0 },
             ..Default::default()
         });
         check(BitcoinSettings {
             dispatcher: DispatcherSettings {
-                max_tx_weight: MAX_MAX_TX_WEIGHT + 1,
+                max_tx_weight: MAX_LIMIT_TX_WEIGHT + 1,
             },
             ..Default::default()
         });
 
-        // max_rbf_attempts: must be 1..=MAX_MAX_RBF_ATTEMPTS
+        // max_rbf_attempts: must be 1..=MAX_LIMIT_RBF_ATTEMPTS
         check(BitcoinSettings {
             speedup: SpeedupSettings {
                 max_rbf_attempts: 0,
@@ -289,16 +290,16 @@ mod tests {
         });
         check(BitcoinSettings {
             speedup: SpeedupSettings {
-                max_rbf_attempts: MAX_MAX_RBF_ATTEMPTS + 1,
+                max_rbf_attempts: MAX_LIMIT_RBF_ATTEMPTS + 1,
                 ..Default::default()
             },
             ..Default::default()
         });
 
-        // min_funding_amount_sats: must be >= MIN_MIN_FUNDING_AMOUNT_SATS
+        // min_funding_amount_sats: must be >= MIN_LIMIT_FUNDING_AMOUNT_SATS
         check(BitcoinSettings {
             funding: FundingSettings {
-                min_funding_amount_sats: MIN_MIN_FUNDING_AMOUNT_SATS - 1,
+                min_funding_amount_sats: MIN_LIMIT_FUNDING_AMOUNT_SATS - 1,
             },
             ..Default::default()
         });
@@ -335,7 +336,7 @@ mod tests {
             ..Default::default()
         });
 
-        // max_feerate_sat_vb: must be 1..=MAX_MAX_FEERATE_SAT_VB
+        // max_feerate_sat_vb: must be 1..=MAX_LIMIT_FEERATE_SAT_VB
         check(BitcoinSettings {
             fee: FeeSettings {
                 max_feerate_sat_vb: 0,
@@ -345,7 +346,7 @@ mod tests {
         });
         check(BitcoinSettings {
             fee: FeeSettings {
-                max_feerate_sat_vb: MAX_MAX_FEERATE_SAT_VB + 1,
+                max_feerate_sat_vb: MAX_LIMIT_FEERATE_SAT_VB + 1,
                 ..Default::default()
             },
             ..Default::default()

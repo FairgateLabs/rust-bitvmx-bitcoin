@@ -78,7 +78,7 @@ impl EngineContext {
 
     /// Reorg detected: a `Confirmed` tx reappeared in the mempool.
     /// Reset state to `InMempool` and refresh the broadcast height.
-    pub fn handle_reorg(
+    pub fn mark_reorg(
         &self,
         tx: &CoordinatedTx,
         current_height: BlockHeight,
@@ -91,7 +91,7 @@ impl EngineContext {
     }
 
     /// Tx reached max confirmations. Settle as `Finalized`.
-    pub fn handle_finalized(
+    pub fn mark_finalized(
         &self,
         txid: Txid,
         current_height: BlockHeight,
@@ -102,14 +102,14 @@ impl EngineContext {
     }
 
     /// Tx confirmed. Update state to `Confirmed`.
-    pub fn handle_confirmed(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+    pub fn mark_confirmed(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         self.storage
             .update_tx_state(txid, TransactionState::Confirmed)?;
         Ok(())
     }
 
     /// Tx orphaned. Keep in `InMempool`.
-    pub fn handle_orphan(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+    pub fn mark_orphan(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         self.storage
             .update_tx_state(txid, TransactionState::InMempool)?;
         Ok(())
@@ -177,7 +177,7 @@ impl EngineContext {
                     }
                 }
                 debug!("Transaction({}) already confirmed on-chain", txid);
-                self.handle_confirmed(txid)?;
+                self.mark_confirmed(txid)?;
             }
             DispatchOutcome::Retryable(msg) => {
                 if tx.retry_count + 1 >= self.coordinator_config.retry_attempts_sending_tx {

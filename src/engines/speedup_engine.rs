@@ -79,7 +79,7 @@ impl SpeedupEngine {
 
             if status.is_in_mempool() {
                 if tx.state == TransactionState::Confirmed {
-                    self.ctx.handle_reorg(tx, current_height)?;
+                    self.ctx.mark_reorg(tx, current_height)?;
                 }
                 continue;
             }
@@ -105,7 +105,7 @@ impl SpeedupEngine {
             }
 
             if status.is_finalized(max_confs) {
-                self.ctx.handle_finalized(tx.txid, current_height)?;
+                self.ctx.mark_finalized(tx.txid, current_height)?;
                 self.remove_replaced_rbf(tx, current_height)?;
                 // Advance base funding to the last finalized on-chain change output.
                 self.ctx.funding_manager.update_funding_from_tx(tx)?;
@@ -113,12 +113,12 @@ impl SpeedupEngine {
             }
 
             if status.is_confirmed() {
-                self.ctx.handle_confirmed(tx.txid)?;
+                self.ctx.mark_confirmed(tx.txid)?;
                 continue;
             }
 
             if status.is_orphan() {
-                self.ctx.handle_orphan(tx.txid)?;
+                self.ctx.mark_orphan(tx.txid)?;
                 continue;
             }
         }

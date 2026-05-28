@@ -99,7 +99,7 @@ impl TransactionEngine {
             if status.is_in_mempool() {
                 if tx.state == TransactionState::Confirmed {
                     info!("Transaction({}) reorged back to mempool", tx.txid);
-                    self.ctx.handle_reorg(&tx, current_height)?;
+                    self.ctx.mark_reorg(&tx, current_height)?;
                 } else if tx.is_stuck_in_mempool(current_height) {
                     let news_was_added =
                         self.ctx
@@ -145,7 +145,7 @@ impl TransactionEngine {
                     "Transaction({}) finalized ({} confirmations)",
                     tx.txid, status.confirmations
                 );
-                self.ctx.handle_finalized(tx.txid, current_height)?;
+                self.ctx.mark_finalized(tx.txid, current_height)?;
                 continue;
             }
 
@@ -154,13 +154,13 @@ impl TransactionEngine {
                     "Transaction({}) confirmed ({} confirmations)",
                     tx.txid, status.confirmations
                 );
-                self.ctx.handle_confirmed(tx.txid)?;
+                self.ctx.mark_confirmed(tx.txid)?;
                 continue;
             }
 
             if status.is_orphan() {
                 debug!("Transaction({}) orphaned, keeping InMempool", tx.txid);
-                self.ctx.handle_orphan(tx.txid)?;
+                self.ctx.mark_orphan(tx.txid)?;
                 continue;
             }
 
