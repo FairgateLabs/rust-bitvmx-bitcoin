@@ -3,6 +3,7 @@ use common::*;
 
 use bitcoin_coordinator::{
     config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
+    core::funding::FundingStorage,
     types::{AckNews, CoordinatorNews, TransactionState},
 };
 use bitcoind::bitcoind::BitcoindFlags;
@@ -307,11 +308,10 @@ fn test_multiple_txs_dispatched_in_single_tick() {
     setup.end_all().unwrap();
 }
 
-/// Registering a parent transaction and a child transaction that spends the
-/// parent's first output, then ticking once, must dispatch both into the
-/// mempool.
+/// Trying to dispatch a parent and its child in the same tick, produces the dispatcher to defers the child
+///  to a later tick, where the parent is now in mempool and the child broadcasts.
 #[test]
-fn test_dispatch_parent_and_child_in_single_tick() {
+fn test_dispatch_parent_then_child_across_ticks() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
@@ -330,8 +330,8 @@ fn test_dispatch_parent_and_child_in_single_tick() {
         .dispatch_without_speedup(child, ctx("child"), None, None, None)
         .unwrap();
 
+    // Tick 1: parent broadcasts; child is deferred (parent not yet in monitor cache).
     coordinator.tick().unwrap();
-
     let coord_storage = get_coord_storage(&setup);
     assert_eq!(
         coord_storage
@@ -340,12 +340,26 @@ fn test_dispatch_parent_and_child_in_single_tick() {
             .unwrap()
             .state,
         TransactionState::InMempool,
-        "parent {parent_id} must be InMempool after batch dispatch"
+        "parent {parent_id} must be InMempool after first tick"
     );
     assert_eq!(
         coord_storage.get_tx_by_id(child_id).unwrap().unwrap().state,
+        TransactionState::ToDispatch,
+        "child {child_id} must remain ToDispatch until the monitor sees the parent"
+    );
+
+    // Subsequent ticks: child broadcasts once parents_ready passes.
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        child_id,
         TransactionState::InMempool,
-        "child {child_id} must be InMempool after batch dispatch"
+        5,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "child {child_id} must reach InMempool after the parent becomes observable"
     );
 
     assert!(coordinator.get_news().unwrap().is_empty());
@@ -355,22 +369,75 @@ fn test_dispatch_parent_and_child_in_single_tick() {
     setup.end_all().unwrap();
 }
 
-/// Adding a valid funding UTXO (above the minimum threshold) must not
-/// generate any coordinator news.
+/// Exercises `add_funding`'s validation across all three observable outcomes in a single end-to-end scenario:
+///   1. A valid UTXO (above `min_funding_amount_sats`) is accepted with no news.
+///   2. A second UTXO below the minimum is rejected and emits exactly one `InvalidFundingUtxo` news item.
+///   3. A valid UTXO added after the invalid one is still accepted with no news
 #[test]
-fn test_add_valid_funding_utxo() {
+fn test_add_funding_validation() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let coordinator = create_coordinator(&setup);
+    let coord_storage = get_coord_storage(&setup);
     tick_until_ready(&coordinator).unwrap();
 
-    // Default minimum is 10 000 sats; 20 000 is safely above it.
-    coordinator.add_funding(utxo(20_000)).unwrap();
+    // 1. Valid UTXO (default minimum is 10 000 sats; 20 000 is above it).
+    let first_utxo = utxo(20_000);
+    coordinator.add_funding(first_utxo.clone()).unwrap();
+    assert!(
+        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        "no news must fire when a valid funding UTXO is added"
+    );
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    // 2. Below-minimum UTXO rejected, news emitted.
+    coordinator.add_funding(utxo(9_999)).unwrap();
+    let news = coordinator.get_news().unwrap();
+    assert_eq!(
+        news.coordinator_news.len(),
+        1,
+        "exactly one InvalidFundingUtxo news must fire; got {:?}",
+        news.coordinator_news
+    );
+    assert!(
+        matches!(
+            &news.coordinator_news[0],
+            CoordinatorNews::InvalidFundingUtxo { amount, min_required }
+            if *amount == 9_999 && *min_required == 10_000
+        ),
+        "unexpected news payload: {:?}",
+        news.coordinator_news[0]
+    );
 
+    // 3. Valid UTXO after invalid one is still accepted with no news.
+    let third_utxo = utxo(50_000);
+    coordinator.add_funding(third_utxo.clone()).unwrap();
+    assert!(
+        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        "no news must fire when a valid funding UTXO is added, even after a previous invalid one"
+    );
+
+    let fundings = coord_storage.read_funding_records().unwrap();
+    assert_eq!(
+        fundings.len(),
+        2,
+        "both valid UTXOs must be present in storage; got {:?}",
+        fundings
+    );
+    assert_eq!(
+        fundings[0].get_funding_info().unwrap().0,
+        first_utxo,
+        "first valid UTXO must be in storage"
+    );
+    assert_eq!(
+        fundings[1].get_funding_info().unwrap().0,
+        third_utxo,
+        "second valid UTXO must be in storage"
+    );
+
+    ack_all_news(&coordinator, &news);
     drop(coordinator);
+    drop(coord_storage);
     setup.end_all().unwrap();
 }
 
@@ -608,77 +675,6 @@ fn test_dispatch_invalid_empty_tx() {
 
     drop(coordinator);
     drop(coord_storage);
-    setup.end_all().unwrap();
-}
-
-/// Adding a funding UTXO below the minimum threshold generates an
-/// `InvalidFundingUtxo` coordinator news item.  The invalid UTXO is not
-/// persisted to storage.
-#[test]
-fn test_add_funding_below_min() {
-    init_trace();
-
-    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let coordinator = create_coordinator(&setup);
-    tick_until_ready(&coordinator).unwrap();
-
-    // Default minimum is 10 000 sats; 9 999 is just below it.
-    coordinator.add_funding(utxo(9_999)).unwrap();
-
-    let news = coordinator.get_news().unwrap();
-    assert_eq!(
-        news.coordinator_news.len(),
-        1,
-        "Expected exactly one coordinator news for invalid funding; got {:?}",
-        news.coordinator_news
-    );
-    assert!(
-        matches!(
-            &news.coordinator_news[0],
-            CoordinatorNews::InvalidFundingUtxo { amount, min_required }
-            if *amount == 9_999 && *min_required == 10_000
-        ),
-        "Unexpected news item: {:?}",
-        news.coordinator_news[0]
-    );
-
-    drop(coordinator);
-    setup.end_all().unwrap();
-}
-
-/// When a valid funding UTXO is in storage and a subsequent call replaces it
-/// with an invalid one, the invalid call must generate an `InvalidFundingUtxo` news item.
-#[test]
-fn test_invalid_funding_replaces() {
-    init_trace();
-
-    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let coordinator = create_coordinator(&setup);
-    tick_until_ready(&coordinator).unwrap();
-
-    // Set a valid UTXO first.
-    coordinator.add_funding(utxo(20_000)).unwrap();
-    assert!(
-        coordinator.get_news().unwrap().coordinator_news.is_empty(),
-        "No news expected after valid funding"
-    );
-
-    // Now replace with an invalid one.
-    coordinator.add_funding(utxo(1_000)).unwrap();
-
-    let news = coordinator.get_news().unwrap();
-    assert!(
-        news.coordinator_news.len() == 1
-            && matches!(
-                &news.coordinator_news[0],
-                CoordinatorNews::InvalidFundingUtxo { amount, .. }
-                if *amount == 1_000
-            ),
-        "Expected exactly one InvalidFundingUtxo news with correct amounts; got {:?}",
-        news.coordinator_news
-    );
-
-    drop(coordinator);
     setup.end_all().unwrap();
 }
 
@@ -1219,7 +1215,8 @@ fn test_retry_dispatches_after_rate_limit() {
 #[test]
 fn test_retry_failure() {
     init_trace();
-    let retry_interval_seconds = 1u64;
+    // Long enough that consecutive ticks are reliably below the rate-limit window.
+    let retry_interval_seconds = 8u64;
 
     // Non-zero min_relay_tx_fee ensures our zero-fee tx is always rejected.
     let setup = TestSetup::new(TestSetupConfig {

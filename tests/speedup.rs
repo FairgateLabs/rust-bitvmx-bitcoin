@@ -8,8 +8,8 @@ use bitcoin_coordinator::{
         SpeedupSettings,
     },
     coordinator::BitcoinCoordinator,
-    core::storage::CoordinatorStorage,
-    types::{CoordinatorNews, TransactionState},
+    core::{funding::FundingStorage, storage::CoordinatorStorage},
+    types::{CoordinatorNews, TransactionState, TxKind},
 };
 use bitcoincore_rpc::RpcApi as _;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
@@ -213,10 +213,10 @@ fn test_cpfp_lifecycle() {
     );
     ack_all_news(&coordinator, &coordinator.get_news().unwrap());
 
-    // Block 3: both Evicted.
+    // Block 3: parent is eligible for eviction but the finalized CPFP must NOT be evicted:
+    // replace_on_finalize moved it into the FundingList and the eviction guard protects it.
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
     let mut parent_evicted = false;
-    let mut cpfp_evicted = false;
     for _ in 0..10 {
         coordinator.tick().unwrap();
         let news = coordinator.get_news().unwrap();
@@ -225,13 +225,13 @@ fn test_cpfp_lifecycle() {
             {
                 parent_evicted = true;
             }
-            if matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == cpfp_txid)
-            {
-                cpfp_evicted = true;
-            }
+            assert!(
+                !matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == cpfp_txid),
+                "CPFP must NOT be evicted while it lives in the FundingList"
+            );
         }
         ack_all_news(&coordinator, &news);
-        if parent_evicted && cpfp_evicted {
+        if parent_evicted {
             break;
         }
     }
@@ -239,14 +239,21 @@ fn test_cpfp_lifecycle() {
         parent_evicted,
         "TransactionEvicted news must fire for parent"
     );
-    assert!(cpfp_evicted, "TransactionEvicted news must fire for CPFP");
     assert!(
         coord_storage.get_tx_by_id(parent_txid).unwrap().is_none(),
         "parent must be removed from storage after eviction"
     );
+    // CPFP record still present and parked in the FundingList.
+    let cpfp_record = coord_storage
+        .get_tx_by_id(cpfp_txid)
+        .unwrap()
+        .expect("CPFP must remain in storage while in the FundingList");
+    assert_eq!(cpfp_record.state, TransactionState::Finalized);
+    assert!(matches!(cpfp_record.kind, TxKind::Speedup(_)));
+    let funding_records = coord_storage.read_funding_records().unwrap();
     assert!(
-        coord_storage.get_tx_by_id(cpfp_txid).unwrap().is_none(),
-        "CPFP must be removed from storage after eviction"
+        funding_records.iter().any(|r| r.txid == cpfp_txid),
+        "finalized CPFP must be present in the FundingList as the chain tip"
     );
 
     drop(coordinator);
@@ -537,7 +544,7 @@ fn test_cpfp_boost() {
     // Mine 1 empty block so CPFP1 becomes stale.
     mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
 
-    // Tick triggers boost_if_stale → builds CPFP2 → save as TO-DISPATCH.
+    // Tick triggers boost_if_stale → builds CPFP2 → save as `ToDispatch`.
     coordinator.tick().unwrap();
     let speedups = coord_storage.get_speedups_ordered().unwrap();
     assert_eq!(speedups.len(), 2, "boost must add a second speedup");
@@ -1104,18 +1111,31 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
         "RBF dispatch must set `replaced_by = Some(rbf_txid)` on the predecessor (CPFP2)"
     );
 
+    // Mine one block. RBF's inputs share CPFP1_change with CPFP2 replacement so CPFP2 is skipped
+    // via the `is_being_replaced` short-circuit.
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
     let reached = tick_until_all_states(
         &coordinator,
         &coord_storage,
-        &[parent_tx.compute_txid(), cpfp1_txid, cpfp2_txid, rbf_txid],
+        &[parent_tx.compute_txid(), cpfp1_txid, rbf_txid],
         TransactionState::Confirmed,
         10,
     )
     .unwrap();
     assert!(
         reached,
-        "parent, CPFP1, CPFP2, and RBF must all confirm after the boosts"
+        "parent, CPFP1, and RBF must all confirm after the first block"
+    );
+    // CPFP2 was replaced in the mempool; it remains InMempool (replaced_by set)
+    // until remove_replaced_rbf walks the chain at RBF finalization.
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(cpfp2_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "CPFP2 must stay InMempool while its RBF replacement is in flight"
     );
     ack_all_news(&coordinator, &coordinator.get_news().unwrap());
 
@@ -1135,6 +1155,19 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
         reached,
         "RBF must reach Finalized after the second confirming block (exercises remove_replaced_rbf)"
     );
+    // remove_replaced_rbf settles CPFP2 as Failed when the RBF finalizes.
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        cpfp2_txid,
+        TransactionState::Failed,
+        5,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "CPFP2 must be settled Failed by remove_replaced_rbf when its replacing RBF finalizes"
+    );
 
     drop(coordinator);
     drop(coord_storage);
@@ -1144,8 +1177,6 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
 /// When the RBF speedup is manually broadcast and confirmed before the coordinator
 /// dispatches it, `handle_dispatch_result` fires the `AlreadyConfirmed` path, which
 /// must mark the predecessor CPFP's `replaced_by` field.
-/// Covers `engines/common.rs`: `AlreadyConfirmed` RBF branch →
-/// `if let Some(mut replaced) = storage.get_tx_by_id(*replaces)?`.
 #[test]
 fn test_rbf_already_confirmed_marks_predecessor() {
     init_trace();
@@ -1174,7 +1205,7 @@ fn test_rbf_already_confirmed_marks_predecessor() {
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("rbf_already_confirmed"), None, None)
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("rbf"), None, None)
         .unwrap();
 
     // CPFP1 built + dispatched (1 unconfirmed).
@@ -1207,33 +1238,38 @@ fn test_rbf_already_confirmed_marks_predecessor() {
     assert!(speedups[2].speedup_kind().unwrap().is_rbf());
     assert_eq!(speedups[2].state, TransactionState::ToDispatch);
 
-    // Manually broadcast the RBF before the coordinator's next tick dispatches it.
-    // The RBF spends CPFP2's change output so parent + CPFP1 + CPFP2 + RBF can
-    // all confirm in the same block.
+    // Manually broadcast the RBF before the coordinator's next tick dispatches it (simulating a crash and restart)
+    // RBF shares CPFP1_change with CPFP2 replacement. The next block contains parent + CPFP1 + RBF.
     setup.bitcoin_client.send_transaction(&rbf_tx).unwrap();
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
 
-    // Tick: review_speedups marks CPFP1/CPFP2 Confirmed (skips ToDispatch RBF);
-    // dispatch_pending_speedups dispatches the RBF → AlreadyConfirmed → sets
-    // CPFP2.replaced_by = Some(rbf_txid) and transitions RBF to Confirmed.
+    // Run several ticks. Expected sequence:
+    // - review_speedups: parent / CPFP1 → Confirmed. CPFP2 → not_found,
+    //   replaced_by None at this point → re-queued ToDispatch.
+    // - dispatch_pending_speedups: CPFP2 ToDispatch dispatched first
+    //   → MissingInput (its inputs spent by RBF on-chain) → settle Failed.
+    //   RBF ToDispatch dispatched next → AlreadyConfirmed → sets
+    //   CPFP2.replaced_by = Some(rbf_txid), marks RBF Confirmed.
     let reached = tick_until_all_states(
         &coordinator,
         &coord_storage,
-        &[parent_txid, cpfp1_txid, cpfp2_txid, rbf_txid],
+        &[parent_txid, cpfp1_txid, rbf_txid],
         TransactionState::Confirmed,
         5,
     )
     .unwrap();
-    assert!(
-        reached,
-        "parent, CPFP1, CPFP2, and RBF must all reach Confirmed"
-    );
+    assert!(reached, "parent, CPFP1, and RBF must reach Confirmed");
 
     let cpfp2 = coord_storage.get_tx_by_id(cpfp2_txid).unwrap().unwrap();
     assert_eq!(
+        cpfp2.state,
+        TransactionState::Failed,
+        "CPFP2 must be settled Failed (MissingInput on its now-spent funding input)"
+    );
+    assert_eq!(
         cpfp2.speedup_kind().unwrap().context().replaced_by,
         Some(rbf_txid),
-        "AlreadyConfirmed path must set CPFP2.replaced_by = Some(rbf_txid)"
+        "AlreadyConfirmed path on the RBF must set CPFP2.replaced_by = Some(rbf_txid)"
     );
 
     drop(coordinator);
@@ -1561,11 +1597,14 @@ fn test_cpfp_funding_restored_after_finalization() {
     setup.end_all().unwrap();
 }
 
-/// Two fundings are registered; the first is below the CPFP fee, the second
-/// is plenty. The coordinator must advance past the first and build the CPFP
-/// against the second without emitting `InsufficientFunds`.
+/// Speedup-primary combine + chain continuation. ///
+/// 1. A modest `funding_initial` and a plentiful `funding_extra` are queued. P1 dispatches; CPFP1 builds from
+///   `funding_initial` alone. The inflated fee from `multi_funding_settings` makes CPFP1's change tight.
+/// 2. CPFP1 confirms and finalizes. `replace_funding_on_finalize` collapses `funding_initial` into a single entry.
+/// 3. P2 dispatches. The chain tip CPFP1_change is now Speedup-derived primary but its amount is below the next
+///     CPFP fee + dust, so the unified build path pulls in `funding_extra` as the combine partner.
 #[test]
-fn test_cpfp_advances_to_next_funding() {
+fn test_chain_tip_combine_after_finalize() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
@@ -1574,17 +1613,14 @@ fn test_cpfp_advances_to_next_funding() {
         create_coordinator_with_km(&setup, key_manager.rc(), multi_funding_settings());
     let coord_storage = get_coord_storage(&setup);
 
-    // Funding A: exactly at min_funding_amount_sats (10 000). Will pass the
-    // add-time validator but the inflated CPFP fee (~100 sat/vB * ~200 vB =
-    // ~20 000) will exceed its amount.
-    let funding_a = create_funded_speedup_utxo(
+    let funding_initial = create_funded_speedup_utxo(
         &setup.bitcoin_client,
         &*key_manager,
         Network::Regtest,
-        10_000,
+        25_000,
     )
     .unwrap();
-    let funding_b = create_funded_speedup_utxo(
+    let funding_extra = create_funded_speedup_utxo(
         &setup.bitcoin_client,
         &*key_manager,
         Network::Regtest,
@@ -1592,246 +1628,137 @@ fn test_cpfp_advances_to_next_funding() {
     )
     .unwrap();
 
-    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+    let (parent1, sd1) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
         &*key_manager,
         Network::Regtest,
         1_000,
     )
     .unwrap();
-    let parent_txid = parent_tx.compute_txid();
+    let parent1_txid = parent1.compute_txid();
 
     tick_until_ready(&coordinator).unwrap();
-    coordinator.add_funding(funding_a.clone()).unwrap();
-    coordinator.add_funding(funding_b.clone()).unwrap();
+    coordinator.add_funding(funding_initial.clone()).unwrap();
+    coordinator.add_funding(funding_extra.clone()).unwrap();
     coordinator
-        .dispatch_with_speedup(parent_tx, speedup_data, ctx("multi_funding"), None, None)
+        .dispatch_with_speedup(parent1, sd1, ctx("chain_combine_p1"), None, None)
         .unwrap();
 
-    // Tick 1: parent dispatches; CPFP build with A fails (insufficient),
-    // funding queue advances to B. No CPFP saved this tick.
-    coordinator.tick().unwrap();
-    assert_eq!(
-        coord_storage
-            .get_tx_by_id(parent_txid)
-            .unwrap()
-            .unwrap()
-            .state,
-        TransactionState::InMempool,
-        "parent must be InMempool after dispatch tick"
-    );
-    assert!(
-        coord_storage.get_speedups_ordered().unwrap().is_empty(),
-        "no CPFP must be created when funding A is insufficient"
-    );
-    let news_after_tick1 = coordinator.get_news().unwrap();
-    assert!(
-        news_after_tick1
-            .coordinator_news
-            .iter()
-            .any(|n| matches!(n, CoordinatorNews::FundingConsumed { txid, .. } if *txid == funding_a.txid)),
-        "FundingConsumed must fire for funding A; got {:?}",
-        news_after_tick1.coordinator_news
-    );
-    assert!(
-        !news_after_tick1
-            .coordinator_news
-            .iter()
-            .any(|n| matches!(n, CoordinatorNews::InsufficientFunds { .. })),
-        "no InsufficientFunds while the queue still has B; got {:?}",
-        news_after_tick1.coordinator_news
-    );
-    ack_all_news(&coordinator, &news_after_tick1);
+    // Phase 1: CPFP1 built from funding_initial alone.
+    let cpfp1_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+    {
+        let cpfp1 = coord_storage.get_tx_by_id(cpfp1_txid).unwrap().unwrap();
+        let inputs = &cpfp1.speedup_kind().unwrap().context().funding_inputs;
+        assert_eq!(
+            inputs.len(),
+            1,
+            "CPFP1 must use a single Funding-kind input (Fi primary, no combine)"
+        );
+        assert_eq!(inputs[0].txid, funding_initial.txid);
+    }
 
-    // Tick 2: CPFP built with funding B and saved as ToDispatch.
-    coordinator.tick().unwrap();
-    let speedups = coord_storage.get_speedups_ordered().unwrap();
-    assert_eq!(
-        speedups.len(),
-        1,
-        "exactly one CPFP must be built after the second tick"
-    );
-    let cpfp_txid = speedups[0].txid;
-    assert_eq!(
-        speedups[0].state,
-        TransactionState::ToDispatch,
-        "CPFP must be saved as ToDispatch on the build tick"
-    );
-
-    // The CPFP must spend funding B, not funding A.
-    let cpfp_tx = &speedups[0].tx;
-    assert!(
-        cpfp_tx
-            .input
-            .iter()
-            .any(|i| i.previous_output.txid == funding_b.txid),
-        "CPFP must spend funding B",
-    );
-    assert!(
-        cpfp_tx
-            .input
-            .iter()
-            .all(|i| i.previous_output.txid != funding_a.txid),
-        "CPFP must not spend funding A (advanced past)"
-    );
-
-    // Tick 3: CPFP dispatched.
-    let reached = tick_until_state(
-        &coordinator,
-        &coord_storage,
-        cpfp_txid,
-        TransactionState::InMempool,
-        3,
-    )
-    .unwrap();
-    assert!(reached, "CPFP must reach InMempool on the next tick");
-
-    // Confirming block: parent and CPFP both reach Confirmed.
+    // Phase 2: confirm + finalize CPFP1.
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
     let reached = tick_until_all_states(
         &coordinator,
         &coord_storage,
-        &[parent_txid, cpfp_txid],
+        &[parent1_txid, cpfp1_txid],
         TransactionState::Confirmed,
         10,
     )
     .unwrap();
-    assert!(
-        reached,
-        "parent and CPFP must both reach Confirmed after one block"
+    assert!(reached, "parent1 and CPFP1 must reach Confirmed");
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let reached = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent1_txid, cpfp1_txid],
+        TransactionState::Finalized,
+        10,
+    )
+    .unwrap();
+    assert!(reached, "parent1 and CPFP1 must reach Finalized");
+    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+    // After finalize the FundingList holds: CPFP1 (Speedup-kind, preserved), funding_extra (Funding-kind, unspent).
+    let funding_records = coord_storage.read_funding_records().unwrap();
+    assert_eq!(
+        funding_records.len(),
+        2,
+        "FundingList must hold CPFP1 + funding_extra"
     );
+    let cpfp1_record = funding_records
+        .iter()
+        .find(|r| r.txid == cpfp1_txid)
+        .expect("CPFP1 must be parked in FundingList");
+    assert!(
+        matches!(cpfp1_record.kind, TxKind::Speedup(_)),
+        "finalized speedup's kind must be preserved"
+    );
+    assert!(funding_records.iter().any(|r| r.txid == funding_extra.txid));
 
-    drop(coordinator);
-    drop(coord_storage);
-    setup.end_all().unwrap();
-}
-
-/// When the funding queue is entirely exhausted (all entries too small),
-/// `InsufficientFunds` is emitted and the parent stays in `InMempool` with
-/// no CPFP. Once the user registers new funding, the next tick picks up the
-/// parent from the pending set and creates the CPFP.
-#[test]
-fn test_cpfp_recovers_after_queue_was_exhausted() {
-    init_trace();
-
-    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let key_manager = TestKeyManager::new();
-    let coordinator =
-        create_coordinator_with_km(&setup, key_manager.rc(), multi_funding_settings());
-    let coord_storage = get_coord_storage(&setup);
-
-    // Create both UTXOs up front (each mines a block) so no block is mined between ticks.
-    let funding_a = create_funded_speedup_utxo(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        10_000,
-    )
-    .unwrap();
-    let funding_b = create_funded_speedup_utxo(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        1_000_000,
-    )
-    .unwrap();
-
-    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+    // Phase 3: dispatch P2. CPFP2 combines chain tip + extra Fi.
+    let (parent2, sd2) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
         &*key_manager,
         Network::Regtest,
         1_000,
     )
     .unwrap();
-    let parent_txid = parent_tx.compute_txid();
-
-    tick_until_ready(&coordinator).unwrap();
-    let funding_a_txid = funding_a.txid;
-    coordinator.add_funding(funding_a).unwrap();
+    let parent2_txid = parent2.compute_txid();
     coordinator
-        .dispatch_with_speedup(
-            parent_tx,
-            speedup_data,
-            ctx("exhausted_funding"),
-            None,
-            None,
-        )
+        .dispatch_with_speedup(parent2, sd2, ctx("chain_combine_p2"), None, None)
         .unwrap();
 
-    // Tick 1: CPFP build fails, queue advances → empty, InsufficientFunds fired.
-    coordinator.tick().unwrap();
-    assert_eq!(
-        coord_storage
-            .get_tx_by_id(parent_txid)
-            .unwrap()
-            .unwrap()
-            .state,
-        TransactionState::InMempool,
-        "parent must stay InMempool after queue exhaustion"
-    );
-    assert!(
-        coord_storage.get_speedups_ordered().unwrap().is_empty(),
-        "no CPFP must exist after queue exhaustion"
-    );
-    let news = coordinator.get_news().unwrap();
-    assert!(
-        news.coordinator_news
-            .iter()
-            .any(|n| matches!(n, CoordinatorNews::FundingConsumed { txid, .. } if *txid == funding_a_txid)),
-        "FundingConsumed must fire for funding A; got {:?}",
-        news.coordinator_news
-    );
-    assert!(
-        news.coordinator_news
-            .iter()
-            .any(|n| matches!(n, CoordinatorNews::InsufficientFunds { .. })),
-        "InsufficientFunds must be emitted when the queue is empty; got {:?}",
-        news.coordinator_news
-    );
-    ack_all_news(&coordinator, &news);
-
-    // User now registers B.
-    coordinator.add_funding(funding_b.clone()).unwrap();
-
-    // Tick 2: pending set has parent → CPFP built with B → saved as ToDispatch.
     coordinator.tick().unwrap();
     let speedups = coord_storage.get_speedups_ordered().unwrap();
-    assert_eq!(speedups.len(), 1, "exactly one CPFP after recovery");
-    let cpfp_txid = speedups[0].txid;
+    // CPFP1 was moved out of SpeedupList by replace_on_finalize, so only CPFP2 remains active.
     assert_eq!(
-        speedups[0].state,
-        TransactionState::ToDispatch,
-        "CPFP must be saved as ToDispatch on the build tick"
+        speedups.len(),
+        1,
+        "SpeedupList must contain only the active CPFP2 (CPFP1 moved to FundingList)"
     );
+    let cpfp2 = &speedups[0];
+    let cpfp2_txid = cpfp2.txid;
+    let cpfp2_inputs = &cpfp2.speedup_kind().unwrap().context().funding_inputs;
+    assert_eq!(
+        cpfp2_inputs.len(),
+        2,
+        "CPFP2 must combine Speedup chain tip + Funding partner (got inputs={:?})",
+        cpfp2_inputs
+    );
+    // Primary = CPFP1 change, partner = funding_extra.
+    assert_eq!(cpfp2_inputs[0].txid, cpfp1_txid);
+    assert_eq!(cpfp2_inputs[1].txid, funding_extra.txid);
+    // The CPFP2 tx must actually spend the combine partner.
     assert!(
-        speedups[0]
+        cpfp2
             .tx
             .input
             .iter()
-            .any(|i| i.previous_output.txid == funding_b.txid),
-        "CPFP must spend funding B"
+            .any(|i| i.previous_output.txid == funding_extra.txid),
+        "CPFP2 tx must include the combine partner as a real input"
     );
 
-    // Tick 3: CPFP dispatched.
     let reached = tick_until_state(
         &coordinator,
         &coord_storage,
-        cpfp_txid,
+        cpfp2_txid,
         TransactionState::InMempool,
         3,
     )
     .unwrap();
-    assert!(reached, "CPFP must reach InMempool on the next tick");
-
-    let news = coordinator.get_news().unwrap();
-    assert!(
-        !news
-            .coordinator_news
-            .iter()
-            .any(|n| matches!(n, CoordinatorNews::InsufficientFunds { .. })),
-        "no further InsufficientFunds after recovery; got {:?}",
-        news.coordinator_news
-    );
+    assert!(reached, "CPFP2 must reach InMempool");
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let reached = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent2_txid, cpfp2_txid],
+        TransactionState::Confirmed,
+        10,
+    )
+    .unwrap();
+    assert!(reached, "parent2 and CPFP2 must reach Confirmed");
 
     drop(coordinator);
     drop(coord_storage);
@@ -1961,6 +1888,237 @@ fn test_cpfp_built_for_parent_confirmed_before_funding() {
     )
     .unwrap();
     assert!(reached, "CPFP must reach InMempool on the next tick");
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// `SpeedupContext.spent` is set on the chain-tip CPFP at the moment a newer speedup builds on top of it.
+/// After a boost cycle (CPFP1 → CPFP2-boost), CPFP1 must be marked spent and CPFP2 must not be marked spent.
+#[test]
+fn test_chain_tip_spent_flag_progresses_with_boosts() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000_000,
+    )
+    .unwrap();
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("spent_flag"), None, None)
+        .unwrap();
+
+    // CPFP1 built + dispatched. spent flag still false (no boost yet).
+    let cpfp1_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+    assert!(
+        !coord_storage
+            .get_tx_by_id(cpfp1_txid)
+            .unwrap()
+            .unwrap()
+            .speedup_kind()
+            .unwrap()
+            .context()
+            .spent,
+        "fresh CPFP1 must NOT be marked spent before any boost"
+    );
+
+    // Trigger a boost: mine 1 empty block, then tick → CPFP2 built using CPFP1_change.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 2, "boost must add CPFP2");
+    let cpfp2_txid = speedups[1].txid;
+
+    // At save time, mark_funding_consumed sets CPFP1.spent = true.
+    assert!(
+        coord_storage
+            .get_tx_by_id(cpfp1_txid)
+            .unwrap()
+            .unwrap()
+            .speedup_kind()
+            .unwrap()
+            .context()
+            .spent,
+        "CPFP1 must be marked spent once CPFP2 reserves its change as funding"
+    );
+    // CPFP2 itself remains unspent (no boost on top of it yet).
+    assert!(
+        !coord_storage
+            .get_tx_by_id(cpfp2_txid)
+            .unwrap()
+            .unwrap()
+            .speedup_kind()
+            .unwrap()
+            .context()
+            .spent,
+        "new chain tip CPFP2 must NOT be marked spent"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// RBF can pull a combine partner when its inherited (Speedup-derived) funding is insufficient at the
+/// bumped fee. Sequence:
+///   1. CPFP1 built from a queue funding Fi.
+///   2. Boost (1 unconfirmed < 2) → CPFP2 with a single Speedup-derived input (CPFP1's change).
+///   3. Boost again (2 unconfirmed = max) → CPFP3 is an RBF replacing CPFP2. RBF inherits CPFP2's
+///      funding_inputs = [CPFP1_change]. Because the single input is Speedup-derived, the unified
+///       build path is allowed to combine. A queued Fi is pulled in as the second input.
+/// Settings are tuned so that CPFP1_change is just enough for CPFP2 but not for the RBF's bumped fee.
+#[test]
+fn test_rbf_combines_when_inherited_funding_insufficient() {
+    init_trace();
+
+    let settings = BitcoinSettings {
+        fee: FeeSettings {
+            min_safe_fee_rate: 80,
+            max_feerate_sat_vb: 1000,
+            base_fee_multiplier: 1.0,
+        },
+        speedup: SpeedupSettings {
+            max_unconfirmed_speedups: 2,
+            max_rbf_attempts: 10,
+            min_blocks_before_resend_speedup: 1,
+            rbf_fee_multiplier: 2.0,
+            bump_fee_percentage: 2.0,
+        },
+        ..cpfp_settings()
+    };
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings);
+    let coord_storage = get_coord_storage(&setup);
+
+    // Initial funding: large enough for CPFP1 + CPFP2 but its leftover change
+    // after CPFP2 is consumed by the RBF cannot cover the bumped RBF fee alone.
+    let funding_initial = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        60_000,
+    )
+    .unwrap();
+    // Extra funding stays unspent in the queue, ready for combine.
+    let funding_extra = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000_000,
+    )
+    .unwrap();
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000,
+    )
+    .unwrap();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_initial.clone()).unwrap();
+    coordinator.add_funding(funding_extra.clone()).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("rbf_combine"), None, None)
+        .unwrap();
+
+    // Build + dispatch CPFP1.
+    let cpfp1_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+    let cpfp1_inputs = coord_storage
+        .get_tx_by_id(cpfp1_txid)
+        .unwrap()
+        .unwrap()
+        .speedup_kind()
+        .unwrap()
+        .context()
+        .funding_inputs
+        .clone();
+    assert_eq!(
+        cpfp1_inputs.len(),
+        1,
+        "CPFP1 must use a single Funding-kind input (only the initial Fi is consumed)"
+    );
+    assert_eq!(cpfp1_inputs[0].txid, funding_initial.txid);
+
+    // First boost: 1 unconfirmed < max(2) → CPFP. Chain tip primary
+    // (Speedup-derived) from CPFP1's change. Must remain single-input.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 2, "first boost must add CPFP2");
+    let cpfp2 = &speedups[1];
+    let cpfp2_txid = cpfp2.txid;
+    assert!(
+        !cpfp2.speedup_kind().unwrap().is_rbf(),
+        "first boost must be a CPFP (1 unconfirmed < limit of 2)"
+    );
+    let cpfp2_inputs = &cpfp2.speedup_kind().unwrap().context().funding_inputs;
+    assert_eq!(
+        cpfp2_inputs.len(),
+        1,
+        "CPFP2 must have a single funding input (chain tip CPFP1_change)"
+    );
+    assert_eq!(cpfp2_inputs[0].txid, cpfp1_txid);
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        cpfp2_txid,
+        TransactionState::InMempool,
+        3,
+    )
+    .unwrap();
+    assert!(reached, "CPFP2 must reach InMempool");
+
+    // Second boost: 2 unconfirmed >= max → RBF replacing CPFP2.  At the bumped fee CPFP1_change
+    // alone is insufficient, so `get_combine_funding` pulls in funding_extra as the second input.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 3, "second boost must add the RBF");
+    let rbf = &speedups[2];
+    assert!(
+        rbf.speedup_kind().unwrap().is_rbf(),
+        "second boost must be RBF (unconfirmed limit reached)"
+    );
+    let rbf_inputs = &rbf.speedup_kind().unwrap().context().funding_inputs;
+    assert_eq!(
+        rbf_inputs.len(),
+        2,
+        "RBF must combine inherited input + queue funding (got inputs={:?})",
+        rbf_inputs
+    );
+    // Inherited input first (matches CPFP1's change), extra second.
+    assert_eq!(rbf_inputs[0].txid, cpfp1_txid);
+    assert_eq!(rbf_inputs[1].txid, funding_extra.txid);
+    // The RBF tx must actually spend the extra Fi.
+    assert!(
+        rbf.tx
+            .input
+            .iter()
+            .any(|i| i.previous_output.txid == funding_extra.txid),
+        "RBF tx must include the combine partner as a spent input"
+    );
 
     drop(coordinator);
     drop(coord_storage);
