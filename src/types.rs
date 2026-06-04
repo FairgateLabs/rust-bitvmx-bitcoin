@@ -57,13 +57,22 @@ pub enum TxKind {
     /// metadata until the coordinator builds a CPFP in the same tick.
     NeedsSpeedup(SpeedupData),
     Speedup(SpeedupKind),
+    /// User-provided funding UTXO tracked as a coordinator transaction.
+    Funding(FundingData),
+}
+
+#[derive(Deserialize, Serialize, Debug, Clone)]
+pub struct FundingData {
+    pub utxo: Utxo,
+    #[serde(default)]
+    pub spent: bool,
 }
 
 /// Shared context stored in every speedup transaction regardless of CPFP/RBF variant.
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct SpeedupContext {
-    /// UTXO that funded this tx; restored on reorg when this tx is evicted.
-    pub funding_input: Utxo,
+    /// UTXOs that funded this tx (1 entry normally, 2 when a leftover is swept).
+    pub funding_inputs: Vec<Utxo>,
     /// Set when this transaction has been superseded by an RBF replacement.
     pub replaced_by: Option<Txid>,
     /// Bump-fee multiplier used; escalated multiplicatively for each subsequent boost/RBF.
@@ -72,6 +81,9 @@ pub struct SpeedupContext {
     /// Stored here because the RBF variant (`SpeedupKind::RBF`) only records `replaces`,
     /// not the original parents, so reconstruction would require a chain walk.
     pub parent_data: Vec<(SpeedupData, u64, usize)>,
+    /// True when this speedup's change output has been consumed by a newer speedup as its funding input.
+    #[serde(default)]
+    pub spent: bool,
 }
 
 impl SpeedupContext {
@@ -91,7 +103,6 @@ pub enum SpeedupKind {
         context: SpeedupContext,
     },
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub enum CoordinatorNews {
@@ -128,14 +139,6 @@ pub enum CoordinatorNews {
     TransactionEvicted {
         txid: Txid,
         context: String,
-    },
-    /// A funding UTXO was consumed (too small to cover the speedup fee) and
-    /// the coordinator has advanced to the next entry in the queue. Emitted
-    /// once per consumed entry so the client can track funding depletion.
-    FundingConsumed {
-        txid: Txid,
-        vout: u32,
-        amount: u64,
     },
     /// Funding UTXO has insufficient balance to cover a speedup fee.
     InsufficientFunds {

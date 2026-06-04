@@ -6,7 +6,6 @@ use crate::{
     helper::find_tx_in_batch,
     types::{CoordinatedTx, CoordinatorNews, TransactionState, TxKind},
 };
-use bitcoin::Transaction;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use tracing::{debug, error, info, warn};
 
@@ -33,7 +32,8 @@ impl TransactionEngine {
         let to_review: Vec<CoordinatedTx> = active_txs
             .into_iter()
             .filter(|tx| {
-                !matches!(tx.kind, TxKind::Speedup(_))
+                // Speedups are handled by the speedup engine; Funding records are not broadcastable.
+                matches!(tx.kind, TxKind::Normal | TxKind::NeedsSpeedup(_))
                     && matches!(
                         tx.state,
                         TransactionState::InMempool | TransactionState::Confirmed
@@ -60,7 +60,8 @@ impl TransactionEngine {
 
         let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
         for tx in active_txs {
-            if matches!(tx.kind, TxKind::Speedup(_)) {
+            // Speedups are handled by the speedup engine; Funding records are not broadcastable.
+            if matches!(tx.kind, TxKind::Speedup(_) | TxKind::Funding(_)) {
                 continue;
             }
             if tx.state == TransactionState::ToDispatch && tx.is_ready_to_dispatch(current_height) {
@@ -188,8 +189,7 @@ impl TransactionEngine {
         }
 
         let txs = self.ctx.apply_retry_rate_limit(txs);
-        let raw_txs: Vec<Transaction> = txs.iter().map(|t| t.tx.clone()).collect();
-        let results = self.ctx.dispatcher.dispatch(raw_txs);
+        let results = self.ctx.dispatcher.dispatch(txs.clone(), &self.ctx.monitor);
 
         for (txid, outcome) in results {
             let tx = find_tx_in_batch(&txs, txid)?;

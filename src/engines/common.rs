@@ -2,6 +2,7 @@ use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor};
 use std::cell::Cell;
+use std::rc::Rc;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -26,7 +27,7 @@ pub struct EngineContext {
 
     pub fee_manager: FeeManager,
     pub funding_manager: FundingManager,
-    pub storage: CoordinatorStorage,
+    pub storage: Rc<CoordinatorStorage>,
     pub dispatcher: Dispatcher,
 
     pub coordinator_config: CoordinatorSettings,
@@ -39,7 +40,7 @@ impl EngineContext {
         fee_manager: FeeManager,
         funding_manager: FundingManager,
         dispatcher: Dispatcher,
-        storage: CoordinatorStorage,
+        storage: Rc<CoordinatorStorage>,
         coordinator_config: CoordinatorSettings,
     ) -> Self {
         Self {
@@ -144,7 +145,8 @@ impl EngineContext {
         filtered
     }
 
-    /// Handle a single dispatch outcome. Returns `true` if the tx was accepted into the mempool.
+    /// Handle a single dispatch outcome. Failures route into `fail_and_cascade`, which settles
+    /// the tx Failed, resets spent flags, and recursively cascades into ToDispatch descendants.
     pub fn handle_dispatch_result(
         &self,
         tx: &CoordinatedTx,
@@ -187,9 +189,7 @@ impl EngineContext {
                         tx.retry_count + 1,
                         msg
                     );
-                    self.storage
-                        .settle_tx(txid, TransactionState::Failed, current_height)?;
-                    self.storage.add_news(Self::dispatch_error_news(tx, txid))?;
+                    self.fail_and_cascade(tx, current_height, false)?;
                 } else {
                     debug!(
                         "Transaction({}) dispatch failed (attempt {}/{}), will retry: {}",
@@ -203,12 +203,112 @@ impl EngineContext {
             }
             DispatchOutcome::Fatal(msg) => {
                 warn!("Transaction({}) fatal dispatch error: {}", txid, msg);
-                self.storage
-                    .settle_tx(txid, TransactionState::Failed, current_height)?;
-                self.storage.add_news(Self::dispatch_error_news(tx, txid))?;
+                self.fail_and_cascade(tx, current_height, false)?;
+            }
+            DispatchOutcome::MissingInput(msg) => {
+                warn!(
+                    "Transaction({}) missing-input dispatch error: {}",
+                    txid, msg
+                );
+                let funding_missing = self.is_funding_input_missing(tx)?;
+                self.fail_and_cascade(tx, current_height, funding_missing)?;
             }
         }
         Ok(())
+    }
+
+    /// Settle `tx` Failed (applying spent-flag reset and re-add semantics), then recursively settle every ToDispatch
+    /// speedup whose primary funding input references `tx.txid`.
+    /// `funding_missing` for the root reflects the actual failure cause: only when true does the root re-add its
+    ///  NeedsSpeedup parents. For cascade victims we always pass `true`: their funding input is the dead parent's
+    /// change output, which is by definition missing. Boost victims naturally skip the re-add.
+    pub fn fail_and_cascade(
+        &self,
+        tx: &CoordinatedTx,
+        current_height: BlockHeight,
+        funding_missing: bool,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        self.settle_failed_dispatch(tx, current_height, funding_missing)?;
+
+        let speedups = self.storage.get_speedups_ordered()?;
+        for d in speedups
+            .iter()
+            .filter(|s| s.state == TransactionState::ToDispatch)
+        {
+            let depends_on_tx = match d.speedup_kind() {
+                Ok(k) => k
+                    .context()
+                    .funding_inputs
+                    .first()
+                    .map_or(false, |fi| fi.txid == tx.txid),
+                Err(_) => false,
+            };
+            if depends_on_tx {
+                warn!(
+                    txid = %d.txid,
+                    "cascade-fail: primary funding parent {} is Failed; settling Failed",
+                    tx.txid,
+                );
+                // Descendants are always treated as funding-missing: their primary funding is gone,
+                //so any non-boost CPFP victim must rebuild (funding-missing true).
+                self.fail_and_cascade(d, current_height, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Settle Failed, emit news, reset spent flags on parents (CPFP only. RBF skips), reset `replaced_by` on
+    /// an RBF predecessor, and on funding-missing re-add NeedsSpeedup parents to PendingSpeedupParents.
+    fn settle_failed_dispatch(
+        &self,
+        tx: &CoordinatedTx,
+        current_height: BlockHeight,
+        funding_missing: bool,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        self.storage
+            .settle_tx(tx.txid, TransactionState::Failed, current_height)?;
+        self.storage
+            .add_news(Self::dispatch_error_news(tx, tx.txid))?;
+
+        // Only CPFPs reset spent flags and re-add parents. RBFs skip both since they don't reserve their parents' UTXOs.
+        if let TxKind::Speedup(SpeedupKind::CPFP { .. }) = &tx.kind {
+            self.funding_manager.mark_parents_unspent(tx)?;
+        }
+
+        // If this is an RBF, clear the `replaced_by` flag on its predecessor so it can be re-boosted by a future boost.
+        if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
+            if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
+                if let Ok(ctx) = replaced.speedup_kind_mut() {
+                    ctx.context_mut().replaced_by = None;
+                    self.storage.update_tx(&replaced)?;
+                }
+            }
+        }
+
+        // On funding-missing failures, re-add NeedsSpeedup parents to PendingSpeedupParents so they can be retried in the next tick.
+        if funding_missing {
+            self.storage.requeue_protocol_parents(tx)?;
+        }
+        Ok(())
+    }
+
+    // Check if any funding input is missing from the mempool.
+    fn is_funding_input_missing(
+        &self,
+        tx: &CoordinatedTx,
+    ) -> Result<bool, BitcoinCoordinatorError> {
+        let k = match tx.speedup_kind() {
+            Ok(k) => k,
+            Err(_) => return Ok(false),
+        };
+        for fi in &k.context().funding_inputs {
+            // Check in real-time on the mempool.
+            let unspent = self.monitor.is_utxo_unspent_rpc(&fi.txid, fi.vout)?;
+            if !unspent {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn dispatch_error_news(tx: &CoordinatedTx, txid: Txid) -> CoordinatorNews {

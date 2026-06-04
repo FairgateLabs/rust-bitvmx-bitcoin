@@ -1,8 +1,9 @@
 use crate::{config::config::DispatcherSettings, types::CoordinatedTx};
-use bitcoin::{Transaction, Txid};
+use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
-use std::collections::HashSet;
+use bitvmx_transaction_monitor::monitor::Monitor;
 use std::rc::Rc;
+use tracing::debug;
 
 /// Typed outcome returned per-transaction by [`Dispatcher::dispatch`].
 #[derive(Debug)]
@@ -18,6 +19,8 @@ pub enum DispatchOutcome {
     Retryable(String),
     /// Permanent error (e.g. transaction too heavy, script invalid). Mark as failed.
     Fatal(String),
+    /// `bad-txns-inputs-missingorspent`: at least one input is gone or spent from the UTXO set / mempool.
+    MissingInput(String),
 }
 
 pub struct Dispatcher {
@@ -65,24 +68,29 @@ impl Dispatcher {
         batches
     }
 
-    /// Broadcast `txs` to the Bitcoin node. Txs whose inputs spend other txs in the same
-    /// batch are sent after their parents so they can accept as in-mempool descendants.
-    pub fn dispatch(&self, txs: Vec<Transaction>) -> Vec<(Txid, DispatchOutcome)> {
-        let (valid_txs, mut results) = self.validate(txs);
-        let ordered = topological_sort(valid_txs);
-
-        for tx in ordered {
-            let txid = tx.compute_txid();
-
-            #[cfg(feature = "testnet-test-delay")]
-            std::thread::sleep(std::time::Duration::from_secs(10));
-            let outcome = match self.bitcoin_client.send_transaction(&tx) {
+    /// Broadcast each tx whose input parents are observable in the mempool / chain via the (cached) `monitor.get_tx_status`.
+    /// Txs with at least one parent in `NotFound` / `Orphan` state are skipped.
+    pub fn dispatch(
+        &self,
+        txs: Vec<CoordinatedTx>,
+        monitor: &Monitor,
+    ) -> Vec<(Txid, DispatchOutcome)> {
+        let (valid, mut results) = self.validate(txs);
+        for tx in valid {
+            let txid = tx.txid;
+            if !parents_ready(&tx, monitor) {
+                debug!(
+                    txid = %txid,
+                    "dispatcher: deferring — at least one parent is not yet in mempool/chain",
+                );
+                continue;
+            }
+            let outcome = match self.bitcoin_client.send_transaction(&tx.tx) {
                 Ok(_) => DispatchOutcome::Success,
                 Err(e) => classify_error(&e.to_string()),
             };
             results.push((txid, outcome));
         }
-
         results
     }
 
@@ -92,15 +100,17 @@ impl Dispatcher {
 
     /// Split `txs` into those that pass the weight limit and those that don't. Oversized
     /// transactions receive a `Fatal` outcome immediately; valid ones are returned.
-    fn validate(&self, txs: Vec<Transaction>) -> (Vec<Transaction>, Vec<(Txid, DispatchOutcome)>) {
+    fn validate(
+        &self,
+        txs: Vec<CoordinatedTx>,
+    ) -> (Vec<CoordinatedTx>, Vec<(Txid, DispatchOutcome)>) {
         let mut valid = Vec::new();
         let mut failures = Vec::new();
-
         for tx in txs {
-            let weight = tx.weight().to_wu();
+            let weight = tx.tx.weight().to_wu();
             if weight > self.settings.max_tx_weight {
                 failures.push((
-                    tx.compute_txid(),
+                    tx.txid,
                     DispatchOutcome::Fatal(format!(
                         "transaction weight {} wu exceeds max {} wu",
                         weight, self.settings.max_tx_weight
@@ -110,57 +120,32 @@ impl Dispatcher {
                 valid.push(tx);
             }
         }
-
         (valid, failures)
     }
 }
 
-/// Order `txs` so that any tx whose input references another tx in the same batch
-/// appears after that referenced tx. If no input refers to another txid in the batch,
-///  returns `txs` unchanged after a  single linear scan.
-fn topological_sort(txs: Vec<Transaction>) -> Vec<Transaction> {
-    if txs.len() < 2 {
-        return txs;
-    }
-
-    let batch: HashSet<Txid> = txs.iter().map(|t| t.compute_txid()).collect();
-
-    let has_intra_batch_dep = txs.iter().any(|tx| {
-        tx.input
-            .iter()
-            .any(|i| batch.contains(&i.previous_output.txid))
-    });
-    if !has_intra_batch_dep {
-        return txs;
-    }
-
-    let mut ordered = Vec::with_capacity(txs.len());
-    let mut placed: HashSet<Txid> = HashSet::new();
-    let mut remaining = txs;
-
-    while !remaining.is_empty() {
-        let mut progressed = false;
-        let mut next = Vec::with_capacity(remaining.len());
-        for tx in remaining {
-            let deps_ready = tx.input.iter().all(|i| {
-                let prev = i.previous_output.txid;
-                !batch.contains(&prev) || placed.contains(&prev)
-            });
-            if deps_ready {
-                placed.insert(tx.compute_txid());
-                ordered.push(tx);
-                progressed = true;
-            } else {
-                next.push(tx);
+/// Return `true` when every input of `tx` references a parent that the monitor reports
+/// as in mempool / confirmed / finalized. External parents naturally satisfy this.
+fn parents_ready(tx: &CoordinatedTx, monitor: &Monitor) -> bool {
+    let max_confs = monitor.settings.max_monitoring_confirmations;
+    for input in &tx.tx.input {
+        let parent_txid = input.previous_output.txid;
+        match monitor.get_tx_status(&parent_txid, true) {
+            Ok(status) => {
+                let ready = status.is_in_mempool()
+                    || status.is_confirmed()
+                    || status.is_finalized(max_confs);
+                if !ready {
+                    return false;
+                }
+            }
+            Err(_) => {
+                // If the monitor errors on this txid, defer.
+                return false;
             }
         }
-        if !progressed {
-            ordered.extend(next);
-            break;
-        }
-        remaining = next;
     }
-    ordered
+    true
 }
 
 /// Map a raw Bitcoin RPC error message to a [`DispatchOutcome`].
@@ -173,6 +158,10 @@ fn classify_error(msg: &str) -> DispatchOutcome {
 
     if msg.contains("already in mempool") {
         return DispatchOutcome::AlreadyKnown;
+    }
+
+    if msg.contains("missing-or-spent") || msg.contains("missing-inputs") {
+        return DispatchOutcome::MissingInput(msg.to_string());
     }
 
     if msg.contains("mempool full")
@@ -193,16 +182,43 @@ fn classify_error(msg: &str) -> DispatchOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::config::DispatcherSettings, test_utils::TestBitcoind};
-    use bitcoin::{absolute::LockTime, transaction::Version, Transaction};
+    use crate::{
+        config::config::DispatcherSettings,
+        test_utils::{normal_coordinated_tx, StorageTestConfig, TestBitcoind},
+    };
+    use bitcoin::{
+        absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
+        Transaction, TxIn, TxOut, Witness,
+    };
+    use bitvmx_transaction_monitor::types::TypesToMonitor;
 
-    fn empty_tx() -> Transaction {
-        Transaction {
+    // Create a dummy CoordinatedTx
+    fn get_dummy_tx() -> CoordinatedTx {
+        normal_coordinated_tx(1)
+    }
+
+    fn get_child_tx(parent: &CoordinatedTx) -> CoordinatedTx {
+        let parent_txid = parent.txid;
+        let mut child = get_dummy_tx();
+        child.tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
-            input: vec![],
-            output: vec![],
-        }
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: parent_txid,
+                    vout: 0,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        child.txid = child.tx.compute_txid();
+        child
     }
 
     fn dispatcher(max_weight: u64) -> (Dispatcher, TestBitcoind) {
@@ -229,32 +245,10 @@ mod tests {
         )
     }
 
-    /// Build a one-input/one-output transaction spending `prev_txid:0`.
-    fn tx_spending(prev_txid: Txid, tag: u64) -> Transaction {
-        use bitcoin::{Amount, OutPoint, ScriptBuf, Sequence, TxIn, TxOut, Witness};
-        Transaction {
-            version: Version::TWO,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: OutPoint {
-                    txid: prev_txid,
-                    vout: 0,
-                },
-                script_sig: ScriptBuf::new(),
-                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(tag),
-                script_pubkey: ScriptBuf::new(),
-            }],
-        }
-    }
-
     #[test]
     fn test_valid_tx_passes_partition() {
-        let tx = empty_tx();
-        let weight = tx.weight().to_wu();
+        let tx = get_dummy_tx();
+        let weight = tx.tx.weight().to_wu();
         let (d, bitcoind) = dispatcher(weight + 100);
         let (valid, failures) = d.validate(vec![tx]);
         assert_eq!(valid.len(), 1);
@@ -266,8 +260,8 @@ mod tests {
 
     #[test]
     fn test_overweight_tx_is_fatal() {
-        let tx = empty_tx();
-        let weight = tx.weight().to_wu();
+        let tx = get_dummy_tx();
+        let weight = tx.tx.weight().to_wu();
         let (d, bitcoind) = dispatcher(weight - 1);
         let (valid, failures) = d.validate(vec![tx]);
         assert!(valid.is_empty());
@@ -280,23 +274,18 @@ mod tests {
 
     #[test]
     fn test_mixed_txs_partitioned_correctly() {
-        let tx = empty_tx();
-        let weight = tx.weight().to_wu();
+        let weight = get_dummy_tx().tx.weight().to_wu();
         let (d, bitcoind) = dispatcher(weight); // exactly at limit
 
-        let valid_tx = empty_tx();
-        let heavy_tx = empty_tx();
-
-        let d2 = dispatcher_with_client(weight - 1, Rc::clone(&d.bitcoin_client)); // slightly under limit to test both cases in one go
-        let (valid, failures) = d2.validate(vec![valid_tx, heavy_tx]);
+        // Slightly under limit → both txs fail validation as overweight.
+        let d2 = dispatcher_with_client(weight - 1, Rc::clone(&d.bitcoin_client));
+        let (valid, failures) = d2.validate(vec![get_dummy_tx(), get_dummy_tx()]);
         assert!(valid.is_empty());
         assert_eq!(failures.len(), 2);
         drop(d2);
 
-        // Now both fit exactly at the limit
-        let tx1 = empty_tx();
-        let tx2 = empty_tx();
-        let (valid, failures) = d.validate(vec![tx1, tx2]);
+        // Now both fit exactly at the limit.
+        let (valid, failures) = d.validate(vec![get_dummy_tx(), get_dummy_tx()]);
         assert_eq!(valid.len(), 2);
         assert!(failures.is_empty());
         drop(d);
@@ -306,8 +295,6 @@ mod tests {
 
     #[test]
     fn test_batch_by_weight_limits_and_splits() {
-        use crate::test_utils::normal_coordinated_tx;
-
         let p1 = normal_coordinated_tx(1);
         let p2 = normal_coordinated_tx(2);
         let p3 = normal_coordinated_tx(3);
@@ -329,12 +316,7 @@ mod tests {
         // The third parent triggers `batches.len() >= max_batches` → break.
         let three = vec![p1.clone(), p2.clone(), p3.clone()];
         let batches = d.batch_by_weight(&three, 2);
-        assert_eq!(
-            batches.len(),
-            2,
-            "batch count must not exceed max_batches"
-        );
-        // Only the first two parents (one per batch due to weight) are present.
+        assert_eq!(batches.len(), 2, "batch count must not exceed max_batches");
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[1].len(), 1);
 
@@ -342,34 +324,66 @@ mod tests {
         bitcoind.stop().unwrap();
     }
 
+    /// A tx with no inputs is trivially ready, so `parents_ready` short-circuits through the loop and returns true.
     #[test]
-    /// Topological sort orders child after parent
-    fn topological_sort_dependent() {
-        let external = Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros());
-        let parent = tx_spending(external, 1);
-        let parent_id = parent.compute_txid();
-        let child = tx_spending(parent_id, 2);
-        let child_id = child.compute_txid();
+    fn test_parents_ready_empty_inputs_is_ready() {
+        let bitcoind = TestBitcoind::default();
+        let storage_cfg = StorageTestConfig::new();
+        let monitor = bitcoind.create_monitor(storage_cfg.get_raw_storage());
+        while !monitor.is_ready().unwrap() {
+            monitor.tick().unwrap();
+        }
 
-        // Pass child first; sort must place parent before child.
-        let ordered = topological_sort(vec![child, parent]);
-        let ids: Vec<Txid> = ordered.iter().map(|t| t.compute_txid()).collect();
-        assert_eq!(ids, vec![parent_id, child_id]);
+        let tx = get_dummy_tx();
+        assert!(tx.tx.input.is_empty(), "dummy tx must have no inputs");
+        assert!(
+            parents_ready(&tx, &monitor),
+            "parents_ready must return true when there are no inputs to gate on",
+        );
+
+        drop(monitor);
+        bitcoind.stop().unwrap();
+        storage_cfg.remove().unwrap();
     }
 
+    // Test the full flow of a parent and child tx through the dispatcher.
+    // Disclaimer: the parent doesn't actually have real funding, so the dispatch will fail.
     #[test]
-    /// Topological sort preserves order between independent txs
-    fn topological_sort_independent() {
-        let external = Txid::from_raw_hash(bitcoin::hashes::Hash::all_zeros());
-        let tx_a = tx_spending(external, 1);
-        let tx_b = tx_spending(external, 2);
-        let id_a = tx_a.compute_txid();
-        let id_b = tx_b.compute_txid();
+    fn test_parents_became_ready() {
+        let storage_cfg = StorageTestConfig::new();
+        let (d, bitcoind) = dispatcher(u64::MAX);
+        let monitor = bitcoind.create_monitor(storage_cfg.get_raw_storage());
+        while !monitor.is_ready().unwrap() {
+            monitor.tick().unwrap();
+        }
+        let parent = get_dummy_tx();
+        let child = get_child_tx(&parent);
+        monitor
+            .monitor(
+                TypesToMonitor::Transactions(
+                    vec![parent.txid, child.txid],
+                    "test".to_string(),
+                    None,
+                ),
+                true,
+            )
+            .unwrap();
 
-        // Neither input refers to the other tx's txid, so the fast path returns
-        // the input order unchanged.
-        let ordered = topological_sort(vec![tx_a, tx_b]);
-        let ids: Vec<Txid> = ordered.iter().map(|t| t.compute_txid()).collect();
-        assert_eq!(ids, vec![id_a, id_b]);
+        // Initially both parent and child are not dispatched, so if we try to dispatch the child, it should be deferred.
+        let txids = d.dispatch(vec![child.clone()], &monitor);
+        assert!(
+            txids.is_empty(),
+            "child must be deferred when parent is not yet in mempool/chain",
+        );
+
+        // If both are dispatched together, only the parent should be dispatched, and the child should be deferred.
+        let txids = d.dispatch(vec![parent.clone(), child.clone()], &monitor);
+        assert_eq!(txids.len(), 1);
+        assert_eq!(txids[0].0, parent.txid);
+
+        drop(d);
+        drop(monitor);
+        bitcoind.stop().unwrap();
+        storage_cfg.remove().unwrap();
     }
 }

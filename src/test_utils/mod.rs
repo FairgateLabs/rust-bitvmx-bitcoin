@@ -121,10 +121,11 @@ pub fn cpfp_coordinated_tx(seed: u8, fee_rate: u64) -> CoordinatedTx {
     tx.kind = TxKind::Speedup(SpeedupKind::CPFP {
         parents: vec![],
         context: SpeedupContext {
-            funding_input: Utxo::new(txid, 0, 100_000, &dummy_pubkey()),
+            funding_inputs: vec![Utxo::new(txid, 0, 100_000, &dummy_pubkey())],
             replaced_by: None,
             bump_fee_used: 1.0,
             parent_data: vec![],
+            spent: false,
         },
     });
     tx.state = TransactionState::InMempool;

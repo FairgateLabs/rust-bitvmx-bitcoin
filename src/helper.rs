@@ -2,13 +2,14 @@ use crate::{
     core::dispatcher::DispatchOutcome,
     errors::BitcoinCoordinatorError,
     types::{
-        CoordinatedTx, News, SpeedupContext, SpeedupKind,
+        CoordinatedTx, FeeInfo, News, SpeedupContext, SpeedupKind,
         TransactionState::{self, *},
         TxKind,
     },
 };
-use bitcoin::Txid;
+use bitcoin::{absolute::LockTime, transaction::Version, Transaction, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
+use protocol_builder::types::Utxo;
 
 impl SpeedupKind {
     pub fn context(&self) -> &SpeedupContext {
@@ -36,6 +37,37 @@ impl SpeedupKind {
 }
 
 impl CoordinatedTx {
+    /// Build a CoordinatedTx with sane defaults: empty placeholder transaction, `TxKind::Normal`,
+    /// `Finalized` state, no timing or retry info. Useful for records that don't represent a real
+    ///  broadcast (e.g. `TxKind::Funding` wrappers).
+    pub fn new_empty() -> Self {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let txid = tx.compute_txid();
+        Self {
+            txid,
+            tx,
+            kind: TxKind::Normal,
+            state: TransactionState::Finalized,
+            target_block_height: 0,
+            confirmation_trigger: None,
+            stuck_in_mempool_blocks: None,
+            settled_block_height: None,
+            broadcast_block_height: None,
+            retry_count: 0,
+            fee_info: FeeInfo {
+                fee: 0,
+                fee_rate: 1,
+                weight: 0,
+            },
+            context: String::new(),
+        }
+    }
+
     /// Returns `&SpeedupKind` or `InvariantViolation` if this tx is not a Speedup.
     pub fn speedup_kind(&self) -> Result<&SpeedupKind, BitcoinCoordinatorError> {
         match &self.kind {
@@ -66,6 +98,26 @@ impl CoordinatedTx {
             None => Err(BitcoinCoordinatorError::InvariantViolation(format!(
                 "tx {} has no outputs",
                 self.txid
+            ))),
+        }
+    }
+
+    /// Extract the funding UTXO and its spent flag from a record that lives in the FundingList.
+    /// - `TxKind::Funding(d)` → `(d.utxo, d.spent)`.
+    /// - `TxKind::Speedup(k)` → `(last-output utxo, k.context().spent)`.
+    /// - Any other kind → `InvariantViolation`.
+    pub fn get_funding_info(&self) -> Result<(Utxo, bool), BitcoinCoordinatorError> {
+        match &self.kind {
+            TxKind::Funding(d) => Ok((d.utxo.clone(), d.spent)),
+            TxKind::Speedup(k) => {
+                let (out, vout) = self.last_output()?;
+                let pub_key = &k.context().funding_inputs[0].pub_key;
+                let utxo = Utxo::new(self.txid, vout, out.value.to_sat(), pub_key);
+                Ok((utxo, k.context().spent))
+            }
+            _ => Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "get_funding_info: tx {} is not Funding or Speedup (kind={:?})",
+                self.txid, self.kind
             ))),
         }
     }

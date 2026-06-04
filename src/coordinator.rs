@@ -55,8 +55,11 @@ impl BitcoinCoordinator {
         let bitcoin_client = Rc::new(BitcoinClient::new_from_config(rpc_config)?);
         let monitor = Monitor::new_with_paths(rpc_config, storage.clone(), Some(settings.monitor))?;
 
-        let funding_manager = FundingManager::new(settings.funding, storage.clone());
-        let coordinator_storage = CoordinatorStorage::new(storage, settings.storage);
+        // Share a single Rc<CoordinatorStorage> between EngineContext and FundingManager.
+        let coordinator_storage = Rc::new(CoordinatorStorage::new(storage, settings.storage));
+        let cs_for_funding: Rc<CoordinatorStorage> = Rc::clone(&coordinator_storage);
+        let funding_storage: Rc<dyn crate::core::funding::FundingStorage> = cs_for_funding;
+        let funding_manager = FundingManager::new(settings.funding, funding_storage);
         let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client);
         let fee_manager = FeeManager::new(settings.fee);
         let coordinator_config = settings.coordinator;
@@ -97,11 +100,11 @@ impl BitcoinCoordinator {
     ///
     /// 1. Review in-flight non-speedups; no dispatch here.
     /// 2. Review in-flight speedups; no dispatch here.
-    /// 3. Dispatch TO-DISPATCH non-speedups (parents and plain txs).
-    /// 4. Dispatch TO-DISPATCH speedups built in a previous tick (or
+    /// 3. Dispatch `ToDispatch` non-speedups (parents and plain txs).
+    /// 4. Dispatch `ToDispatch` speedups built in a previous tick (or
     ///    re-queued by step 2's not_found path).
-    /// 5. Boost the latest live speedup if stale; save TO-DISPATCH for next tick.
-    /// 6. Build one CPFP batch for pending parents; save TO-DISPATCH for next tick.
+    /// 5. Boost the latest live speedup if stale; save `ToDispatch` for next tick.
+    /// 6. Build one CPFP batch for pending parents; save `ToDispatch` for next tick.
     pub fn tick(&self) -> Result<(), BitcoinCoordinatorError> {
         self.tx_engine.ctx.monitor.tick()?;
 
