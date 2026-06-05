@@ -100,6 +100,8 @@ pub enum SpeedupKind {
     },
     RBF {
         replaces: Txid,
+        /// Funding inputs newly claimed by this RBF beyond what the replaced predecessor already consumed.
+        new_funding_inputs: Vec<Utxo>,
         context: SpeedupContext,
     },
 }

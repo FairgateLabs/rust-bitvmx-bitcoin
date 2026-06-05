@@ -1460,6 +1460,7 @@ mod tests {
         let mut failed_rbf = dummy_tx(random_txid(), TransactionState::Failed);
         failed_rbf.kind = TxKind::Speedup(SpeedupKind::RBF {
             replaces: failed_cpfp_id,
+            new_funding_inputs: vec![],
             context: SpeedupContext {
                 funding_inputs: vec![],
                 replaced_by: None,

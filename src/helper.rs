@@ -357,6 +357,7 @@ mod tests {
         };
         rbf.kind = TxKind::Speedup(SpeedupKind::RBF {
             replaces: replaced_txid,
+            new_funding_inputs: vec![],
             context,
         });
         let k = rbf.speedup_kind_mut().unwrap();

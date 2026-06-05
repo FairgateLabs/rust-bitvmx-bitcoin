@@ -275,8 +275,15 @@ impl EngineContext {
             self.funding_manager.mark_parents_unspent(tx)?;
         }
 
-        // If this is an RBF, clear the `replaced_by` flag on its predecessor so it can be re-boosted by a future boost.
-        if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
+        // If this is an RBF: release only the funding inputs this RBF newly claimed (inherited inputs stay marked
+        // because the predecessor still reserves them), and clear the `replaced_by` flag on its predecessor.
+        if let TxKind::Speedup(SpeedupKind::RBF {
+            replaces,
+            new_funding_inputs,
+            ..
+        }) = &tx.kind
+        {
+            self.funding_manager.release_marks(new_funding_inputs)?;
             if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
                 if let Ok(ctx) = replaced.speedup_kind_mut() {
                     ctx.context_mut().replaced_by = None;

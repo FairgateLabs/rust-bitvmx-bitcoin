@@ -172,7 +172,7 @@ impl SpeedupEngine {
         let current_height = self.ctx.monitor.get_monitor_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
-        let (last_txid, next_bump, use_rbf, parent_entries, rbf_initial_inputs) = {
+        let (last_txid, next_bump, use_rbf, parent_entries, rbf_initial_inputs, rbf_inherited_count) = {
             // Short-circuit if any speedup is already `ToDispatch`.
             if all_speedups
                 .iter()
@@ -231,6 +231,11 @@ impl SpeedupEngine {
             } else {
                 vec![]
             };
+            let rbf_inherited_count = if use_rbf {
+                last_context.funding_inputs.len()
+            } else {
+                0
+            };
             let rbf_initial_inputs = if use_rbf {
                 Some(last_context.funding_inputs.clone())
             } else {
@@ -243,6 +248,7 @@ impl SpeedupEngine {
                 use_rbf,
                 parent_entries,
                 rbf_initial_inputs,
+                rbf_inherited_count,
             )
         };
 
@@ -287,6 +293,7 @@ impl SpeedupEngine {
         let kind = if use_rbf {
             SpeedupKind::RBF {
                 replaces: last_txid,
+                new_funding_inputs: build_funding_inputs[rbf_inherited_count..].to_vec(),
                 context,
             }
         } else {
