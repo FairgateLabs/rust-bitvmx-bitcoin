@@ -189,7 +189,10 @@ impl TransactionEngine {
         }
 
         let txs = self.ctx.apply_retry_rate_limit(txs);
-        let results = self.ctx.dispatcher.dispatch(txs.clone(), &self.ctx.monitor);
+        let results = self
+            .ctx
+            .dispatcher
+            .dispatch(txs.clone(), &self.ctx.monitor)?;
 
         for (txid, outcome) in results {
             let tx = find_tx_in_batch(&txs, txid)?;

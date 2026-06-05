@@ -149,7 +149,7 @@ impl SpeedupEngine {
         let results = self
             .ctx
             .dispatcher
-            .dispatch(dispatchable.clone(), &self.ctx.monitor);
+            .dispatch(dispatchable.clone(), &self.ctx.monitor)?;
 
         for (txid, outcome) in results {
             if let Some(tx) = dispatchable.iter().find(|t| t.txid == txid) {
@@ -172,7 +172,14 @@ impl SpeedupEngine {
         let current_height = self.ctx.monitor.get_monitor_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
-        let (last_txid, next_bump, use_rbf, parent_entries, rbf_initial_inputs, rbf_inherited_count) = {
+        let (
+            last_txid,
+            next_bump,
+            use_rbf,
+            parent_entries,
+            rbf_initial_inputs,
+            rbf_inherited_count,
+        ) = {
             // Short-circuit if any speedup is already `ToDispatch`.
             if all_speedups
                 .iter()

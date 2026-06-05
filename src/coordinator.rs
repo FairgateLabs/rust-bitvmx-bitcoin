@@ -60,7 +60,10 @@ impl BitcoinCoordinator {
         let cs_for_funding: Rc<CoordinatorStorage> = Rc::clone(&coordinator_storage);
         let funding_storage: Rc<dyn crate::core::funding::FundingStorage> = cs_for_funding;
         let funding_manager = FundingManager::new(settings.funding, funding_storage);
-        let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client);
+        let cs_for_dispatcher: Rc<CoordinatorStorage> = Rc::clone(&coordinator_storage);
+        let dispatcher_storage: Rc<dyn crate::core::dispatcher::DispatcherStorage> =
+            cs_for_dispatcher;
+        let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client, dispatcher_storage);
         let fee_manager = FeeManager::new(settings.fee);
         let coordinator_config = settings.coordinator;
 

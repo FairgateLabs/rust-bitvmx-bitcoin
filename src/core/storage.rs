@@ -1,6 +1,6 @@
 use crate::{
     config::config::CoordinatorStorageSettings,
-    core::funding::FundingStorage,
+    core::{dispatcher::DispatcherStorage, funding::FundingStorage},
     errors::BitcoinCoordinatorError,
     types::{CoordinatedTx, CoordinatorNews, FundingData, SpeedupKind, TransactionState, TxKind},
 };
@@ -705,6 +705,20 @@ impl FundingStorage for CoordinatorStorage {
         self.storage.set(&list_key, &list, None)?;
         self.remove_speedup_from_list(tx.txid)?;
         Ok(())
+    }
+}
+
+// ================================
+// DISPATCHER STORAGE
+// ================================
+impl DispatcherStorage for CoordinatorStorage {
+    /// Funding-kind records are operator-supplied external UTXOs (must already be
+    /// confirmed per the README disclaimer). Treat them as untracked so the
+    /// dispatcher does NOT gate on them.
+    fn is_tx_known(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
+        Ok(self
+            .get_tx_by_id(*txid)?
+            .is_some_and(|tx| !matches!(tx.kind, TxKind::Funding(_))))
     }
 }
 

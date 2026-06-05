@@ -1,9 +1,15 @@
-use crate::{config::config::DispatcherSettings, types::CoordinatedTx};
+use crate::{
+    config::config::DispatcherSettings, errors::BitcoinCoordinatorError, types::CoordinatedTx,
+};
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use bitvmx_transaction_monitor::monitor::Monitor;
 use std::rc::Rc;
 use tracing::debug;
+
+pub trait DispatcherStorage {
+    fn is_tx_known(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError>;
+}
 
 /// Typed outcome returned per-transaction by [`Dispatcher::dispatch`].
 #[derive(Debug)]
@@ -26,13 +32,19 @@ pub enum DispatchOutcome {
 pub struct Dispatcher {
     settings: DispatcherSettings,
     bitcoin_client: Rc<BitcoinClient>,
+    storage: Rc<dyn DispatcherStorage>,
 }
 
 impl Dispatcher {
-    pub fn new(settings: DispatcherSettings, bitcoin_client: Rc<BitcoinClient>) -> Self {
+    pub fn new(
+        settings: DispatcherSettings,
+        bitcoin_client: Rc<BitcoinClient>,
+        storage: Rc<dyn DispatcherStorage>,
+    ) -> Self {
         Self {
             settings,
             bitcoin_client,
+            storage,
         }
     }
 
@@ -68,20 +80,21 @@ impl Dispatcher {
         batches
     }
 
-    /// Broadcast each tx whose input parents are observable in the mempool / chain via the (cached) `monitor.get_tx_status`.
-    /// Txs with at least one parent in `NotFound` / `Orphan` state are skipped.
+    /// Broadcast each tx whose coordinator-tracked input parents are in mempool / chain.
+    /// Parents the coordinator does not track are assumed ready and the broadcast proceeds;
+    /// bitcoind validates on receive.
     pub fn dispatch(
         &self,
         txs: Vec<CoordinatedTx>,
         monitor: &Monitor,
-    ) -> Vec<(Txid, DispatchOutcome)> {
+    ) -> Result<Vec<(Txid, DispatchOutcome)>, BitcoinCoordinatorError> {
         let (valid, mut results) = self.validate(txs);
         for tx in valid {
             let txid = tx.txid;
-            if !parents_ready(&tx, monitor) {
+            if !self.parents_ready(&tx, monitor)? {
                 debug!(
                     txid = %txid,
-                    "dispatcher: deferring — at least one parent is not yet in mempool/chain",
+                    "dispatcher: deferring — at least one tracked parent is not yet in mempool/chain",
                 );
                 continue;
             }
@@ -91,7 +104,32 @@ impl Dispatcher {
             };
             results.push((txid, outcome));
         }
-        results
+        Ok(results)
+    }
+
+    /// For each input of `tx`: if the parent txid is coordinator-tracked, require it to be
+    /// in mempool / confirmed / finalized; otherwise (external) assume it is on chain.
+    fn parents_ready(
+        &self,
+        tx: &CoordinatedTx,
+        monitor: &Monitor,
+    ) -> Result<bool, BitcoinCoordinatorError> {
+        let max_confs = monitor.settings.max_monitoring_confirmations;
+        for input in &tx.tx.input {
+            let parent_txid = input.previous_output.txid;
+            if !self.storage.is_tx_known(&parent_txid)? {
+                continue;
+            }
+            let status = monitor
+                .get_tx_status(&parent_txid, true)
+                .map_err(|e| BitcoinCoordinatorError::Internal(e.to_string()))?;
+            let ready =
+                status.is_in_mempool() || status.is_confirmed() || status.is_finalized(max_confs);
+            if !ready {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     // -------------------------------------------------------------------------
@@ -122,30 +160,6 @@ impl Dispatcher {
         }
         (valid, failures)
     }
-}
-
-/// Return `true` when every input of `tx` references a parent that the monitor reports
-/// as in mempool / confirmed / finalized. External parents naturally satisfy this.
-fn parents_ready(tx: &CoordinatedTx, monitor: &Monitor) -> bool {
-    let max_confs = monitor.settings.max_monitoring_confirmations;
-    for input in &tx.tx.input {
-        let parent_txid = input.previous_output.txid;
-        match monitor.get_tx_status(&parent_txid, true) {
-            Ok(status) => {
-                let ready = status.is_in_mempool()
-                    || status.is_confirmed()
-                    || status.is_finalized(max_confs);
-                if !ready {
-                    return false;
-                }
-            }
-            Err(_) => {
-                // If the monitor errors on this txid, defer.
-                return false;
-            }
-        }
-    }
-    true
 }
 
 /// Map a raw Bitcoin RPC error message to a [`DispatchOutcome`].
@@ -190,7 +204,6 @@ mod tests {
         absolute::LockTime, transaction::Version, Amount, OutPoint, ScriptBuf, Sequence,
         Transaction, TxIn, TxOut, Witness,
     };
-    use bitvmx_transaction_monitor::types::TypesToMonitor;
 
     // Create a dummy CoordinatedTx
     fn get_dummy_tx() -> CoordinatedTx {
@@ -221,27 +234,44 @@ mod tests {
         child
     }
 
+    struct AllUnknown;
+    impl DispatcherStorage for AllUnknown {
+        fn is_tx_known(&self, _txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
+            Ok(false)
+        }
+    }
+    struct AllKnown;
+    impl DispatcherStorage for AllKnown {
+        fn is_tx_known(&self, _txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
+            Ok(true)
+        }
+    }
+
     fn dispatcher(max_weight: u64) -> (Dispatcher, TestBitcoind) {
         let bitcoind = TestBitcoind::default();
         let client = Rc::new(
             BitcoinClient::new_from_config(&bitcoind.rpc_config)
                 .expect("BitcoinClient::new_from_config failed"),
         );
+        let storage: Rc<dyn DispatcherStorage> = Rc::new(AllUnknown);
         let d = Dispatcher::new(
             DispatcherSettings {
                 max_tx_weight: max_weight,
             },
             client,
+            storage,
         );
         (d, bitcoind)
     }
 
     fn dispatcher_with_client(max_weight: u64, client: Rc<BitcoinClient>) -> Dispatcher {
+        let storage: Rc<dyn DispatcherStorage> = Rc::new(AllUnknown);
         Dispatcher::new(
             DispatcherSettings {
                 max_tx_weight: max_weight,
             },
             client,
+            storage,
         )
     }
 
@@ -324,10 +354,10 @@ mod tests {
         bitcoind.stop().unwrap();
     }
 
-    /// A tx with no inputs is trivially ready, so `parents_ready` short-circuits through the loop and returns true.
+    /// A tx with no inputs is trivially ready and the dispatcher proceeds to send.
     #[test]
     fn test_parents_ready_empty_inputs_is_ready() {
-        let bitcoind = TestBitcoind::default();
+        let (d, bitcoind) = dispatcher(u64::MAX);
         let storage_cfg = StorageTestConfig::new();
         let monitor = bitcoind.create_monitor(storage_cfg.get_raw_storage());
         while !monitor.is_ready().unwrap() {
@@ -337,51 +367,65 @@ mod tests {
         let tx = get_dummy_tx();
         assert!(tx.tx.input.is_empty(), "dummy tx must have no inputs");
         assert!(
-            parents_ready(&tx, &monitor),
+            d.parents_ready(&tx, &monitor).unwrap(),
             "parents_ready must return true when there are no inputs to gate on",
         );
 
+        drop(d);
         drop(monitor);
         bitcoind.stop().unwrap();
         storage_cfg.remove().unwrap();
     }
 
-    // Test the full flow of a parent and child tx through the dispatcher.
-    // Disclaimer: the parent doesn't actually have real funding, so the dispatch will fail.
+    /// A coordinator-tracked parent that the monitor has not yet observed makes the gate
+    /// defer the child. An untracked (external) parent passes the gate.
     #[test]
-    fn test_parents_became_ready() {
+    fn test_tracked_parent_defers_child_external_passes() {
         let storage_cfg = StorageTestConfig::new();
-        let (d, bitcoind) = dispatcher(u64::MAX);
+        let bitcoind = TestBitcoind::default();
+        let client = Rc::new(
+            BitcoinClient::new_from_config(&bitcoind.rpc_config)
+                .expect("BitcoinClient::new_from_config failed"),
+        );
         let monitor = bitcoind.create_monitor(storage_cfg.get_raw_storage());
         while !monitor.is_ready().unwrap() {
             monitor.tick().unwrap();
         }
+
         let parent = get_dummy_tx();
         let child = get_child_tx(&parent);
-        monitor
-            .monitor(
-                TypesToMonitor::Transactions(
-                    vec![parent.txid, child.txid],
-                    "test".to_string(),
-                    None,
-                ),
-                true,
-            )
-            .unwrap();
 
-        // Initially both parent and child are not dispatched, so if we try to dispatch the child, it should be deferred.
-        let txids = d.dispatch(vec![child.clone()], &monitor);
+        // (a) Tracked parent + monitor knows nothing → child deferred.
+        let tracked: Rc<dyn DispatcherStorage> = Rc::new(AllKnown);
+        let d_tracked = Dispatcher::new(
+            DispatcherSettings {
+                max_tx_weight: u64::MAX,
+            },
+            Rc::clone(&client),
+            tracked,
+        );
+        let txids = d_tracked.dispatch(vec![child.clone()], &monitor).unwrap();
         assert!(
             txids.is_empty(),
-            "child must be deferred when parent is not yet in mempool/chain",
+            "child must be deferred when the tracked parent is not in mempool/chain",
         );
 
-        // If both are dispatched together, only the parent should be dispatched, and the child should be deferred.
-        let txids = d.dispatch(vec![parent.clone(), child.clone()], &monitor);
-        assert_eq!(txids.len(), 1);
-        assert_eq!(txids[0].0, parent.txid);
+        // (b) Untracked parent (treated as external) → child dispatched (send fails because
+        // the dummy tx has no real funding, so the result carries a Fatal/MissingInput outcome).
+        let untracked: Rc<dyn DispatcherStorage> = Rc::new(AllUnknown);
+        let d_untracked = Dispatcher::new(
+            DispatcherSettings {
+                max_tx_weight: u64::MAX,
+            },
+            client,
+            untracked,
+        );
+        let txids = d_untracked.dispatch(vec![child.clone()], &monitor).unwrap();
+        assert_eq!(txids.len(), 1, "external parent must let the gate pass");
+        assert_eq!(txids[0].0, child.txid);
 
-        drop(d);
+        drop(d_tracked);
+        drop(d_untracked);
         drop(monitor);
         bitcoind.stop().unwrap();
         storage_cfg.remove().unwrap();

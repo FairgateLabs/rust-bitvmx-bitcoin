@@ -68,6 +68,11 @@ flight at a time.
 > ⚠️ **`add_funding` UTXOs must be effectively final.** Only pass UTXOs whose funding transaction is
 > deep enough on-chain that you accept it as `Finalized` (i.e., no longer reorgable in practice).
 
+> ⚠️ **External (non-coordinator-tracked) parents must already be confirmed.**
+> The dispatcher only gates on tracked parents; untracked ones are assumed on-chain.
+> Registering a tx whose input references an unregistered, not-yet-confirmed tx will be
+> rejected by bitcoind with a missing-input error.
+
 > 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold.
 > To unblock: call `cancel()` to abandon tracking, or dispatch a CPFP spending one of its outputs via
 > `dispatch_without_speedup`. The coordinator tracks both and mines them together.
@@ -160,7 +165,15 @@ let status = coordinator.get_transaction(some_txid)?;
 
 Tuning constants live in `BitcoinSettings`. A sample YAML used by the test
 suite is in `config/coordinator_config.yaml`; every field is optional and falls
-back to the defaults in `src/config/settings.rs`. The main groups are:
+back to the defaults in `src/config/settings.rs`.
+
+> ⚠️ **Do not change `BitcoinSettings` values across a restart on the same
+> storage.** Several invariants (slot accounting, fee-rate state, retention
+> bounds) assume the configuration that produced the persisted state is the
+> one used to resume it. Reload the coordinator with the same settings, or
+> start from clean storage.
+
+The main groups are:
 
 - `coordinator`: retry interval and retry attempts for failed dispatches.
 - `dispatcher`: maximum allowed transaction weight.
