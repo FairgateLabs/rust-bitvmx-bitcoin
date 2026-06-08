@@ -2128,14 +2128,14 @@ fn test_rbf_combines_when_inherited_funding_insufficient() {
 
 /// Cancel use cases involving a NeedsSpeedup parent and an in-flight CPFP.
 ///
-/// Three phases exercised in one coordinator instance:
-///   A) Cancel a parent BEFORE its first tick. The parent never enters the mempool. The PSP dangling pointer is
-///      lazy-pruned on the next `create_cpfp_batch`. No CPFP is built and the funding UTXO stays unspent.
-///   B) Cancel a parent WHILE its CPFP is `ToDispatch`. The CPFP still dispatches (bitcoind keeps the parent in
-///      its mempool, because `cancel` only touches coordinator state). It progresses through InMempool → Confirmed
-///      → Finalized normally. `replace_on_finalize` installs the finalized CPFP into the FundingList as the chain tip.
-///   C) Register a fresh parent after the cancels. The coordinator state must be clean: a new CPFP builds and dispatches
-///      against the post-finalize chain tip, with no leaked spent marks or stale PSP entries blocking it.
+/// Three phases exercised in one coordinator instance, matching the new
+/// cancel contract (only Normal / NeedsSpeedup in ToDispatch is cancellable):
+///   A) Cancel a parent BEFORE its first tick — succeeds. The parent never
+///      enters the mempool, no CPFP is built, funding stays unspent, PSP self-prunes.
+///   B) Cancel a parent AFTER it has been dispatched — REFUSED. `InvalidCancel`
+///      news fires, the parent record stays in storage, normal lifecycle continues.
+///   C) Register a fresh parent post-rejection and verify the coordinator state
+///      is clean for new work.
 #[test]
 fn test_cancel_parent_edge_cases() {
     init_trace();
@@ -2199,7 +2199,7 @@ fn test_cancel_parent_edge_cases() {
     }
 
     // ---------------------------------------------------------------
-    // Phase B: cancel WHILE the CPFP is ToDispatch
+    // Phase B: cancel AFTER dispatch — REFUSED
     // ---------------------------------------------------------------
     let (parent_b, sd_b) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
@@ -2213,16 +2213,8 @@ fn test_cancel_parent_edge_cases() {
         .dispatch_with_speedup(parent_b, sd_b, ctx("cancel_b"), None, None)
         .unwrap();
 
-    // Tick 1: parent_b → InMempool, CPFP built as ToDispatch.
+    // Tick → parent_b dispatched to InMempool; CPFP built ToDispatch.
     coordinator.tick().unwrap();
-    let speedups = coord_storage.get_speedups_ordered().unwrap();
-    assert_eq!(speedups.len(), 1, "exactly one CPFP must be built");
-    let cpfp_txid = speedups[0].txid;
-    assert_eq!(
-        speedups[0].state,
-        TransactionState::ToDispatch,
-        "CPFP must still be ToDispatch on the build tick",
-    );
     assert_eq!(
         coord_storage
             .get_tx_by_id(parent_b_txid)
@@ -2233,7 +2225,7 @@ fn test_cancel_parent_edge_cases() {
         "parent_b must be InMempool after dispatch",
     );
 
-    // Cancel parent_b BEFORE the CPFP gets a chance to broadcast.
+    // Cancel attempt is refused; news emitted; tx record stays put.
     coordinator
         .cancel(TypesToMonitor::Transactions(
             vec![parent_b_txid],
@@ -2242,17 +2234,23 @@ fn test_cancel_parent_edge_cases() {
         ))
         .unwrap();
     assert!(
-        coord_storage.get_tx_by_id(parent_b_txid).unwrap().is_none(),
-        "parent_b must be removed from storage after cancel",
+        coord_storage.get_tx_by_id(parent_b_txid).unwrap().is_some(),
+        "parent_b must REMAIN in storage; cancel after dispatch is refused",
     );
-    // CPFP record retains a now-dangling reference to parent_b.txid; that is OK,
-    // nothing iterates `parents` against storage for live lookups.
-    let cpfp_after = coord_storage.get_tx_by_id(cpfp_txid).unwrap().unwrap();
-    let parents = cpfp_after.speedup_kind().unwrap().parents();
-    assert_eq!(parents.len(), 1);
-    assert_eq!(parents[0], parent_b_txid);
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.coordinator_news.iter().any(|n| matches!(
+            n,
+            CoordinatorNews::InvalidCancel { txid: id, .. } if *id == parent_b_txid
+        )),
+        "InvalidCancel news must be emitted for the rejected cancel",
+    );
+    ack_all_news(&coordinator, &news);
 
-    // Tick 2+: CPFP dispatches. Bitcoind still has parent_b in mempool, so the broadcast succeeds.
+    // The CPFP that was already built keeps progressing normally.
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 1);
+    let cpfp_txid = speedups[0].txid;
     let reached = tick_until_state(
         &coordinator,
         &coord_storage,
@@ -2261,12 +2259,9 @@ fn test_cancel_parent_edge_cases() {
         3,
     )
     .unwrap();
-    assert!(
-        reached,
-        "CPFP must reach InMempool even with its tracked parent cancelled",
-    );
+    assert!(reached, "CPFP keeps making progress despite the refused cancel");
 
-    // Drive both through Confirmed → Finalized.
+    // Mine through to Finalized so the FundingList is updated.
     mine_blocks(&setup.bitcoin_client, 2, &setup.regtest_wallet).unwrap();
     let reached = tick_until_state(
         &coordinator,
@@ -2276,23 +2271,11 @@ fn test_cancel_parent_edge_cases() {
         10,
     )
     .unwrap();
-    assert!(
-        reached,
-        "CPFP must reach Finalized despite the cancelled parent reference",
-    );
-
-    // FundingList must now hold the finalized CPFP as a Speedup-kind chain tip,
-    // and the original Funding-kind entry must have been replaced by it.
-    let records = coord_storage.read_funding_records().unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(records[0].txid, cpfp_txid);
-    assert!(matches!(records[0].kind, TxKind::Speedup(_)));
-
-    // Ack the news produced during phase B so phase C starts clean.
+    assert!(reached, "CPFP must finalize after blocks are mined");
     ack_all_news(&coordinator, &coordinator.get_news().unwrap());
 
     // ---------------------------------------------------------------
-    // Phase C: re-register a fresh parent and verify state is clean
+    // Phase C: register a fresh parent and verify the post-rejection state is clean
     // ---------------------------------------------------------------
     let (parent_c, sd_c) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
@@ -2319,14 +2302,6 @@ fn test_cancel_parent_edge_cases() {
             .state,
         TransactionState::InMempool,
         "parent_c must be InMempool after the new CPFP dispatches",
-    );
-    // The new CPFP must chain off the previous finalized CPFP's change output.
-    let cpfp_c = coord_storage.get_tx_by_id(cpfp_c_txid).unwrap().unwrap();
-    let new_inputs = &cpfp_c.speedup_kind().unwrap().context().funding_inputs;
-    assert_eq!(new_inputs.len(), 1);
-    assert_eq!(
-        new_inputs[0].txid, cpfp_txid,
-        "new CPFP must consume the previous finalized CPFP's change as its primary funding",
     );
 
     drop(coordinator);

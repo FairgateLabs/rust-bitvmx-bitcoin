@@ -74,8 +74,13 @@ flight at a time.
 > rejected by bitcoind with a missing-input error.
 
 > 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold.
-> To unblock: call `cancel()` to abandon tracking, or dispatch a CPFP spending one of its outputs via
-> `dispatch_without_speedup`. The coordinator tracks both and mines them together.
+> To unblock: dispatch a CPFP spending one of its outputs via `dispatch_without_speedup`. The
+> coordinator tracks both and mines them together.
+
+> ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in
+> `ToDispatch` are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` /
+> `Finalized` / `Failed`), or if the txid is internal (Speedup) or external (Funding /
+> unknown), the request is refused and a news item is emitted. 
 
 The `BitcoinCoordinator` struct exposes the following methods:
 
@@ -87,7 +92,7 @@ The `BitcoinCoordinator` struct exposes the following methods:
 | `dispatch` | Dispatch a tx with optional speedup support. |
 | `dispatch_without_speedup` | Dispatch a plain tx with optional stuck-in-mempool detection. |
 | `dispatch_with_speedup` | Dispatch a tx and enable CPFP/RBF speedups. |
-| `cancel` | Cancel monitoring and remove tracked txs from storage. |
+| `cancel` | Cancel monitoring + storage for txs still in `ToDispatch` (refused once dispatched). |
 | `add_funding` | Register a funding UTXO available for future speedups. |
 | `get_transaction` | Query the on-chain / mempool status of a tx. |
 | `get_news` | Retrieve all unacknowledged monitor and coordinator news. |

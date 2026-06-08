@@ -750,11 +750,10 @@ fn test_valid_and_invalid_tx() {
     setup.end_all().unwrap();
 }
 
-/// Cancelling a transaction that is already in the mempool removes it from
-/// coordinator storage and cancels monitor tracking.  Subsequent ticks do not
-/// produce any errors or spurious news for that txid.
+/// Cancel is refused once a transaction has been dispatched. The coordinator
+/// emits `InvalidCancel` news and leaves the tx tracked.
 #[test]
-fn test_cancel_dispatched_tx() {
+fn test_cancel_dispatched_tx_refused() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
@@ -778,7 +777,7 @@ fn test_cancel_dispatched_tx() {
         "tx must be InMempool before cancel"
     );
 
-    // Cancel after dispatch.
+    // Cancel after dispatch is refused.
     coordinator
         .cancel(TypesToMonitor::Transactions(
             vec![txid],
@@ -788,19 +787,17 @@ fn test_cancel_dispatched_tx() {
         .unwrap();
 
     assert!(
-        coord_storage.get_tx_by_id(txid).unwrap().is_none(),
-        "tx must be removed from storage after cancel"
+        coord_storage.get_tx_by_id(txid).unwrap().is_some(),
+        "tx must REMAIN in storage after cancel was refused"
     );
-
-    // Several subsequent ticks must not produce news related to this tx.
-    for _ in 0..10 {
-        coordinator.tick().unwrap();
-    }
     let news = coordinator.get_news().unwrap();
     assert!(
-        news.is_empty(),
-        "No coordinator news expected after cancelling a dispatched tx; got {:?}",
-        news.coordinator_news
+        news.coordinator_news.iter().any(|n| matches!(
+            n,
+            CoordinatorNews::InvalidCancel { txid: id, .. } if *id == txid
+        )),
+        "InvalidCancel news must be emitted; got {:?}",
+        news.coordinator_news,
     );
 
     drop(coordinator);

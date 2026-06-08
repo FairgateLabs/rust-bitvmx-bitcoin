@@ -159,6 +159,11 @@ pub enum CoordinatorNews {
         effective_fee_rate: u64,
         context: String,
     },
+    /// A `cancel` request was rejected. Only Normal / NeedsSpeedup txs in `ToDispatch` state are cancellable.
+    InvalidCancel {
+        txid: Txid,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
