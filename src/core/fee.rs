@@ -78,6 +78,13 @@ impl FeeManager {
         self.settings.base_fee_multiplier
     }
 
+    /// Boost-rate floor: every boost (RBF and CPFP-of-CPFP) must pay strictly more per vbyte than its predecessor.
+    /// For RBF this satisfies BIP-125 rule 6; for CPFP-of-CPFP it prevents a lower-rate child from dragging the
+    /// package's effective rate down Returns `max(network_rate, predecessor_rate + 1)`.
+    pub fn boost_fee_rate(network_rate: u64, predecessor_rate: u64) -> u64 {
+        network_rate.max(predecessor_rate.saturating_add(1))
+    }
+
     /// Compute the extra fee needed to bring all `unconfirmed_speedups` up to
     /// `new_fee_rate`, along with the total virtual size of that chain.
     pub fn chain_fee_diff(
@@ -374,5 +381,36 @@ mod tests {
         let (fee, capped) = manager_15.compute_speedup_fee(&[100], 50, 1.0, 5, false, 0);
         assert_eq!(fee, 650);
         assert!(!capped, "cap flag must be clear when final <= cap");
+    }
+
+    /// `boost_fee_rate` floors at `predecessor + 1`. When the network rate is already
+    /// higher, the network rate wins. Saturating arithmetic protects against u64::MAX.
+    #[test]
+    fn test_boost_fee_rate_floor() {
+        assert_eq!(
+            FeeManager::boost_fee_rate(5, 10),
+            11,
+            "floor wins when network below"
+        );
+        assert_eq!(
+            FeeManager::boost_fee_rate(15, 10),
+            15,
+            "network wins when above floor"
+        );
+        assert_eq!(
+            FeeManager::boost_fee_rate(11, 10),
+            11,
+            "equal-to-floor passes through"
+        );
+        assert_eq!(
+            FeeManager::boost_fee_rate(0, 0),
+            1,
+            "predecessor 0 still floors at 1"
+        );
+        assert_eq!(
+            FeeManager::boost_fee_rate(5, u64::MAX),
+            u64::MAX,
+            "saturating add prevents overflow",
+        );
     }
 }

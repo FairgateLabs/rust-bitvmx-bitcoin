@@ -18,6 +18,7 @@ use crate::{
         config::SpeedupSettings,
         settings::{CPFP_TRANSACTION_CONTEXT, RBF_TRANSACTION_CONTEXT},
     },
+    core::fee::FeeManager,
     engines::common::EngineContext,
     errors::BitcoinCoordinatorError,
     types::{
@@ -174,6 +175,7 @@ impl SpeedupEngine {
 
         let (
             last_txid,
+            last_rate,
             next_bump,
             use_rbf,
             parent_entries,
@@ -226,7 +228,7 @@ impl SpeedupEngine {
             // Decide whether to boost via RBF or CPFP, depending on how many unconfirmed speedups are currently in the mempool.
             let inmempool_count = all_speedups
                 .iter()
-                .filter(|tx| tx.state == TransactionState::InMempool)
+                .filter(|tx| is_live_in_mempool(tx))
                 .count() as u32;
             let use_rbf = inmempool_count >= self.settings.max_unconfirmed_speedups;
             let parent_entries: Vec<(SpeedupData, usize)> = if use_rbf {
@@ -251,6 +253,7 @@ impl SpeedupEngine {
 
             (
                 last.txid,
+                last.fee_info.fee_rate,
                 last_context.bump_fee_used * self.settings.bump_fee_percentage,
                 use_rbf,
                 parent_entries,
@@ -260,17 +263,28 @@ impl SpeedupEngine {
         };
 
         // Fetch the current fee rate and available funding for the boost
-        let (fee_rate, fee_news) = self
+        let (network_fee_rate, fee_news) = self
             .ctx
             .fee_manager
             .get_network_fee_rate(&self.ctx.monitor)?;
         if let Some(news) = fee_news {
             self.ctx.storage.add_news(news)?;
         }
+        // Every boost must out-pay its predecessor: floor the network rate at minimum `predecessor_rate + 1`
+        let fee_rate = FeeManager::boost_fee_rate(network_fee_rate, last_rate);
+        if fee_rate != network_fee_rate {
+            debug!(
+                network = network_fee_rate,
+                predecessor = last_rate,
+                clamped = fee_rate,
+                use_rbf = use_rbf,
+                "boost_if_stale: network rate below predecessor; CLAMPED boost rate to predecessor + 1",
+            );
+        }
 
         let unconfirmed: Vec<CoordinatedTx> = all_speedups
             .iter()
-            .filter(|tx| tx.state == TransactionState::InMempool)
+            .filter(|tx| is_live_in_mempool(tx))
             .cloned()
             .collect();
         let (chain_diff_fee, _chain_vsize) =
@@ -357,7 +371,7 @@ impl SpeedupEngine {
 
         let unconfirmed: Vec<CoordinatedTx> = all_speedups
             .iter()
-            .filter(|tx| tx.state == TransactionState::InMempool)
+            .filter(|tx| is_live_in_mempool(tx))
             .cloned()
             .collect();
         let available_slots = self
@@ -683,6 +697,13 @@ impl SpeedupEngine {
         }
         Ok(())
     }
+}
+
+/// Returns true if the tx is a speedup that is currently live in the mempool. A speedup
+/// is considered not live if it has been replaced by an RBF.
+fn is_live_in_mempool(tx: &CoordinatedTx) -> bool {
+    tx.state == TransactionState::InMempool
+        && !matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
 }
 
 fn amount_from_speedup_data(data: &SpeedupData) -> u64 {
