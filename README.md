@@ -80,7 +80,10 @@ flight at a time.
 > ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in
 > `ToDispatch` are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` /
 > `Finalized` / `Failed`), or if the txid is internal (Speedup) or external (Funding /
-> unknown), the request is refused and a news item is emitted. 
+> unknown), the request is refused and a news item is emitted.
+
+> ⚠️ **Ack news only AFTER acting on it.** News is deduplicated by value.Acking early 
+> means a second occurrence of the same event within the same block will NOT re-fire.
 
 The `BitcoinCoordinator` struct exposes the following methods:
 

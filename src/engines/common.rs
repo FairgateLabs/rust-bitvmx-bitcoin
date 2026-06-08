@@ -235,12 +235,17 @@ impl EngineContext {
             .iter()
             .filter(|s| s.state == TransactionState::ToDispatch)
         {
+            // Cascade target if EITHER (a) the speedup's primary funding input was produced
+            // by `tx` (boost-of-CPFP chain), or (b) `tx.txid` appears in the speedup's
+            // `parents` list (CPFP covering a NeedsSpeedup parent that just failed).
             let depends_on_tx = match d.speedup_kind() {
-                Ok(k) => k
-                    .context()
-                    .funding_inputs
-                    .first()
-                    .map_or(false, |fi| fi.txid == tx.txid),
+                Ok(k) => {
+                    k.context()
+                        .funding_inputs
+                        .first()
+                        .map_or(false, |fi| fi.txid == tx.txid)
+                        || k.parents().contains(&tx.txid)
+                }
                 Err(_) => false,
             };
             if depends_on_tx {

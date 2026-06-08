@@ -627,9 +627,9 @@ fn test_cpfp_fee_escalates_across_boosts() {
     // Initial CPFP (covers the NeedsSpeedup parent directly).
     let _cpfp1_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
 
-    // Drive N boost iterations. Bump escalation is 1.0 → 2.0 → 4.0 → … so with
-    // default max_feerate_sat_vb we can stack quite a few without hitting the cap.
-    let boost_iters = 5u32;
+    // Drive N boost iterations. Bump escalation (×2.0 each step) combined with the `FeeManager::boost_fee_rate`
+    // floor (predecessor + 1) compounds the effective fee rate quickly.
+    let boost_iters = 3u32;
     for i in 0..boost_iters {
         mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
         coordinator.tick().unwrap();
@@ -2259,7 +2259,10 @@ fn test_cancel_parent_edge_cases() {
         3,
     )
     .unwrap();
-    assert!(reached, "CPFP keeps making progress despite the refused cancel");
+    assert!(
+        reached,
+        "CPFP keeps making progress despite the refused cancel"
+    );
 
     // Mine through to Finalized so the FundingList is updated.
     mine_blocks(&setup.bitcoin_client, 2, &setup.regtest_wallet).unwrap();
