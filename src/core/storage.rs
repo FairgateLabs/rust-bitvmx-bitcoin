@@ -687,12 +687,22 @@ impl FundingStorage for CoordinatorStorage {
             return Ok(());
         }
 
-        // Remove (list entry + tx record) from highest to lowest index.
+        // Remove (list entry + tx record) from highest to lowest index. Emit a
+        // `TransactionEvicted` news entry for every removed record.
         for idx in to_remove_idx.iter().rev() {
             let removed_id = list.remove(*idx);
+            let removed_ctx = self
+                .get_tx_by_id(removed_id)?
+                .map(|rec| rec.context.clone());
             let tx_key = self.get_key(StoreKey::Tx(removed_id));
             self.storage.remove(&tx_key, None)?;
             self.remove_speedup_from_list(removed_id)?;
+            if let Some(ctx_str) = removed_ctx {
+                self.add_news(CoordinatorNews::TransactionEvicted {
+                    txid: removed_id,
+                    context: ctx_str,
+                })?;
+            }
         }
 
         // Insert the finalized speedup's txid at the smallest removed position.
