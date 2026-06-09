@@ -154,6 +154,7 @@ fn test_cpfp_lifecycle() {
         500_000,
     )
     .unwrap();
+    let funding_txid = funding_utxo.txid;
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
         &*key_manager,
@@ -198,21 +199,51 @@ fn test_cpfp_lifecycle() {
     );
     ack_all_news(&coordinator, &coordinator.get_news().unwrap());
 
-    // Block 2: both Finalized.
+    // Block 2: both Finalized. When the CPFP finalizes, `replace_funding_on_finalize`
+    // replaces the Funding-kind record with the finalized CPFP and must emit
+    // `TransactionEvicted` for the original funding UTXO.
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
-    let reached = tick_until_all_states(
-        &coordinator,
-        &coord_storage,
-        &[parent_txid, cpfp_txid],
-        TransactionState::Finalized,
-        10,
-    )
-    .unwrap();
+    let mut funding_evicted = false;
+    let mut reached_finalized = false;
+    for _ in 0..10 {
+        coordinator.tick().unwrap();
+        let news = coordinator.get_news().unwrap();
+        for n in &news.coordinator_news {
+            if matches!(
+                n,
+                CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == funding_txid
+            ) {
+                funding_evicted = true;
+            }
+        }
+        ack_all_news(&coordinator, &news);
+        let parent_state = coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .map(|t| t.state);
+        let cpfp_state = coord_storage
+            .get_tx_by_id(cpfp_txid)
+            .unwrap()
+            .map(|t| t.state);
+        if parent_state == Some(TransactionState::Finalized)
+            && cpfp_state == Some(TransactionState::Finalized)
+        {
+            reached_finalized = true;
+            break;
+        }
+    }
     assert!(
-        reached,
+        reached_finalized,
         "parent and CPFP must both reach Finalized after 2 blocks"
     );
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    assert!(
+        funding_evicted,
+        "TransactionEvicted news must fire for the Funding UTXO via replace_funding_on_finalize"
+    );
+    assert!(
+        coord_storage.get_tx_by_id(funding_txid).unwrap().is_none(),
+        "Funding record must be removed from storage once the CPFP finalizes"
+    );
 
     // Block 3: parent is eligible for eviction but the finalized CPFP must NOT be evicted:
     // replace_on_finalize moved it into the FundingList and the eviction guard protects it.
@@ -1353,6 +1384,200 @@ fn test_cpfp_orphan_requeue() {
         "the recovered CPFP must still cover the original parent; got parents = {:?}",
         parents
     );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Drives a NeedsSpeedup parent to `Failed` after its covering CPFP is in flight, then asserts the
+/// cascade-via-parents gate settles the CPFP too, releases its funding and re-adds protocol parents to PSP.
+/// Sequence:
+///   1. Register parent + funding, drive parent → InMempool + CPFP → InMempool.
+///   2. `expire_mempool` evicts both from bitcoind's mempool.
+///   3. Double-spend the parent's wallet UTXO via a competing raw tx, mined into a block.
+///   4. Tick → review_active flips parent ToDispatch → step 3 re-dispatches → bitcoind
+///      returns MissingInput (input already spent on-chain) → `fail_and_cascade(parent)`.
+///   5. Cascade walks ToDispatch speedups; the new gate `parents().contains(&tx.txid)`
+///      catches the CPFP (also re-queued by review_speedups) and settles it Failed.
+///   6. Verify both records are Failed and the funding UTXO is unspent again so it can be reused.
+#[test]
+fn test_parent_failure_cascades_cpfp_via_parents_gate() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        500_000,
+    )
+    .unwrap();
+    let funding_txid = funding_utxo.txid;
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+    let parent_txid = parent_tx.compute_txid();
+    let parent_input = parent_tx.input[0].previous_output;
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("parent_fail"), None, None)
+        .unwrap();
+
+    // Drive parent + CPFP to InMempool.
+    let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+    );
+
+    // Build a boost chain on top of the CPFP so the cascade walks through every descendant.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 2, "first boost must add CPFP-of-CPFP");
+    let boost_cpfp_txid = speedups[1].txid;
+    assert!(
+        !speedups[1].speedup_kind().unwrap().is_rbf(),
+        "first boost must be a CPFP (1 unconfirmed < 2)"
+    );
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        boost_cpfp_txid,
+        TransactionState::InMempool,
+        3,
+    )
+    .unwrap();
+    assert!(reached, "boost CPFP must reach InMempool");
+
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 3, "second boost must add an RBF");
+    let rbf_txid = speedups[2].txid;
+    assert!(
+        speedups[2].speedup_kind().unwrap().is_rbf(),
+        "second boost must be RBF (2 unconfirmed >= max)"
+    );
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        rbf_txid,
+        TransactionState::InMempool,
+        3,
+    )
+    .unwrap();
+    assert!(reached, "RBF must reach InMempool before the eviction");
+
+    // After RBF dispatched, its predecessor's `replaced_by` is set.
+    let predecessor = coord_storage
+        .get_tx_by_id(boost_cpfp_txid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        predecessor.speedup_kind().unwrap().context().replaced_by,
+        Some(rbf_txid),
+        "RBF dispatch must set replaced_by on its predecessor"
+    );
+
+    // Evict bitcoind's mempool (parent + every speedup gone).
+    expire_mempool(&setup.bitcoin_client, &setup.regtest_wallet).unwrap();
+
+    // Build a raw conflict tx spending the same UTXO to a fresh wallet address.
+    let conflict_addr = setup.bitcoin_client.init_wallet("test_wallet").unwrap();
+    let conflict_inputs = vec![bitcoincore_rpc::json::CreateRawTransactionInput {
+        txid: parent_input.txid,
+        vout: parent_input.vout,
+        sequence: None,
+    }];
+    let mut conflict_outputs = std::collections::HashMap::new();
+    conflict_outputs.insert(
+        format!("{}", conflict_addr),
+        bitcoin::Amount::from_sat(180_000),
+    );
+    let raw_tx = setup
+        .bitcoin_client
+        .client
+        .create_raw_transaction(&conflict_inputs, &conflict_outputs, None, None)
+        .expect("create conflict raw tx");
+    let signed = setup
+        .bitcoin_client
+        .client
+        .sign_raw_transaction_with_wallet(&raw_tx, None, None)
+        .expect("sign conflict tx");
+    assert!(signed.complete);
+    let conflict_tx: bitcoin::Transaction =
+        bitcoin::consensus::Decodable::consensus_decode(&mut &signed.hex[..])
+            .expect("decode conflict tx");
+
+    setup
+        .bitcoin_client
+        .send_transaction(&conflict_tx)
+        .expect("broadcast conflict tx");
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+
+    // Tick until both parent and CPFP settle Failed.
+    let reached = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent_txid, cpfp_txid, rbf_txid],
+        TransactionState::Failed,
+        15,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "parent, CPFP, boost CPFP, and RBF must all settle Failed after the parent double-spend is mined"
+    );
+
+    // CPFP's funding UTXO must have been released by `mark_parents_unspent`.
+    let funding_record = coord_storage.get_tx_by_id(funding_txid).unwrap().unwrap();
+    match funding_record.kind {
+        TxKind::Funding(d) => assert!(
+            !d.spent,
+            "funding mark must be released after the CPFP was cascade-failed"
+        ),
+        _ => panic!("expected Funding kind for the funding record"),
+    }
+
+    // RBF settle path: `replaced_by` on its predecessor must have been cleared by `settle_failed_dispatch`.
+    let boost_cpfp = coord_storage
+        .get_tx_by_id(boost_cpfp_txid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        boost_cpfp.speedup_kind().unwrap().context().replaced_by,
+        None,
+        "RBF cascade-fail must clear `replaced_by` on its predecessor (settle_failed_dispatch RBF branch)"
+    );
+
+    // `SpeedupDispatchError` news must have fired for the cascaded speedups.
+    let news = coordinator.get_news().unwrap();
+    for cascaded in [cpfp_txid, rbf_txid] {
+        assert!(
+            news.coordinator_news.iter().any(|n| matches!(
+                n,
+                CoordinatorNews::SpeedupDispatchError { txid, .. } if *txid == cascaded
+            )),
+            "SpeedupDispatchError news must fire for cascaded speedup {}",
+            cascaded
+        );
+    }
 
     drop(coordinator);
     drop(coord_storage);

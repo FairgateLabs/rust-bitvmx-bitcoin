@@ -174,7 +174,8 @@ fn classify_error(msg: &str) -> DispatchOutcome {
         return DispatchOutcome::AlreadyKnown;
     }
 
-    if msg.contains("missing-or-spent") || msg.contains("missing-inputs") {
+    // Bitcoind reports the policy code `bad-txns-inputs-missingorspent`. Also accept the older `missing-inputs` form.
+    if msg.contains("missingorspent") || msg.contains("missing-inputs") {
         return DispatchOutcome::MissingInput(msg.to_string());
     }
 

@@ -1,6 +1,7 @@
 mod common;
 use common::*;
 
+use bitcoin::hashes::{sha256d, Hash as _};
 use bitcoin_coordinator::{
     config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
     core::funding::FundingStorage,
@@ -750,8 +751,9 @@ fn test_valid_and_invalid_tx() {
     setup.end_all().unwrap();
 }
 
-/// Cancel is refused once a transaction has been dispatched. The coordinator
-/// emits `InvalidCancel` news and leaves the tx tracked.
+/// Cancel rejection contract: only `Normal` / `NeedsSpeedup` in `ToDispatch` are
+/// cancellable. Everything else (post-dispatch, unknown txid, `Funding`-kind) is
+/// refused with an `InvalidCancel` news entry and storage is left untouched.
 #[test]
 fn test_cancel_dispatched_tx_refused() {
     init_trace();
@@ -761,14 +763,17 @@ fn test_cancel_dispatched_tx_refused() {
 
     let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let txid = tx.compute_txid();
+    let funding = utxo(50_000);
+    let funding_txid = funding.txid;
+    let unknown_txid = bitcoin::Txid::from_raw_hash(sha256d::Hash::hash(b"unknown_for_cancel"));
 
     tick_until_ready(&coordinator).unwrap();
-
+    coordinator.add_funding(funding).unwrap();
     coordinator
         .dispatch_without_speedup(tx, ctx("cancel_after_dispatch"), None, None, None)
         .unwrap();
 
-    // Dispatch.
+    // Dispatch (Normal tx → InMempool).
     coordinator.tick().unwrap();
     let coord_storage = get_coord_storage(&setup);
     assert_eq!(
@@ -777,28 +782,46 @@ fn test_cancel_dispatched_tx_refused() {
         "tx must be InMempool before cancel"
     );
 
-    // Cancel after dispatch is refused.
+    // Batch cancel mixing all three rejection causes:
+    //   - txid:           Normal in InMempool → refused (state).
+    //   - unknown_txid:   never registered    → refused (not found).
+    //   - funding_txid:   Funding-kind        → refused (kind).
     coordinator
         .cancel(TypesToMonitor::Transactions(
-            vec![txid],
+            vec![txid, unknown_txid, funding_txid],
             ctx("cancel_after_dispatch"),
             None,
         ))
         .unwrap();
 
+    // All three records (the present ones) must remain in storage.
     assert!(
         coord_storage.get_tx_by_id(txid).unwrap().is_some(),
-        "tx must REMAIN in storage after cancel was refused"
+        "dispatched tx must REMAIN in storage after cancel was refused"
     );
-    let news = coordinator.get_news().unwrap();
     assert!(
-        news.coordinator_news.iter().any(|n| matches!(
-            n,
-            CoordinatorNews::InvalidCancel { txid: id, .. } if *id == txid
-        )),
-        "InvalidCancel news must be emitted; got {:?}",
-        news.coordinator_news,
+        coord_storage.get_tx_by_id(funding_txid).unwrap().is_some(),
+        "Funding-kind record must REMAIN in storage after cancel was refused"
     );
+
+    // One InvalidCancel news per refused entry.
+    let news = coordinator.get_news().unwrap();
+    let rejected: Vec<bitcoin::Txid> = news
+        .coordinator_news
+        .iter()
+        .filter_map(|n| match n {
+            CoordinatorNews::InvalidCancel { txid, .. } => Some(*txid),
+            _ => None,
+        })
+        .collect();
+    for expected in [&txid, &unknown_txid, &funding_txid] {
+        assert!(
+            rejected.contains(expected),
+            "InvalidCancel news must include {} (got {:?})",
+            expected,
+            rejected,
+        );
+    }
 
     drop(coordinator);
     drop(coord_storage);
