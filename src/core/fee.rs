@@ -252,15 +252,17 @@ mod tests {
             fee_rate, 10,
             "fee rate must be clamped to max_feerate_sat_vb"
         );
-        let Some(CoordinatorNews::EstimateFeerateTooHigh {
-            max_fee_rate: 10, ..
-        }) = news
-        else {
-            panic!(
-                "EstimateFeerateTooHigh must be emitted when clamping; got {:?}",
-                news
-            );
-        };
+        assert!(
+            matches!(
+                news,
+                Some(CoordinatorNews::EstimateFeerateTooHigh {
+                    max_fee_rate: 10,
+                    ..
+                })
+            ),
+            "EstimateFeerateTooHigh must be emitted when clamping; got {:?}",
+            news
+        );
 
         drop(monitor);
         storage.remove().unwrap();

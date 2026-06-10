@@ -242,6 +242,15 @@ mod tests {
     }
 
     #[test]
+    fn test_load_config_missing_file_returns_invalid_configuration() {
+        let err = Config::load_config("config/does_not_exist.yaml").unwrap_err();
+        assert!(matches!(
+            err,
+            BitcoinCoordinatorError::InvalidConfiguration(_)
+        ));
+    }
+
+    #[test]
     fn test_validate_rejects_invalid_settings() {
         fn check(s: BitcoinSettings) {
             let err = s.validate().unwrap_err();

@@ -442,6 +442,167 @@ fn test_cpfp_no_funding() {
     setup.end_all().unwrap();
 }
 
+/// Two related fee-cap paths::
+/// Phase A — `MaxFeeRateReached` from a fresh CPFP: Settings have `min_safe_fee_rate` close to `max_feerate_sat_vb`,
+/// so the first CPFP's computed fee exceeds the cap and `compute_speedup_fee` clamps it.
+/// Phase B — `InsufficientFunds` from a Speedup-derived primary that cannot combine: after CPFP1 finalizes-into-mempool,
+/// its tiny change becomes the only Speedup-derived chain tip. A new parent's CPFP build picks that tip as the primary input.
+/// The capped fee still exceeds available, combine is attempted but `get_combine_funding`  returns `None`.
+#[test]
+fn test_cpfp_capped_then_insufficient_funding_emit_news() {
+    init_trace();
+
+    // min_safe_fee_rate > max/2 → first CPFP's final_fee exceeds the cap (`compute_speedup_fee` formula:
+    //(parent_vsize+child_vsize)*fee_rate vs max*child_vsize) on a ~1-in/1-out CPFP package.
+    let settings = BitcoinSettings {
+        fee: FeeSettings {
+            min_safe_fee_rate: 80,
+            max_feerate_sat_vb: 100,
+            base_fee_multiplier: 1.0,
+        },
+        ..cpfp_settings()
+    };
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings);
+    let coord_storage = get_coord_storage(&setup);
+
+    // ─── Phase A: fresh CPFP build is capped → MaxFeeRateReached ───────────
+    // Funding sized just above the cap so the build succeeds but `capped == true`.
+    let funding_a = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        20_000,
+    )
+    .unwrap();
+    let (parent1_tx, speedup_data1) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000,
+    )
+    .unwrap();
+    let parent1_txid = parent1_tx.compute_txid();
+
+    // Sync the indexer past the fund_address-mined blocks so the first tick after dispatch can actually build the CPFP.
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_a.clone()).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent1_tx, speedup_data1, ctx("capped_path"), None, None)
+        .unwrap();
+
+    // Drive ticks until CPFP1 is built and reaches InMempool.
+    let cpfp1_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 5);
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        parent1_txid,
+        TransactionState::InMempool,
+        5,
+    )
+    .unwrap();
+    assert!(reached, "parent1 must reach InMempool");
+
+    let cpfp1 = coord_storage.get_tx_by_id(cpfp1_txid).unwrap().unwrap();
+    let max_rate = 100u64;
+    assert_eq!(
+        cpfp1.fee_info.fee_rate, max_rate,
+        "capped CPFP's effective rate must equal max_feerate_sat_vb",
+    );
+
+    let news_a = coordinator.get_news().unwrap();
+    let cap_news = news_a
+        .coordinator_news
+        .iter()
+        .find(|n| {
+            matches!(
+                n,
+                CoordinatorNews::MaxFeeRateReached { txid, .. } if *txid == cpfp1_txid,
+            )
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "MaxFeeRateReached must be emitted against CPFP1 ({}); got {:?}",
+                cpfp1_txid, news_a.coordinator_news,
+            )
+        });
+    if let CoordinatorNews::MaxFeeRateReached {
+        effective_fee_rate, ..
+    } = cap_news
+    {
+        assert_eq!(
+            *effective_fee_rate, max_rate,
+            "MaxFeeRateReached must carry the cap-clamped effective rate",
+        );
+    }
+
+    // Ack everything so Phase B's news assertion is not ambiguous.
+    ack_all_news(&coordinator, &news_a);
+
+    // ─── Phase B: Speedup-derived primary, combine returns None → InsufficientFunds ─
+    // CPFP1's leftover change is now the Speedup-derived chain tip. Its amount cannot cover another capped CPFP fee.
+    let (parent2_tx, speedup_data2) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000,
+    )
+    .unwrap();
+    let parent2_txid = parent2_tx.compute_txid();
+    coordinator
+        .dispatch_with_speedup(
+            parent2_tx,
+            speedup_data2,
+            ctx("insufficient_path"),
+            None,
+            None,
+        )
+        .unwrap();
+
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        parent2_txid,
+        TransactionState::InMempool,
+        10,
+    )
+    .unwrap();
+    assert!(reached, "parent2 must reach InMempool");
+    assert_eq!(
+        coord_storage.get_speedups_ordered().unwrap().len(),
+        1,
+        "no second CPFP must be created when the chain tip + combine cannot cover the fee",
+    );
+
+    let news_b = coordinator.get_news().unwrap();
+    let cpfp1_leftover = cpfp1.speedup_kind().unwrap().context().funding_inputs[0]
+        .amount
+        .saturating_sub(cpfp1.fee_info.fee);
+    assert!(
+        news_b.coordinator_news.iter().any(|n| matches!(
+            n,
+            CoordinatorNews::InsufficientFunds { available, required }
+                if *available <= cpfp1_leftover && *required > *available,
+        )),
+        "expected InsufficientFunds with available<=cpfp1_leftover ({}) and required>available; got {:?}",
+        cpfp1_leftover,
+        news_b.coordinator_news,
+    );
+
+    // release_marks must have reset the Speedup-kind chain tip's spent flag.
+    let cpfp1_after = coord_storage.get_tx_by_id(cpfp1_txid).unwrap().unwrap();
+    assert!(
+        !cpfp1_after.speedup_kind().unwrap().context().spent,
+        "release_marks must reset the Speedup-derived primary's spent flag",
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
 /// After one confirming block is invalidated, the coordinator detects the reorg
 /// and resets both the parent and its CPFP from Confirmed back to InMempool.
 #[test]

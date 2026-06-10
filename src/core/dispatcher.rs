@@ -361,9 +361,6 @@ mod tests {
         let (d, bitcoind) = dispatcher(u64::MAX);
         let storage_cfg = StorageTestConfig::new();
         let monitor = bitcoind.create_monitor(storage_cfg.get_raw_storage());
-        while !monitor.is_ready().unwrap() {
-            monitor.tick().unwrap();
-        }
 
         let tx = get_dummy_tx();
         assert!(tx.tx.input.is_empty(), "dummy tx must have no inputs");
@@ -389,9 +386,6 @@ mod tests {
                 .expect("BitcoinClient::new_from_config failed"),
         );
         let monitor = bitcoind.create_monitor(storage_cfg.get_raw_storage());
-        while !monitor.is_ready().unwrap() {
-            monitor.tick().unwrap();
-        }
 
         let parent = get_dummy_tx();
         let child = get_child_tx(&parent);
