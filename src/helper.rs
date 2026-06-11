@@ -184,8 +184,8 @@ impl TransactionState {
             (Confirmed, Finalized) => true,
 
             // Crash recovery: tx already on-chain when we restart
-            (ToDispatch, Confirmed) => true, // dispatched but crash before InMempool record or someone else broadcast the tx
-            (ToDispatch, Finalized) => true, // dispatched but crash before Confirmed record or someone else broadcast the tx
+            (ToDispatch, Confirmed) => true, // crash before InMempool record, or a confirmed tx transiently re-queued to ToDispatch found confirmed on resend
+            (ToDispatch, Finalized) => true, // crash before Confirmed record, or a confirmed tx transiently re-queued to ToDispatch found finalized on resend
             (InMempool, Finalized) => true,  // confirmed so fast we never saw Confirmed
 
             // Requeue after not-found in mempool

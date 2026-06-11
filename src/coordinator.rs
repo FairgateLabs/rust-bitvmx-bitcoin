@@ -2,7 +2,9 @@ use std::rc::Rc;
 
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::{
-    bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
+    bitcoin_client::{BitcoinClient, BitcoinClientApi},
+    rpc_config::RpcConfig,
+    types::BlockHeight,
 };
 use bitvmx_transaction_monitor::{
     monitor::Monitor,
@@ -53,6 +55,14 @@ impl BitcoinCoordinator {
         settings.validate()?;
 
         let bitcoin_client = Rc::new(BitcoinClient::new_from_config(rpc_config)?);
+
+        // Fail fast if it is off.
+        if !bitcoin_client.is_txindex_enabled()? {
+            return Err(BitcoinCoordinatorError::InvalidConfiguration(
+                "the Bitcoin node must run with -txindex=1".to_string(),
+            ));
+        }
+
         let monitor = Monitor::new_with_paths(rpc_config, storage.clone(), Some(settings.monitor))?;
 
         // Share a single Rc<CoordinatorStorage> between EngineContext and FundingManager.

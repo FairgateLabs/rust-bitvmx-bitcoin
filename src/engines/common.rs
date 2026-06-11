@@ -1,8 +1,8 @@
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor};
-use std::cell::Cell;
 use std::rc::Rc;
+use std::{cell::Cell, collections::HashSet};
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -52,29 +52,6 @@ impl EngineContext {
             coordinator_config,
             last_retry_at: Cell::new(None),
         }
-    }
-
-    /// Transition a successfully-dispatched tx to `InMempool` and enable monitor mempool search.
-    pub fn mark_dispatched(
-        &self,
-        tx: &CoordinatedTx,
-        current_height: BlockHeight,
-        fee_info: FeeInfo,
-    ) -> Result<(), BitcoinCoordinatorError> {
-        let mut updated = tx.clone();
-        updated.state = TransactionState::InMempool;
-        updated.broadcast_block_height = Some(current_height);
-        updated.fee_info = fee_info;
-        self.storage.update_tx(&updated)?;
-        self.monitor.monitor(
-            TypesToMonitor::Transactions(
-                vec![tx.txid],
-                tx.context.clone(),
-                tx.confirmation_trigger,
-            ),
-            true,
-        )?;
-        Ok(())
     }
 
     /// Reorg detected: a `Confirmed` tx reappeared in the mempool.
@@ -157,62 +134,147 @@ impl EngineContext {
     ) -> Result<(), BitcoinCoordinatorError> {
         tx.verify_tx_id(txid)?; // sanity check
         match outcome {
-            DispatchOutcome::Success | DispatchOutcome::AlreadyKnown => {
-                if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
-                    if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
-                        replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
-                        self.storage.update_tx(&replaced)?;
-                    }
-                }
-                self.mark_dispatched(tx, current_height, fee_info)?;
-                info!(
-                    "Transaction({}) dispatched at block height {}",
-                    txid, current_height
-                );
-            }
-            DispatchOutcome::AlreadyConfirmed => {
-                // If an RBF lands directly on-chain, mark the predecessor as replaced.
-                if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
-                    if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
-                        replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
-                        self.storage.update_tx(&replaced)?;
-                    }
-                }
-                debug!("Transaction({}) already confirmed on-chain", txid);
-                self.mark_confirmed(txid)?;
-            }
-            DispatchOutcome::Retryable(msg) => {
-                if tx.retry_count + 1 >= self.coordinator_config.retry_attempts_sending_tx {
-                    warn!(
-                        "Transaction({}) failed after {} attempts: {}",
-                        txid,
-                        tx.retry_count + 1,
-                        msg
-                    );
-                    self.fail_and_cascade(tx, current_height, false)?;
-                } else {
-                    debug!(
-                        "Transaction({}) dispatch failed (attempt {}/{}), will retry: {}",
-                        txid,
-                        tx.retry_count + 1,
-                        self.coordinator_config.retry_attempts_sending_tx,
-                        msg
-                    );
-                    self.storage.mark_as_retry(txid)?;
-                }
+            DispatchOutcome::Success => {
+                self.mark_accepted(tx, txid, current_height, fee_info)?;
             }
             DispatchOutcome::Fatal(msg) => {
+                // Deterministic pre-send rejection (e.g. oversize). No node probe needed.
                 warn!("Transaction({}) fatal dispatch error: {}", txid, msg);
                 self.fail_and_cascade(tx, current_height, false)?;
             }
-            DispatchOutcome::MissingInput(msg) => {
-                warn!(
-                    "Transaction({}) missing-input dispatch error: {}",
-                    txid, msg
-                );
-                let funding_missing = self.is_funding_input_missing(tx)?;
-                self.fail_and_cascade(tx, current_height, funding_missing)?;
+            DispatchOutcome::DispatchError(raw) => {
+                self.classify_dispatch_error(tx, txid, &raw, current_height, fee_info)?;
             }
+        }
+        Ok(())
+    }
+
+    /// Settle a tx the node accepted (dispatch `Success`) or already had in its mempool.
+    /// For an RBF, mark its predecessor `replaced_by`.
+    fn mark_accepted(
+        &self,
+        tx: &CoordinatedTx,
+        txid: Txid,
+        current_height: BlockHeight,
+        fee_info: FeeInfo,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
+            if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
+                replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
+                self.storage.update_tx(&replaced)?;
+            }
+        }
+
+        let mut updated = tx.clone();
+        updated.state = TransactionState::InMempool;
+        updated.broadcast_block_height = Some(current_height);
+        updated.fee_info = fee_info;
+        self.storage.update_tx(&updated)?;
+
+        self.monitor.monitor(
+            TypesToMonitor::Transactions(vec![txid], tx.context.clone(), tx.confirmation_trigger),
+            true,
+        )?;
+        info!(
+            "Transaction({}) dispatched at block height {}",
+            txid, current_height
+        );
+        Ok(())
+    }
+
+    /// Settle a tx the node reports already confirmed on-chain. For an RBF landing directly on-chain,
+    /// mark its predecessor `replaced_by`. State is capped at `Confirmed`. Preserve the original
+    /// broadcast height.
+    fn mark_already_confirmed(
+        &self,
+        tx: &CoordinatedTx,
+        txid: Txid,
+        current_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
+            if let Some(mut replaced) = self.storage.get_tx_by_id(*replaces)? {
+                replaced.speedup_kind_mut()?.context_mut().replaced_by = Some(txid);
+                self.storage.update_tx(&replaced)?;
+            }
+        }
+
+        let mut updated = tx.clone();
+        updated.broadcast_block_height.get_or_insert(current_height); // only if missing
+        updated.state = TransactionState::Confirmed;
+        self.storage.update_tx(&updated)?;
+
+        self.monitor.monitor(
+            TypesToMonitor::Transactions(vec![txid], tx.context.clone(), tx.confirmation_trigger),
+            true,
+        )?;
+        debug!("Transaction({}) already confirmed on-chain", txid);
+        Ok(())
+    }
+
+    /// Classify a raw broadcast failure by querying node state over RPC. Order:
+    ///   1. Node already has the tx:
+    ///        Some(0)    → in mempool        → accept (InMempool).
+    ///        Some(n>=1) → confirmed         → Confirmed (review finalizes by depth).
+    ///   2. None (absent): inspect inputs. A funding input gone → recreate; an external/parent input gone → fail.
+    ///   3. Inputs intact, cause unknown (fee/policy/transient): retry until the budget is spent.
+    fn classify_dispatch_error(
+        &self,
+        tx: &CoordinatedTx,
+        txid: Txid,
+        raw: &str,
+        current_height: BlockHeight,
+        fee_info: FeeInfo,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        // Step 1 — does the node already have this tx (mempool or chain)?
+        match self.monitor.get_tx_confirmations(&txid)? {
+            Some(0) => {
+                debug!(
+                    "Transaction({}) already in node mempool; treating as dispatched: {}",
+                    txid, raw
+                );
+                return self.mark_accepted(tx, txid, current_height, fee_info);
+            }
+            Some(_) => {
+                return self.mark_already_confirmed(tx, txid, current_height);
+            }
+            None => {}
+        }
+
+        // Step 2 — tx is absent from the node, so it is NOT mined. A missing/spent input is therefore
+        // definitive: funding gone → recreate; external/parent gone → fail.
+        if let Some(funding_missing) = self.missing_input_kind(tx)? {
+            if funding_missing {
+                warn!(
+                    "Transaction({}) funding input missing/spent; settling Failed to recreate: {}",
+                    txid, raw
+                );
+            } else {
+                warn!(
+                    "Transaction({}) external input missing/spent; settling Failed: {}",
+                    txid, raw
+                );
+            }
+            return self.fail_and_cascade(tx, current_height, funding_missing);
+        }
+
+        // Step 3 — inputs intact, cause unknown. Retry until the budget is spent, then fail.
+        if tx.retry_count + 1 >= self.coordinator_config.retry_attempts_sending_tx {
+            warn!(
+                "Transaction({}) failed after {} attempts: {}",
+                txid,
+                tx.retry_count + 1,
+                raw
+            );
+            self.fail_and_cascade(tx, current_height, false)?;
+        } else {
+            debug!(
+                "Transaction({}) dispatch failed (attempt {}/{}), will retry: {}",
+                txid,
+                tx.retry_count + 1,
+                self.coordinator_config.retry_attempts_sending_tx,
+                raw
+            );
+            self.storage.mark_as_retry(txid)?;
         }
         Ok(())
     }
@@ -304,23 +366,43 @@ impl EngineContext {
         Ok(())
     }
 
-    // Check if any funding input is missing from the mempool.
-    fn is_funding_input_missing(
+    /// Probe the node for a missing/spent input of `tx`. Returns:
+    ///   * `Some(true)`  — a coordinator *funding* input is gone → recoverable (recreate funding).
+    ///   * `Some(false)` — a non-funding/external (parent) input is gone → fatal.
+    ///   * `None`        — every input still unspent → transient failure (fee/policy) → retry.
+    fn missing_input_kind(
         &self,
         tx: &CoordinatedTx,
-    ) -> Result<bool, BitcoinCoordinatorError> {
-        let k = match tx.speedup_kind() {
-            Ok(k) => k,
-            Err(_) => return Ok(false),
+    ) -> Result<Option<bool>, BitcoinCoordinatorError> {
+        let funding: HashSet<(Txid, u32)> = match tx.speedup_kind() {
+            Ok(k) => k
+                .context()
+                .funding_inputs
+                .iter()
+                .map(|u| (u.txid, u.vout))
+                .collect(),
+            Err(_) => HashSet::new(),
         };
-        for fi in &k.context().funding_inputs {
-            // Check in real-time on the mempool.
-            let unspent = self.monitor.is_utxo_unspent_rpc(&fi.txid, fi.vout)?;
-            if !unspent {
-                return Ok(true);
+
+        // Funding inputs first — a gone funding UTXO is recoverable.
+        for (txid, vout) in &funding {
+            if !self.monitor.is_utxo_unspent_rpc(txid, *vout, true)? {
+                return Ok(Some(true));
             }
         }
-        Ok(false)
+
+        // Remaining (external / parent) inputs — a gone one is fatal for this tx.
+        for input in &tx.tx.input {
+            let op = (input.previous_output.txid, input.previous_output.vout);
+            if funding.contains(&op) {
+                continue;
+            }
+            if !self.monitor.is_utxo_unspent_rpc(&op.0, op.1, true)? {
+                return Ok(Some(false));
+            }
+        }
+
+        Ok(None)
     }
 
     fn dispatch_error_news(tx: &CoordinatedTx, txid: Txid) -> CoordinatorNews {

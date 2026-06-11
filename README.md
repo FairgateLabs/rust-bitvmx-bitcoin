@@ -199,6 +199,7 @@ Prerequisites:
 
 - Rust
 - Docker, used by integration tests
+- A Bitcoin node running with `-txindex=1`
 
 Common commands:
 

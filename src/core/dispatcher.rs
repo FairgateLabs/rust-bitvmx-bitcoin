@@ -11,22 +11,19 @@ pub trait DispatcherStorage {
     fn is_tx_known(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError>;
 }
 
-/// Typed outcome returned per-transaction by [`Dispatcher::dispatch`].
+/// Raw per-transaction outcome returned by [`Dispatcher::dispatch`].
+///
+/// The dispatcher does not interpret node error strings. A failed broadcast is reported
+/// verbatim as [`DispatchOutcome::DispatchError`]; the engine classifies it authoritatively
+/// by probing node state over RPC (see `EngineContext::handle_dispatch_result`).
 #[derive(Debug)]
 pub enum DispatchOutcome {
     /// Transaction accepted by the node.
     Success,
-    /// Node already has the transaction in the mempool.
-    AlreadyKnown,
-    /// Transaction is already confirmed on-chain (outputs already in UTXO set).
-    /// This is definitive: no indexer query needed.
-    AlreadyConfirmed,
-    /// Transient error (fee/mempool policy, network). Coordinator may retry.
-    Retryable(String),
-    /// Permanent error (e.g. transaction too heavy, script invalid). Mark as failed.
+    /// Pre-send validation failure (e.g. transaction weight exceeds the configured max).
     Fatal(String),
-    /// `bad-txns-inputs-missingorspent`: at least one input is gone or spent from the UTXO set / mempool.
-    MissingInput(String),
+    /// Broadcast returned an error. The raw node message is carried unparsed.
+    DispatchError(String),
 }
 
 pub struct Dispatcher {
@@ -100,7 +97,7 @@ impl Dispatcher {
             }
             let outcome = match self.bitcoin_client.send_transaction(&tx.tx) {
                 Ok(_) => DispatchOutcome::Success,
-                Err(e) => classify_error(&e.to_string()),
+                Err(e) => DispatchOutcome::DispatchError(e.to_string()),
             };
             results.push((txid, outcome));
         }
@@ -136,8 +133,11 @@ impl Dispatcher {
     // Private helpers
     // -------------------------------------------------------------------------
 
-    /// Split `txs` into those that pass the weight limit and those that don't. Oversized
-    /// transactions receive a `Fatal` outcome immediately; valid ones are returned.
+    /// Split `txs` into those that pass structural pre-send checks and those that don't.
+    /// Deterministically-invalid transactions receive a `Fatal` outcome immediately. Valid
+    /// ones are returned. Two checks, both decidable from the tx alone:
+    ///   - oversized (weight exceeds `max_tx_weight`);
+    ///   - zero inputs — a tx with no inputs can never be valid.
     fn validate(
         &self,
         txs: Vec<CoordinatedTx>,
@@ -145,6 +145,13 @@ impl Dispatcher {
         let mut valid = Vec::new();
         let mut failures = Vec::new();
         for tx in txs {
+            if tx.tx.input.is_empty() {
+                failures.push((
+                    tx.txid,
+                    DispatchOutcome::Fatal("transaction has no inputs".to_string()),
+                ));
+                continue;
+            }
             let weight = tx.tx.weight().to_wu();
             if weight > self.settings.max_tx_weight {
                 failures.push((
@@ -160,38 +167,6 @@ impl Dispatcher {
         }
         (valid, failures)
     }
-}
-
-/// Map a raw Bitcoin RPC error message to a [`DispatchOutcome`].
-fn classify_error(msg: &str) -> DispatchOutcome {
-    if msg.contains("Transaction outputs already in utxo set")
-        || msg.contains("already in block chain")
-    {
-        return DispatchOutcome::AlreadyConfirmed;
-    }
-
-    if msg.contains("already in mempool") {
-        return DispatchOutcome::AlreadyKnown;
-    }
-
-    // Bitcoind reports the policy code `bad-txns-inputs-missingorspent`. Also accept the older `missing-inputs` form.
-    if msg.contains("missingorspent") || msg.contains("missing-inputs") {
-        return DispatchOutcome::MissingInput(msg.to_string());
-    }
-
-    if msg.contains("mempool full")
-        || msg.contains("insufficient priority")
-        || msg.contains("min relay fee")
-        || msg.contains("mempool min fee not met")
-        || msg.contains("too-long-mempool-chain")
-        || msg.contains("network")
-        || msg.contains("connection")
-        || msg.contains("timeout")
-    {
-        return DispatchOutcome::Retryable(msg.to_string());
-    }
-
-    DispatchOutcome::Fatal(msg.to_string())
 }
 
 #[cfg(test)]
@@ -233,6 +208,31 @@ mod tests {
         };
         child.txid = child.tx.compute_txid();
         child
+    }
+
+    /// A dummy `CoordinatedTx` carrying a single input, so it passes the structural validity check in `validate`.
+    fn tx_with_input(seed: u8) -> CoordinatedTx {
+        let mut tx = get_dummy_tx();
+        let base_txid = tx.txid;
+        tx.tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint {
+                    txid: base_txid,
+                    vout: seed as u32,
+                },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(1),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+        tx.txid = tx.tx.compute_txid();
+        tx
     }
 
     struct AllUnknown;
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_valid_tx_passes_partition() {
-        let tx = get_dummy_tx();
+        let tx = tx_with_input(1);
         let weight = tx.tx.weight().to_wu();
         let (d, bitcoind) = dispatcher(weight + 100);
         let (valid, failures) = d.validate(vec![tx]);
@@ -305,18 +305,18 @@ mod tests {
 
     #[test]
     fn test_mixed_txs_partitioned_correctly() {
-        let weight = get_dummy_tx().tx.weight().to_wu();
+        let weight = tx_with_input(1).tx.weight().to_wu();
         let (d, bitcoind) = dispatcher(weight); // exactly at limit
 
         // Slightly under limit → both txs fail validation as overweight.
         let d2 = dispatcher_with_client(weight - 1, Rc::clone(&d.bitcoin_client));
-        let (valid, failures) = d2.validate(vec![get_dummy_tx(), get_dummy_tx()]);
+        let (valid, failures) = d2.validate(vec![tx_with_input(1), tx_with_input(2)]);
         assert!(valid.is_empty());
         assert_eq!(failures.len(), 2);
         drop(d2);
 
         // Now both fit exactly at the limit.
-        let (valid, failures) = d.validate(vec![get_dummy_tx(), get_dummy_tx()]);
+        let (valid, failures) = d.validate(vec![tx_with_input(1), tx_with_input(2)]);
         assert_eq!(valid.len(), 2);
         assert!(failures.is_empty());
         drop(d);
@@ -406,7 +406,7 @@ mod tests {
         );
 
         // (b) Untracked parent (treated as external) → child dispatched (send fails because
-        // the dummy tx has no real funding, so the result carries a Fatal/MissingInput outcome).
+        // the dummy tx has no real funding, so the result carries a DispatchError outcome).
         let untracked: Rc<dyn DispatcherStorage> = Rc::new(AllUnknown);
         let d_untracked = Dispatcher::new(
             DispatcherSettings {
