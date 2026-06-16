@@ -85,7 +85,7 @@ impl FundingManager {
                 continue;
             }
             let ctx = tx.speedup_kind()?.context();
-            if ctx.is_being_replaced() || ctx.spent {
+            if tx.has_live_replacement(speedups) || ctx.spent {
                 continue;
             }
             let (utxo, _spent) = tx.get_funding_info()?;
@@ -483,7 +483,10 @@ mod tests {
         let (sole, is_speedup) = get_funding(&mgr, &storage).unwrap();
         assert!(!is_speedup);
         let combine = mgr.get_combine_funding().unwrap();
-        assert!(combine.is_none(), "no second entry means no combine partner");
+        assert!(
+            combine.is_none(),
+            "no second entry means no combine partner"
+        );
         assert!(
             funding_spent(&storage, sole.txid),
             "primary stays spent on combine None — caller owns the release"

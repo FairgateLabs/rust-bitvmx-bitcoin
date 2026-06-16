@@ -213,6 +213,19 @@ impl TransactionState {
 }
 
 impl CoordinatedTx {
+    /// True when this speedup is being replaced by an RBF. Two signals, because they are written at different times:
+    ///   (a) `replaced_by` is set — written only when the RBF is *dispatched*
+    ///       (`mark_accepted` / `mark_already_confirmed`).
+    ///   (b) a live (`state != Failed`) RBF record whose `replaces == self.txid` exists. Set at
+    ///       RBF build time, before (a), and survives a restart where (a) was not yet written.
+    pub fn has_live_replacement(&self, all_speedups: &[CoordinatedTx]) -> bool {
+        matches!(&self.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
+            || all_speedups.iter().any(|s| {
+                s.state != TransactionState::Failed
+                    && matches!(&s.kind, TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) if *replaces == self.txid)
+            })
+    }
+
     /// Returns `true` when the transaction is due to be dispatched at `current_height`.
     pub fn is_ready_to_dispatch(&self, current_height: BlockHeight) -> bool {
         current_height >= self.target_block_height

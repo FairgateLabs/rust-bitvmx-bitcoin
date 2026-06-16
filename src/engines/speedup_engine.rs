@@ -88,17 +88,10 @@ impl SpeedupEngine {
 
             // Tx is neither in mempool nor on chain.
             if status.is_not_found() {
-                // A speedup we deliberately replaced (RBF) must not be re-queued or guarded. Two signals:
-                //   (a) `replaced_by` is set.
-                //   (b) a live RBF record whose `replaces == tx.txid` exists in the coordinator (`replaced_by`
-                //       is not enough because it is only set after the replacement is built, and may be lost
-                //       during a restart).
-                let being_replaced = matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
-                    || all_speedups.iter().any(|s| {
-                        s.state != TransactionState::Failed
-                            && matches!(&s.kind, TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) if *replaces == tx.txid)
-                    });
-                if being_replaced {
+                // A speedup we deliberately replaced (RBF) must not be re-queued or guarded; its
+                // disappearance is the intended local swap, not a reorg flap. See
+                // `CoordinatedTx::has_live_replacement` for why both signals are needed.
+                if tx.has_live_replacement(&all_speedups) {
                     continue;
                 }
                 // Otherwise re-queue the same tx for dispatch this tick. Step 4 sends the exact same tx. Possible outcomes:
@@ -202,8 +195,7 @@ impl SpeedupEngine {
 
             // Find the latest speedup with state InMempool and not already being replaced by an RBF.
             let last = match all_speedups.iter().rev().find(|tx| {
-                tx.state == TransactionState::InMempool
-                    && !matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
+                tx.state == TransactionState::InMempool && !tx.has_live_replacement(&all_speedups)
             }) {
                 Some(t) => t,
                 None => return Ok(()),
@@ -238,7 +230,7 @@ impl SpeedupEngine {
             // Decide whether to boost via RBF or CPFP, depending on how many unconfirmed speedups are currently in the mempool.
             let inmempool_count = all_speedups
                 .iter()
-                .filter(|tx| is_live_in_mempool(tx))
+                .filter(|tx| is_live_in_mempool(tx, &all_speedups))
                 .count() as u32;
             let use_rbf = inmempool_count >= self.settings.max_unconfirmed_speedups;
             let parent_entries: Vec<(SpeedupData, usize)> = if use_rbf {
@@ -294,7 +286,7 @@ impl SpeedupEngine {
 
         let unconfirmed: Vec<CoordinatedTx> = all_speedups
             .iter()
-            .filter(|tx| is_live_in_mempool(tx))
+            .filter(|tx| is_live_in_mempool(tx, &all_speedups))
             .cloned()
             .collect();
         let (chain_diff_fee, _chain_vsize) =
@@ -381,7 +373,7 @@ impl SpeedupEngine {
 
         let unconfirmed: Vec<CoordinatedTx> = all_speedups
             .iter()
-            .filter(|tx| is_live_in_mempool(tx))
+            .filter(|tx| is_live_in_mempool(tx, &all_speedups))
             .cloned()
             .collect();
         let available_slots = self
@@ -711,10 +703,10 @@ impl SpeedupEngine {
 }
 
 /// Returns true if the tx is a speedup that is currently live in the mempool. A speedup
-/// is considered not live if it has been replaced by an RBF.
-fn is_live_in_mempool(tx: &CoordinatedTx) -> bool {
-    tx.state == TransactionState::InMempool
-        && !matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
+/// is considered not live if it has been (or is being) replaced by an RBF — see
+/// `CoordinatedTx::has_live_replacement`.
+fn is_live_in_mempool(tx: &CoordinatedTx, all_speedups: &[CoordinatedTx]) -> bool {
+    tx.state == TransactionState::InMempool && !tx.has_live_replacement(all_speedups)
 }
 
 fn amount_from_speedup_data(data: &SpeedupData) -> u64 {
