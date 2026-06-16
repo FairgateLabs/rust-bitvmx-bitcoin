@@ -185,6 +185,38 @@ impl CoordinatorStorage {
         self.update_tx_state_impl(tx_id, new_state, None)
     }
 
+    /// Re-queue a tx that the chain reported `not_found` back to `ToDispatch`, and arm the reorg-flap
+    /// fail guard. `fail_guard_until` is set to `current_height + max_monitoring_confirmations`.After
+    /// the window, exactly one chain branch survives, so the verdict is final.
+    pub fn requeue_not_found(
+        &self,
+        tx_id: Txid,
+        guard_deadline: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let mut tx = match self.get_tx_by_id(tx_id)? {
+            Some(tx) => tx,
+            None => {
+                self.add_news(CoordinatorNews::TxNotFound { txid: tx_id })?;
+                return Ok(());
+            }
+        };
+
+        if !tx.state.can_transition_to(&TransactionState::ToDispatch) {
+            self.add_news(CoordinatorNews::InvalidStateTransition {
+                txid: tx_id,
+                from: tx.state,
+                to: TransactionState::ToDispatch,
+            })?;
+            return Ok(());
+        }
+
+        tx.state = TransactionState::ToDispatch;
+        // Anchor at the first not_found; do not extend on subsequent ones. Reorgs deeper than max_confs are impossible
+        tx.fail_guard_until.get_or_insert(guard_deadline);
+        self.update_tx(&tx)?;
+        Ok(())
+    }
+
     /// Transition a tx to a terminal state (`Finalized` or `Failed`) and record
     /// the block height at which it settled.
     /// Returns an error if called with a non-terminal state; use `update_tx_state` instead.
@@ -762,6 +794,7 @@ mod tests {
             stuck_in_mempool_blocks: None,
             confirmation_trigger: None,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 1000,

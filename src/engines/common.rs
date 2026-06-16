@@ -169,6 +169,8 @@ impl EngineContext {
         updated.state = TransactionState::InMempool;
         updated.broadcast_block_height = Some(current_height);
         updated.fee_info = fee_info;
+        // The tx is live again: disarm any reorg-flap fail guard. A future not_found re-arms it.
+        updated.fail_guard_until = None;
         self.storage.update_tx(&updated)?;
 
         self.monitor.monitor(
@@ -201,6 +203,8 @@ impl EngineContext {
         let mut updated = tx.clone();
         updated.broadcast_block_height.get_or_insert(current_height); // only if missing
         updated.state = TransactionState::Confirmed;
+        // Recovered on-chain: disarm the fail guard.
+        updated.fail_guard_until = None;
         self.storage.update_tx(&updated)?;
 
         self.monitor.monitor(
@@ -243,6 +247,20 @@ impl EngineContext {
         // Step 2 — tx is absent from the node, so it is NOT mined. A missing/spent input is therefore
         // definitive: funding gone → recreate; external/parent gone → fail.
         if let Some(funding_missing) = self.missing_input_kind(tx)? {
+            // Reorg-flap guard. An "input consumed" verdict is reversible while a reorg is still unsettled.
+            // Read more in `CoordinatedTx::fail_guard_until` docs.
+            if let Some(deadline) = tx.fail_guard_until {
+                if current_height < deadline {
+                    debug!(
+                        "Transaction({}) input consumed but within reorg-flap guard window \
+                         (until block {}, now {}); deferring Failed and re-queuing: {}",
+                        txid, deadline, current_height, raw
+                    );
+                    // mark_as_retry keeps it ToDispatch and paces the re-dispatch via the shared retry-interval window.
+                    self.storage.mark_as_retry(txid)?;
+                    return Ok(());
+                }
+            }
             if funding_missing {
                 warn!(
                     "Transaction({}) funding input missing/spent; settling Failed to recreate: {}",

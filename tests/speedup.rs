@@ -191,6 +191,7 @@ fn test_cpfp_lifecycle() {
         &[parent_txid, cpfp_txid],
         TransactionState::Confirmed,
         10,
+        None,
     )
     .unwrap();
     assert!(
@@ -656,6 +657,7 @@ fn test_cpfp_reorg() {
         &[parent_txid, cpfp_txid],
         TransactionState::Confirmed,
         10,
+        None,
     )
     .unwrap();
     assert!(
@@ -678,6 +680,7 @@ fn test_cpfp_reorg() {
         &[parent_txid, cpfp_txid],
         TransactionState::InMempool,
         10,
+        None,
     )
     .unwrap();
     assert!(
@@ -948,6 +951,7 @@ fn test_cpfp_fee_escalates_across_boosts() {
         &all_txids,
         TransactionState::Confirmed,
         10,
+        None,
     )
     .unwrap();
     assert!(
@@ -1313,6 +1317,7 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
         &[parent_tx.compute_txid(), cpfp1_txid, rbf_txid],
         TransactionState::Confirmed,
         10,
+        None,
     )
     .unwrap();
     assert!(
@@ -1369,7 +1374,7 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
 
 /// When the RBF speedup is manually broadcast and confirmed before the coordinator
 /// dispatches it, `handle_dispatch_result` fires the `AlreadyConfirmed` path, which
-/// must mark the predecessor CPFP's `replaced_by` field.
+/// must mark the predecessor CPFP's `replaced_by` field. Simulates a crash and restart.
 #[test]
 fn test_rbf_already_confirmed_marks_predecessor() {
     init_trace();
@@ -1449,15 +1454,32 @@ fn test_rbf_already_confirmed_marks_predecessor() {
         &[parent_txid, cpfp1_txid, rbf_txid],
         TransactionState::Confirmed,
         5,
+        None,
     )
     .unwrap();
     assert!(reached, "parent, CPFP1, and RBF must reach Confirmed");
+
+    // CPFP2 went `not_found` because the RBF replaced it on-chain. review_speedups recognizes
+    // this as a local replacement (RBF) and does not re-queue or guard it
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        cpfp2_txid,
+        TransactionState::Failed,
+        5,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "CPFP2 must settle Failed once the replacing RBF finalizes"
+    );
 
     let cpfp2 = coord_storage.get_tx_by_id(cpfp2_txid).unwrap().unwrap();
     assert_eq!(
         cpfp2.state,
         TransactionState::Failed,
-        "CPFP2 must be settled Failed (MissingInput on its now-spent funding input)"
+        "CPFP2 must be settled Failed (remove_replaced_rbf on RBF finalization)"
     );
     assert_eq!(
         cpfp2.speedup_kind().unwrap().context().replaced_by,
@@ -1521,6 +1543,7 @@ fn test_cpfp_orphan_requeue() {
         &[parent_txid, cpfp_txid],
         TransactionState::InMempool,
         10,
+        None,
     )
     .unwrap();
     assert!(
@@ -1692,13 +1715,26 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
         .expect("broadcast conflict tx");
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
 
-    // Tick until both parent and CPFP settle Failed.
+    // Tick 1: indexer syncs. Parent not yet seen missing, guard not armed.
+    coordinator.tick().unwrap();
+    // Tick 2: indexer reaches the conflict height, review sees the parent `not_found`, re-queues it
+    // ToDispatch and arms the fail guard at `current_height + max_monitoring_confirmations`.
+    coordinator.tick().unwrap();
+
+    // Mine strictly past the guard window (max_monitoring_confirmations = 2, so 3) so the
+    // genuinely-spent input is allowed to settle Failed (permanent conflict, not a transient reorg).
+    mine_empty_blocks(&setup.bitcoin_client, 3, &setup.regtest_wallet).unwrap();
+
+    // Tick until parent + descendants settle Failed. The guard defers via `mark_as_retry`, so the
+    // re-dispatch that re-runs classify (and now fails the parent → cascade) is rate-limited to
+    // `retry_interval_seconds`; sleep just over it before each tick to clear the limit.
     let reached = tick_until_all_states(
         &coordinator,
         &coord_storage,
         &[parent_txid, cpfp_txid, rbf_txid],
         TransactionState::Failed,
-        15,
+        cpfp_settings().coordinator.retry_attempts_sending_tx + 2,
+        Some(cpfp_settings().coordinator.retry_interval_seconds * 1000 + 1),
     )
     .unwrap();
     assert!(
@@ -1903,6 +1939,7 @@ fn test_cpfp_funding_restored_after_finalization() {
         &[parent1_txid, cpfp1_txid],
         TransactionState::Confirmed,
         10,
+        None,
     )
     .unwrap();
     assert!(reached, "parent1 and CPFP1 must reach Confirmed");
@@ -1917,6 +1954,7 @@ fn test_cpfp_funding_restored_after_finalization() {
         &[parent1_txid, cpfp1_txid],
         TransactionState::Finalized,
         10,
+        None,
     )
     .unwrap();
     assert!(reached, "parent1 and CPFP1 must reach Finalized");
@@ -2052,6 +2090,7 @@ fn test_chain_tip_combine_after_finalize() {
         &[parent1_txid, cpfp1_txid],
         TransactionState::Confirmed,
         10,
+        None,
     )
     .unwrap();
     assert!(reached, "parent1 and CPFP1 must reach Confirmed");
@@ -2062,6 +2101,7 @@ fn test_chain_tip_combine_after_finalize() {
         &[parent1_txid, cpfp1_txid],
         TransactionState::Finalized,
         10,
+        None,
     )
     .unwrap();
     assert!(reached, "parent1 and CPFP1 must reach Finalized");
@@ -2143,6 +2183,7 @@ fn test_chain_tip_combine_after_finalize() {
         &[parent2_txid, cpfp2_txid],
         TransactionState::Confirmed,
         10,
+        None,
     )
     .unwrap();
     assert!(reached, "parent2 and CPFP2 must reach Confirmed");

@@ -88,8 +88,17 @@ impl SpeedupEngine {
 
             // Tx is neither in mempool nor on chain.
             if status.is_not_found() {
-                // If an RBF replacement is in flight, leave the predecessor as-is
-                if matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced()) {
+                // A speedup we deliberately replaced (RBF) must not be re-queued or guarded. Two signals:
+                //   (a) `replaced_by` is set.
+                //   (b) a live RBF record whose `replaces == tx.txid` exists in the coordinator (`replaced_by`
+                //       is not enough because it is only set after the replacement is built, and may be lost
+                //       during a restart).
+                let being_replaced = matches!(&tx.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
+                    || all_speedups.iter().any(|s| {
+                        s.state != TransactionState::Failed
+                            && matches!(&s.kind, TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) if *replaces == tx.txid)
+                    });
+                if being_replaced {
                     continue;
                 }
                 // Otherwise re-queue the same tx for dispatch this tick. Step 4 sends the exact same tx. Possible outcomes:
@@ -100,9 +109,10 @@ impl SpeedupEngine {
                     state = ?tx.state,
                     "speedup not in mempool / chain; re-queueing the same tx for dispatch",
                 );
+                // Arm the reorg-flap fail guard.
                 self.ctx
                     .storage
-                    .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
+                    .requeue_not_found(tx.txid, current_height + max_confs)?;
                 continue;
             }
 
@@ -640,6 +650,7 @@ impl SpeedupEngine {
             stuck_in_mempool_blocks: None,
             confirmation_trigger: None,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info,
             context: ctx_str.to_string(),

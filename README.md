@@ -68,6 +68,9 @@ flight at a time.
 > ⚠️ **`add_funding` UTXOs must be effectively final.** Only pass UTXOs whose funding transaction is
 > deep enough on-chain that you accept it as `Finalized` (i.e., no longer reorgable in practice).
 
+> ⚠️ **Reorgs deeper than `max_monitoring_confirmations` are assumed impossible.** A `Finalized` tx is
+> treated as permanent; a reorg past the finality threshold is out of scope and not detected.
+
 > ⚠️ **External (non-coordinator-tracked) parents must already be confirmed.**
 > The dispatcher only gates on tracked parents; untracked ones are assumed on-chain.
 > Registering a tx whose input references an unregistered, not-yet-confirmed tx will be

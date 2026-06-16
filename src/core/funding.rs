@@ -246,6 +246,7 @@ mod tests {
             stuck_in_mempool_blocks: None,
             confirmation_trigger: None,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,

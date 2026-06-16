@@ -133,9 +133,10 @@ impl TransactionEngine {
                     "Transaction({}) not found, re-queuing for dispatch this tick",
                     tx.txid
                 );
+                // Re-queue and arm the reorg-flap fail guard.
                 self.ctx
                     .storage
-                    .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
+                    .requeue_not_found(tx.txid, current_height + max_confs)?;
                 // No need to re-add a NeedsSpeedup parent to PendingSpeedupParents here: the
                 // covering CPFP is independently re-queued in `review_speedups`'s not_found arm
                 continue;

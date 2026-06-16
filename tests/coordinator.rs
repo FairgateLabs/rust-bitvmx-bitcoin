@@ -1134,6 +1134,7 @@ fn test_stuck_in_mempool_cpfp_resolution() {
         &[parent_txid, cpfp_txid],
         TransactionState::Confirmed,
         5,
+        None,
     )
     .unwrap();
     assert!(both_confirmed, "both parent and CPFP must reach Confirmed");
@@ -1319,6 +1320,147 @@ fn test_retry_failure() {
             .any(|n| matches!(n, CoordinatorNews::DispatchError { txid: id, .. } if *id == txid)),
         "DispatchError news must be present after retry exhaustion; got {:?}",
         news.coordinator_news
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Reorg-flap fail guard: input-consumed deferral and recovery. Reproduces the strand the guard fixes end-to-end:
+///   - T (our tx) and T' (a competing counterparty/timeout spend) both spend the same coin U.
+///   - T is dispatched and sits in the mempool, never mined. This is the case that actually reaches the guard:
+///     because T was never in a block, a later `getrawtransaction(T)` returns "not found", so the verdict falls
+///     through to "input consumed".
+///   - A competing block carrying T' is mined: U is now spent by T' and T is evicted from the mempool (vanishes
+///     / not_found). The coordinator re-dispatches T; bitcoind rejects it with "bad-txns-inputs-missingorspent".
+///   - The guard instead keeps T `ToDispatch` and defers the `Failed` verdict for `max_monitoring_confirmations`
+///     blocks. We hold here across several ticks and longer than `retry_attempts_sending_tx * retry_interval_seconds`)
+///     to prove the deferral is BLOCK-based, not retry-budget-based: T stays alive, never Failed.
+///   - REORG (revert): the competing block is invalidated. U is free again; the next re-dispatch of T succeeds and T
+///     returns to InMempool → Confirmed, guard disarmed.
+#[test]
+fn test_double_reorg_input_consumed() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let settings = BitcoinSettings {
+        monitor: MonitorSettingsConfig {
+            max_monitoring_confirmations: Some(3), // guard window = 3 blocks
+            ..Default::default()
+        },
+        coordinator: CoordinatorSettings {
+            retry_interval_seconds: 1,
+            retry_attempts_sending_tx: 2, // tiny budget: would fail fast if guard were budget-based
+            ..CoordinatorSettings::default()
+        },
+        ..Default::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
+    let coord_storage = get_coord_storage(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // T and T' both spend the same confirmed coin U.
+    let (t, t_prime) = create_conflicting_txs(&setup.bitcoin_client).unwrap();
+    let txid = t.compute_txid();
+
+    // Dispatch T to the mempool.
+    coordinator
+        .dispatch_without_speedup(t.clone(), ctx("flap"), None, None, None)
+        .unwrap();
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            txid,
+            TransactionState::InMempool,
+            5
+        )
+        .unwrap(),
+        "T must reach InMempool after dispatch"
+    );
+    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+    // Competing confirm: mine a block carrying T' (U now spent by T'); T is evicted.
+    let block_with_t_prime =
+        generate_block_with(&setup.bitcoin_client, &setup.regtest_wallet, &[&t_prime]).unwrap();
+
+    // The coordinator must observe T as not_found and re-queue it to ToDispatch (which arms the fail guard).
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            txid,
+            TransactionState::ToDispatch,
+            12
+        )
+        .unwrap(),
+        "T must be re-queued to ToDispatch after T' confirmed and made it not_found"
+    );
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert!(
+        stored.fail_guard_until.is_some(),
+        "fail guard must be armed once T goes not_found; got {:?}",
+        stored.fail_guard_until
+    );
+
+    // Tick until past the guard window, but T must remain ToDispatch.
+    for round in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(1200)); // force re-dispatch past the rate limit
+        coordinator.tick().unwrap();
+        let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+        assert_ne!(
+            stored.state,
+            TransactionState::Failed,
+            "T must NOT be Failed while inside the block guard window (round {round}, state {:?})",
+            stored.state
+        );
+        assert!(
+            stored.fail_guard_until.is_some(),
+            "fail guard must remain armed during the hold (round {round})"
+        );
+    }
+
+    //REORG #2 (revert): invalidate the competing block. U is free again; T is valid.
+    invalidate_block(&setup.bitcoin_client, &block_with_t_prime).unwrap();
+
+    // Let the retry interval elapse, then the next re-dispatch of T must succeed and bring it back to InMempool, with the guard disarmed.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            txid,
+            TransactionState::InMempool,
+            12
+        )
+        .unwrap(),
+        "T must recover to InMempool after the reorg reverted"
+    );
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(
+        stored.state,
+        TransactionState::InMempool,
+        "T must be live again, not Failed"
+    );
+    assert!(
+        stored.fail_guard_until.is_none(),
+        "fail guard must be disarmed once T is accepted again; got {:?}",
+        stored.fail_guard_until
+    );
+
+    // And it confirms normally afterwards.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            txid,
+            TransactionState::Confirmed,
+            8
+        )
+        .unwrap(),
+        "recovered T must confirm on the surviving chain"
     );
 
     drop(coordinator);

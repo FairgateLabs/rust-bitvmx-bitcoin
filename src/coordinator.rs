@@ -396,6 +396,7 @@ impl BitcoinCoordinator {
             stuck_in_mempool_blocks,
             confirmation_trigger,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info,
             context,

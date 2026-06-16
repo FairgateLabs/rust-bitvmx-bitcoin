@@ -58,6 +58,7 @@ impl CoordinatedTx {
             stuck_in_mempool_blocks: None,
             settled_block_height: None,
             broadcast_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,
@@ -279,6 +280,7 @@ mod tests {
             stuck_in_mempool_blocks: None,
             confirmation_trigger: None,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,
@@ -310,6 +312,7 @@ mod tests {
             stuck_in_mempool_blocks: threshold,
             confirmation_trigger: None,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,

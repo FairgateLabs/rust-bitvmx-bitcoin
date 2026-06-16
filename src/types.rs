@@ -29,6 +29,15 @@ pub struct CoordinatedTx {
     pub settled_block_height: Option<BlockHeight>, // Block when tx reached Finalized/Failed; None = not yet settled
     pub broadcast_block_height: Option<BlockHeight>, // Block when tx was broadcast; None = not yet broadcast
 
+    // Reorg-flap fail guard. Set when review re-queues this tx to `ToDispatch` after the chain reported it `not_found`
+    // (vanished from both chain and mempool). Holds the block height at which it becomes safe to declare the tx `Failed`
+    // on an "input consumed" verdict. Purpose: a transient reorg can make an already-broadcast tx T vanish because a
+    // competing tx T' (e.g. a counterparty timeout spend in a two-party protocol) temporarily takes one of T's inputs.
+    // Re-dispatching T then fails with a missing/spent input, which would normally settle T `Failed` (irreversible). If
+    // the reorg reverts, T becomes valid again. This guard defers the terminal `Failed` decision until the chain has had
+    // `max_monitoring_confirmations` blocks to settle, after which exactly one branch survives and the verdict is final.
+    pub fail_guard_until: Option<BlockHeight>,
+
     // Retry
     pub retry_count: u32,
     pub fee_info: FeeInfo,
