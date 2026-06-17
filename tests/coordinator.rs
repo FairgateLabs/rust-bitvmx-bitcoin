@@ -828,6 +828,39 @@ fn test_cancel_dispatched_tx_refused() {
     setup.end_all().unwrap();
 }
 
+/// `cancel` with a non-`Transactions` monitoring entry (here `SpendingUTXOTransaction`)
+/// must take the pass-through arm: it forwards straight to `monitor.cancel`, touches no
+/// coordinator storage, and emits no `InvalidCancel` news.
+#[test]
+fn test_cancel_passthrough_non_transactions() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Register a non-transaction monitoring entry, then cancel it via the same variant.
+    let watched = bitcoin::Txid::from_raw_hash(sha256d::Hash::hash(b"watched_utxo_for_cancel"));
+    let entry = TypesToMonitor::SpendingUTXOTransaction(watched, 0, ctx("passthrough"), None);
+    coordinator.monitor(entry.clone()).unwrap();
+
+    // The pass-through arm just forwards to monitor.cancel and returns Ok.
+    coordinator.cancel(entry).unwrap();
+
+    // No coordinator news (no InvalidCancel): the pass-through arm never classifies or rejects.
+    assert!(
+        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        "pass-through cancel must not emit any coordinator news"
+    );
+
+    // A second tick must stay clean; cancelling an unknown spending-UTXO entry is a no-op.
+    coordinator.tick().unwrap();
+    assert!(coordinator.get_news().unwrap().coordinator_news.is_empty());
+
+    drop(coordinator);
+    setup.end_all().unwrap();
+}
+
 /// When multiple coordinator news items are present, `ack_news` removes only
 /// the acknowledged item and leaves the rest untouched.
 #[test]
