@@ -9,6 +9,18 @@ It is a modular rewrite of `rust-bitcoin-coordinator` with a clearer separation
 between the transaction engine, the speedup engine, the dispatcher, the fee
 manager, and the funding manager.
 
+## Documentation
+
+The `docs/` folder explains the concepts a new developer needs without reading
+the source:
+
+- [`docs/architecture.md`](docs/architecture.md): components, the tick pipeline,
+  the transaction lifecycle, dispatch classification, and the news stream.
+- [`docs/speedup.md`](docs/speedup.md): CPFP vs RBF, the funding chain, and the
+  fee model.
+- [`docs/design.md`](docs/design.md): the durable rules and invariants the
+  coordinator is built on, plus a glossary.
+
 ## ⚠️ Disclaimer
 
 This library is currently under development and may not be fully stable.
@@ -56,6 +68,10 @@ in-flight transactions, dispatches anything ready, and schedules speedups for
 parents that need them. Build/save of a new speedup happens in one tick and
 the broadcast happens in the next, with at most one pre-built speedup in
 flight at a time.
+
+See [`docs/architecture.md`](docs/architecture.md) for the full tick pipeline and
+component diagram, and [`docs/design.md`](docs/design.md) for the invariants
+behind the build/dispatch split.
 
 ## Public API
 
@@ -196,13 +212,17 @@ The main groups are:
 - `monitor`: max confirmations to track and indexer settings (forwarded to
   `bitvmx-transaction-monitor`).
 
+The full settings table and the behavior each field drives are in
+[`docs/architecture.md`](docs/architecture.md#configuration).
+
 ## Development Setup
 
 Prerequisites:
 
 - Rust
 - Docker, used by integration tests
-- A Bitcoin node running with `-txindex=1`
+- A Bitcoin node running with `-txindex=1` (required: see
+  [`docs/design.md`](docs/design.md#failure-classification) for more detail)
 
 Common commands:
 
