@@ -444,9 +444,9 @@ fn test_cpfp_no_funding() {
 }
 
 /// Two related fee-cap paths::
-/// Phase A — `MaxFeeRateReached` from a fresh CPFP: Settings have `min_safe_fee_rate` close to `max_feerate_sat_vb`,
+/// Phase A, `MaxFeeRateReached` from a fresh CPFP: Settings have `min_safe_fee_rate` close to `max_feerate_sat_vb`,
 /// so the first CPFP's computed fee exceeds the cap and `compute_speedup_fee` clamps it.
-/// Phase B — `InsufficientFunds` from a Speedup-derived primary that cannot combine: after CPFP1 finalizes-into-mempool,
+/// Phase B, `InsufficientFunds` from a Speedup-derived primary that cannot combine: after CPFP1 finalizes-into-mempool,
 /// its tiny change becomes the only Speedup-derived chain tip. A new parent's CPFP build picks that tip as the primary input.
 /// The capped fee still exceeds available, combine is attempted but `get_combine_funding`  returns `None`.
 #[test]
@@ -1535,8 +1535,7 @@ fn test_cpfp_orphan_requeue() {
     // Evict all mempool transactions.
     expire_mempool(&setup.bitcoin_client, &setup.regtest_wallet).unwrap();
 
-    // Both parent and CPFP must end up InMempool again — one tick suffices but
-    // give the recovery a small budget.
+    // Both parent and CPFP must end up InMempool again. One tick suffices but give the recovery a small budget.
     let reached = tick_until_all_states(
         &coordinator,
         &coord_storage,
@@ -2557,9 +2556,9 @@ fn test_rbf_combines_when_inherited_funding_insufficient() {
 ///
 /// Three phases exercised in one coordinator instance, matching the new
 /// cancel contract (only Normal / NeedsSpeedup in ToDispatch is cancellable):
-///   A) Cancel a parent BEFORE its first tick — succeeds. The parent never
+///   A) Cancel a parent BEFORE its first tick, succeeds. The parent never
 ///      enters the mempool, no CPFP is built, funding stays unspent, PSP self-prunes.
-///   B) Cancel a parent AFTER it has been dispatched — REFUSED. `InvalidCancel`
+///   B) Cancel a parent AFTER it has been dispatched, REFUSED. `InvalidCancel`
 ///      news fires, the parent record stays in storage, normal lifecycle continues.
 ///   C) Register a fresh parent post-rejection and verify the coordinator state
 ///      is clean for new work.
@@ -2626,7 +2625,7 @@ fn test_cancel_parent_edge_cases() {
     }
 
     // ---------------------------------------------------------------
-    // Phase B: cancel AFTER dispatch — REFUSED
+    // Phase B: cancel AFTER dispatch, REFUSED
     // ---------------------------------------------------------------
     let (parent_b, sd_b) = create_coordinator_parent_tx(
         &setup.bitcoin_client,

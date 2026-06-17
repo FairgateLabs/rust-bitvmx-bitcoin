@@ -330,7 +330,7 @@ fn test_coordinator_full_lifecycle() {
     storage_cfg.remove().unwrap();
 }
 
-/// Comprehensive testnet3 lifecycle test. Drives **6 transactions** (1 splitter,
+/// Comprehensive testnet3 lifecycle test. Drives 6 transactions (1 splitter,
 /// 3 plain parents, 1 child of a parent, 1 parent-with-CPFP, plus the
 /// auto-built CPFP) through a single confirmation cycle
 ///
@@ -339,7 +339,6 @@ fn test_coordinator_full_lifecycle() {
 /// - `monitor` + `cancel` for an unrelated external txid
 /// - `dispatch_without_speedup` (with and without `stuck_in_mempool_blocks`)
 /// - `dispatch_without_speedup` for a parent + child in the same tick
-///   (topological sort)
 /// - `dispatch_with_speedup` for a CPFP parent (auto-built CPFP)
 /// - `confirmation_trigger = Some(1)` (deterministic confirmation news)
 /// - `get_transaction` against the live monitor
@@ -839,7 +838,7 @@ fn poll_until_evicted(
             |n| matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == txid),
         );
         if evicted {
-            // ack everything accumulated
+            // Ack everything accumulated.
             for n in &news.monitor_news {
                 let ack = match n {
                     MonitorNews::Transaction(t, _, ctx) => {

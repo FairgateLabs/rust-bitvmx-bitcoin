@@ -911,7 +911,7 @@ fn test_tx_metadata_persisted() {
     let tx1 = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let tx2 = dummy_tx();
 
-    // Compute txids **before** moving the transactions.
+    // Compute txids before moving the transactions.
     let txid1 = tx1.compute_txid();
     let txid2 = tx2.compute_txid();
 

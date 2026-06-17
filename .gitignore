@@ -17,3 +17,6 @@ Cargo.lock
 
 # local testnet credentials (never commit)
 tests/testnet_local.yaml
+
+# txt files
+*.txt

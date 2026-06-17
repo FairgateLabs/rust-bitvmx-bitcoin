@@ -214,10 +214,9 @@ impl TransactionState {
 
 impl CoordinatedTx {
     /// True when this speedup is being replaced by an RBF. Two signals, because they are written at different times:
-    ///   (a) `replaced_by` is set — written only when the RBF is *dispatched*
-    ///       (`mark_accepted` / `mark_already_confirmed`).
-    ///   (b) a live (`state != Failed`) RBF record whose `replaces == self.txid` exists. Set at
-    ///       RBF build time, before (a), and survives a restart where (a) was not yet written.
+    ///   (a) `replaced_by` is set, written only when the RBF is dispatched (`mark_accepted` or `mark_already_confirmed`).
+    ///   (b) A live (`state != Failed`) RBF record whose `replaces == self.txid` exists. Set at RBF build time, before (a),
+    ///       and it survives a restart where (a) was not yet written.
     pub fn has_live_replacement(&self, all_speedups: &[CoordinatedTx]) -> bool {
         matches!(&self.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
             || all_speedups.iter().any(|s| {
@@ -247,7 +246,7 @@ impl CoordinatedTx {
     }
 }
 
-//implement is_empty for News
+// Implement is_empty for News.
 impl News {
     pub fn is_empty(&self) -> bool {
         self.monitor_news.is_empty() && self.coordinator_news.is_empty()

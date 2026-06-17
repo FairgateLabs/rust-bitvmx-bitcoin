@@ -35,10 +35,10 @@ struct SpeedupBuildResult {
 }
 
 /// SpeedupEngine implements the four speedup-related phases of `tick()`:
-/// 1. `dispatch_pending_speedups` — broadcast `ToDispatch` speedups built in a prior tick.
-/// 2. `review_speedups`           — update state from chain (no dispatch).
-/// 3. `boost_if_stale`            — build a boost CPFP or RBF, save as `ToDispatch`.
-/// 4. `create_cpfp_batch`         — build one CPFP for the next PendingSpeedupParents batch.
+/// 1. `dispatch_pending_speedups`: broadcast `ToDispatch` speedups built in a prior tick.
+/// 2. `review_speedups`: update state from chain (no dispatch).
+/// 3. `boost_if_stale`: build a boost CPFP or RBF, save as `ToDispatch`.
+/// 4. `create_cpfp_batch`: build one CPFP for the next PendingSpeedupParents batch.
 pub struct SpeedupEngine {
     ctx: Rc<EngineContext>,
     key_manager: Rc<KeyManager>,
@@ -702,9 +702,8 @@ impl SpeedupEngine {
     }
 }
 
-/// Returns true if the tx is a speedup that is currently live in the mempool. A speedup
-/// is considered not live if it has been (or is being) replaced by an RBF — see
-/// `CoordinatedTx::has_live_replacement`.
+/// Returns true if the tx is a speedup that is currently live in the mempool. A speedup is considered
+/// not live if it has been or is being replaced by an RBF, see `CoordinatedTx::has_live_replacement`.
 fn is_live_in_mempool(tx: &CoordinatedTx, all_speedups: &[CoordinatedTx]) -> bool {
     tx.state == TransactionState::InMempool && !tx.has_live_replacement(all_speedups)
 }

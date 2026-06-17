@@ -343,11 +343,11 @@ mod tests {
     fn test_compute_speedup_fee_bump_and_chain_diff() {
         let manager = FeeManager::new(settings(1, 100_000));
 
-        // bump 2.0 on 650 → 1300.
+        // Bump 2.0 on 650 -> 1300.
         let (fee, _) = manager.compute_speedup_fee(&[100], 50, 2.0, 5, false, 0);
         assert_eq!(fee, 1300);
 
-        // bump 1.5 → ceil(650 * 1.5) = 975.
+        // Bump 1.5 -> ceil(650 * 1.5) = 975.
         let (fee, _) = manager.compute_speedup_fee(&[100], 50, 1.5, 5, false, 0);
         assert_eq!(fee, 975);
 
@@ -378,7 +378,7 @@ mod tests {
         assert_eq!(fee, 250);
         assert!(capped);
 
-        // Cap = 15 × 50 = 750. Unclamped 650 is below the cap — not flagged.
+        // Cap = 15 * 50 = 750. Unclamped 650 is below the cap, so it is not flagged.
         let manager_15 = FeeManager::new(settings(1, 15));
         let (fee, capped) = manager_15.compute_speedup_fee(&[100], 50, 1.0, 5, false, 0);
         assert_eq!(fee, 650);

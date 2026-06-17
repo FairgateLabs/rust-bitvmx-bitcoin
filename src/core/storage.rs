@@ -111,6 +111,9 @@ impl CoordinatorStorage {
         Ok(txs.into_iter().filter(|tx| tx.state == state).collect())
     }
 
+    /// Returns the non-terminal transactions: the ToDispatch, InMempool, and Confirmed records. These are the only
+    /// states the tick pipeline acts on, so Failed and Finalized records are deliberately excluded (review never
+    /// re-examines a terminal tx). Several invariants in the engines rely on this filtered set.
     pub fn get_active_txs(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
         let txs = self.get_all_txs()?;
 
@@ -237,6 +240,9 @@ impl CoordinatorStorage {
         self.update_tx_state_impl(tx_id, new_state, Some(block_height))
     }
 
+    /// Re-queues a tx for another dispatch attempt: moves it back to ToDispatch and increments retry_count. Used both
+    /// by the normal retry path and by the reorg-flap guard's deferral. Emits news instead of erroring if the tx is
+    /// missing or the transition to ToDispatch is not allowed from its current state.
     pub fn mark_as_retry(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
         let mut tx = match self.get_tx_by_id(tx_id)? {
             Some(tx) => tx,
@@ -881,8 +887,7 @@ mod tests {
         assert_eq!(updated.state, TransactionState::Confirmed);
         assert!(storage.get_and_mark_news(2).unwrap().is_empty());
 
-        // Valid: Confirmed -> ToDispatch (deep-reorg recovery — the speedup
-        // engine re-queues a not_found Confirmed speedup for re-dispatch).
+        // Valid: Confirmed -> ToDispatch (deep-reorg recovery, where the speedup engine re-queues a not_found Confirmed speedup for re-dispatch).
         storage
             .update_tx_state(txid, TransactionState::ToDispatch)
             .unwrap();
@@ -1331,8 +1336,8 @@ mod tests {
         assert!(returned_ids.contains(&finalized_id));
         assert!(!returned_ids.contains(&failed_id));
 
-        // The non-Failed parents are still retained for future CPFP construction:
-        // a second call returns the same three.
+        // The non-Failed parents are still retained for future CPFP construction.
+        // A second call returns the same three.
         let again = storage.get_pending_speedup_parents().unwrap();
         let again_ids: Vec<Txid> = again.iter().map(|t| t.txid).collect();
         assert_eq!(again_ids.len(), 3);
@@ -1422,7 +1427,7 @@ mod tests {
         });
         storage.insert_speedup(cpfp).unwrap();
 
-        // Eviction should NOT remove the parent — live coverage protects it.
+        // Eviction should NOT remove the parent, since live coverage protects it.
         storage.evict_stale_txs(100).unwrap();
         assert!(
             storage.get_tx_by_id(parent_id).unwrap().is_some(),

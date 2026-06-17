@@ -212,7 +212,7 @@ pub fn get_coord_storage(setup: &TestSetup) -> CoordinatorStorage {
 // Transaction helpers
 // =============================================================================
 
-/// Creates a funded, signed Bitcoin transaction that is **not yet broadcast**.
+/// Creates a funded, signed Bitcoin transaction that is not yet broadcast.
 ///
 /// Internally this:
 /// 1. Sends 'fund_amount' sats from the test wallet to itself (via `fund_address`),
@@ -602,7 +602,7 @@ pub fn expire_mempool(bitcoin_client: &BitcoinClient, address: &Address) -> anyh
         .get_block_header_info(&best_hash)
         .map_err(|e| anyhow::anyhow!("get_block_header_info failed: {:?}", e))?;
 
-    // Jump 15 days ahead — comfortably past the default 336 h (14 d) expiry.
+    // Jump 15 days ahead, comfortably past the default 336 h (14 d) expiry.
     let eviction_time = header.time as i64 + 15 * 24 * 3600;
     bitcoin_client
         .client

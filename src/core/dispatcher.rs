@@ -137,7 +137,7 @@ impl Dispatcher {
     /// Deterministically-invalid transactions receive a `Fatal` outcome immediately. Valid
     /// ones are returned. Two checks, both decidable from the tx alone:
     ///   - oversized (weight exceeds `max_tx_weight`);
-    ///   - zero inputs — a tx with no inputs can never be valid.
+    ///   - zero inputs, since a tx with no inputs can never be valid.
     fn validate(
         &self,
         txs: Vec<CoordinatedTx>,
@@ -333,9 +333,8 @@ mod tests {
         // Weight of an empty tx in wu; used to set max_tx_weight just below 2×.
         let single_weight = p1.tx.weight().to_wu();
 
-        // Case A — weight overflow: two parents each of `single_weight` but
-        // max_tx_weight = single_weight + 1 (fits first, overflows on second).
-        // Expect: two batches of 1 each (up to max_batches=10).
+        // Case A, weight overflow: two parents each of `single_weight` but max_tx_weight = single_weight + 1
+        // (fits the first, overflows on the second). Expect two batches of 1 each (up to max_batches=10).
         let (d, bitcoind) = dispatcher(single_weight + 1);
         let two = vec![p1.clone(), p2.clone()];
         let batches = d.batch_by_weight(&two, 10);
@@ -343,8 +342,8 @@ mod tests {
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[1].len(), 1);
 
-        // Case B — max_batches limit: three parents, max_batches = 2.
-        // The third parent triggers `batches.len() >= max_batches` → break.
+        // Case B, max_batches limit: three parents, max_batches = 2.
+        // The third parent triggers `batches.len() >= max_batches` and breaks.
         let three = vec![p1.clone(), p2.clone(), p3.clone()];
         let batches = d.batch_by_weight(&three, 2);
         assert_eq!(batches.len(), 2, "batch count must not exceed max_batches");

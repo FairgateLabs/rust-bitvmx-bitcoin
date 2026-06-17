@@ -229,7 +229,7 @@ impl EngineContext {
         current_height: BlockHeight,
         fee_info: FeeInfo,
     ) -> Result<(), BitcoinCoordinatorError> {
-        // Step 1 — does the node already have this tx (mempool or chain)?
+        // Step 1. Does the node already have this tx, in the mempool or on chain?
         match self.monitor.get_tx_confirmations(&txid)? {
             Some(0) => {
                 debug!(
@@ -244,8 +244,8 @@ impl EngineContext {
             None => {}
         }
 
-        // Step 2 — tx is absent from the node, so it is NOT mined. A missing/spent input is therefore
-        // definitive: funding gone → recreate; external/parent gone → fail.
+        // Step 2. The tx is absent from the node, so it is NOT mined, which makes a missing or spent input definitive:
+        // a funding input gone means recreate, an external or parent input gone means fail (fail_and_cascade false).
         if let Some(funding_missing) = self.missing_input_kind(tx)? {
             // Reorg-flap guard. An "input consumed" verdict is reversible while a reorg is still unsettled.
             // Read more in `CoordinatedTx::fail_guard_until` docs.
@@ -275,7 +275,7 @@ impl EngineContext {
             return self.fail_and_cascade(tx, current_height, funding_missing);
         }
 
-        // Step 3 — inputs intact, cause unknown. Retry until the budget is spent, then fail.
+        // Step 3. Inputs intact, cause unknown. Retry until the budget is spent, then fail.
         if tx.retry_count + 1 >= self.coordinator_config.retry_attempts_sending_tx {
             warn!(
                 "Transaction({}) failed after {} attempts: {}",
@@ -384,10 +384,10 @@ impl EngineContext {
         Ok(())
     }
 
-    /// Probe the node for a missing/spent input of `tx`. Returns:
-    ///   * `Some(true)`  — a coordinator *funding* input is gone → recoverable (recreate funding).
-    ///   * `Some(false)` — a non-funding/external (parent) input is gone → fatal.
-    ///   * `None`        — every input still unspent → transient failure (fee/policy) → retry.
+    /// Probe the node for a missing or spent input of `tx`. Returns:
+    ///   * `Some(true)`: a coordinator funding input is gone, recoverable by recreating funding.
+    ///   * `Some(false)`: a non-funding or external (parent) input is gone, fatal for this tx.
+    ///   * `None`: every input is still unspent, so the failure is transient (fee or policy), retry.
     fn missing_input_kind(
         &self,
         tx: &CoordinatedTx,
@@ -402,14 +402,14 @@ impl EngineContext {
             Err(_) => HashSet::new(),
         };
 
-        // Funding inputs first — a gone funding UTXO is recoverable.
+        // Funding inputs first, since a gone funding UTXO is recoverable.
         for (txid, vout) in &funding {
             if !self.monitor.is_utxo_unspent_rpc(txid, *vout, true)? {
                 return Ok(Some(true));
             }
         }
 
-        // Remaining (external / parent) inputs — a gone one is fatal for this tx.
+        // Remaining external or parent inputs, where a gone one is fatal for this tx.
         for input in &tx.tx.input {
             let op = (input.previous_output.txid, input.previous_output.vout);
             if funding.contains(&op) {
