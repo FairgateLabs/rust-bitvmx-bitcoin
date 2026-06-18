@@ -1,45 +1,17 @@
 mod common;
 use common::*;
 
+use bitcoin_coordinator::{
+    config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
+    types::{AckNews, CoordinatorNews, TransactionState},
+};
 use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
-    types::{AckMonitorNews, MonitorNews, TypesToMonitor},
-};
-use rust_bitvmx_bitcoin::{
-    config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
-    types::{AckNews, CoordinatorNews, News, TransactionState},
+    types::{MonitorNews, TypesToMonitor},
 };
 use tracing::info;
-
-// =============================================================================
-// Helper: context string for tests
-// =============================================================================
-
-fn ctx(label: &str) -> String {
-    format!("test_ctx:{}", label)
-}
-
-/// Ack every item in `news` so it is not returned again.
-fn ack_all_news(coordinator: &rust_bitvmx_bitcoin::coordinator::BitcoinCoordinator, news: &News) {
-    for n in &news.monitor_news {
-        let ack = match n {
-            MonitorNews::Transaction(t, _, ctx) => AckMonitorNews::Transaction(*t, ctx.clone()),
-            MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
-            MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
-                AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
-            }
-            MonitorNews::RskPeginTransaction(t, _) => AckMonitorNews::RskPeginTransaction(*t),
-        };
-        coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
-    }
-    for n in &news.coordinator_news {
-        coordinator
-            .ack_news(AckNews::Coordinator(n.clone()))
-            .unwrap();
-    }
-}
 
 // =============================================================================
 // HAPPY PATH TESTS
@@ -326,6 +298,54 @@ fn test_multiple_txs_dispatched_in_single_tick() {
     setup.end_all().unwrap();
 }
 
+/// Registering a parent transaction and a child transaction that spends the
+/// parent's first output, then ticking once, must dispatch both into the
+/// mempool.
+#[test]
+fn test_dispatch_parent_and_child_in_single_tick() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+
+    let (parent, child) = create_parent_and_child_signed_txs(&setup.bitcoin_client);
+    let parent_id = parent.compute_txid();
+    let child_id = child.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+
+    coordinator
+        .dispatch_without_speedup(parent, ctx("parent"), None, None, None)
+        .unwrap();
+    coordinator
+        .dispatch_without_speedup(child, ctx("child"), None, None, None)
+        .unwrap();
+
+    coordinator.tick().unwrap();
+
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_id)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "parent {parent_id} must be InMempool after batch dispatch"
+    );
+    assert_eq!(
+        coord_storage.get_tx_by_id(child_id).unwrap().unwrap().state,
+        TransactionState::InMempool,
+        "child {child_id} must be InMempool after batch dispatch"
+    );
+
+    assert!(coordinator.get_news().unwrap().is_empty());
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
 /// Adding a valid funding UTXO (above the minimum threshold) must not
 /// generate any coordinator news.
 #[test]
@@ -476,8 +496,8 @@ fn test_news_ack() {
 }
 
 /// Dispatching a transaction that is already in the mempool is treated as a
-/// success (`AlreadyKnown` → `on_dispatch_success`).  The coordinator sets the
-/// state to `InMempool` without generating any error news.
+/// success (`AlreadyKnown`).  The coordinator sets the state to `InMempool`
+///  without generating any error news.
 #[test]
 fn test_dispatch_already_in_mempool() {
     init_trace();
@@ -618,10 +638,7 @@ fn test_add_funding_below_min() {
 }
 
 /// When a valid funding UTXO is in storage and a subsequent call replaces it
-/// with an invalid one, the invalid call must:
-/// 1. Generate an `InvalidFundingUtxo` news item.
-/// 2. Clear the previously valid UTXO from storage so it cannot be
-///    accidentally reused. //TODO: add this to the test when speedup logic is implemented
+/// with an invalid one, the invalid call must generate an `InvalidFundingUtxo` news item.
 #[test]
 fn test_invalid_funding_replaces() {
     init_trace();
@@ -1005,7 +1022,7 @@ fn test_retry_dispatches_after_rate_limit() {
         .unwrap();
     coord_storage.mark_as_retry(txid_subject).unwrap();
 
-    // Ticks 1 and 2 must be blocked — the interval has not elapsed yet.
+    // Ticks 1 and 2 must be blocked. The interval has not elapsed yet.
     for tick in 1..=2 {
         coordinator.tick().unwrap();
         assert_eq!(
@@ -1019,7 +1036,7 @@ fn test_retry_dispatches_after_rate_limit() {
         );
     }
 
-    // Tick 3 — after the interval — must dispatch successfully.
+    // Tick 3: After the interval, must dispatch successfully.
     std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
     coordinator.tick().unwrap();
     assert_eq!(
@@ -1051,7 +1068,7 @@ fn test_retry_failure() {
     // Non-zero min_relay_tx_fee ensures our zero-fee tx is always rejected.
     let setup = TestSetup::new(TestSetupConfig {
         bitcoind_flags: Some(BitcoindFlags {
-            min_relay_tx_fee: 0.00002, // 2 sat/vbyte — zero-fee tx will fail
+            min_relay_tx_fee: 0.00002, // 2 sat/vbyte. Zero-fee tx will fail
             ..BitcoindFlags::default()
         }),
         ..TestSetupConfig::default()
@@ -1077,7 +1094,7 @@ fn test_retry_failure() {
 
     let coord_storage = get_coord_storage(&setup);
 
-    // Tick 1 — first dispatch attempt (retry_count = 0, not rate-limited).
+    // Tick 1: first dispatch attempt (retry_count = 0, not rate-limited).
     // The tx fails → mark_as_retry → retry_count = 1.
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
@@ -1087,7 +1104,7 @@ fn test_retry_failure() {
     );
     assert_eq!(stored.state, TransactionState::ToDispatch);
 
-    // Tick 2 immediately — `last_retry_at` is still None so the first retry is
+    // Tick 2 immediately: `last_retry_at` is still None so the first retry is
     // allowed.  The tx fails again → mark_as_retry → retry_count = 2.
     // `last_retry_at` is now set.
     coordinator.tick().unwrap();
@@ -1098,7 +1115,7 @@ fn test_retry_failure() {
     );
     assert_eq!(stored.state, TransactionState::ToDispatch);
 
-    // Tick 3 immediately — rate-limiter blocks the retry (interval not elapsed).
+    // Tick 3 immediately: rate-limiter blocks the retry (interval not elapsed).
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
     assert_eq!(

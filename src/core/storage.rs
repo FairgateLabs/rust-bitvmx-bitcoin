@@ -1,13 +1,12 @@
+use crate::{
+    config::config::CoordinatorStorageSettings,
+    errors::BitcoinCoordinatorError,
+    types::{CoordinatedTx, CoordinatorNews, TransactionState, TxKind},
+};
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use std::rc::Rc;
 use storage_backend::storage::{KeyValueStore, Storage};
-
-use crate::{
-    config::config::CoordinatorStorageSettings,
-    errors::BitcoinCoordinatorError,
-    types::{CoordinatedTx, CoordinatorNews, TransactionState},
-};
 
 const TX_PREFIX: &str = "bitcoin_coordinator";
 
@@ -17,8 +16,15 @@ pub struct CoordinatorStorage {
 }
 
 enum StoreKey {
+    /// Individual coordinated transaction record (Normal / NeedsSpeedup / Speedup).
     Tx(Txid),
+    /// Ordered list of coordinator and monitor news items awaiting acknowledgement.
     News,
+    /// Ordered list of Speedup-kind transaction ids (CPFPs / RBFs), insertion order.
+    SpeedupList,
+    /// Set of NeedsSpeedup parent txids that still require a CPFP to be built.
+    /// Added on dispatch_with_speedup; removed when the covering CPFP is dispatched.
+    PendingSpeedupParents,
 }
 
 impl CoordinatorStorage {
@@ -48,6 +54,7 @@ impl CoordinatorStorage {
     pub fn remove_tx(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::Tx(tx_id));
         self.storage.remove(&key, None)?;
+        self.remove_speedup_from_list(tx_id)?;
         Ok(())
     }
 
@@ -154,7 +161,7 @@ impl CoordinatorStorage {
     }
 
     /// Transition a tx to a non-terminal state (`ToDispatch`, `InMempool`, `Confirmed`).
-    /// Returns an error if called with a terminal state — use `settle_tx` instead.
+    /// Returns an error if called with a terminal state; use `settle_tx` instead.
     pub fn update_tx_state(
         &self,
         tx_id: Txid,
@@ -165,7 +172,7 @@ impl CoordinatorStorage {
 
     /// Transition a tx to a terminal state (`Finalized` or `Failed`) and record
     /// the block height at which it settled.
-    /// Returns an error if called with a non-terminal state — use `update_tx_state` instead.
+    /// Returns an error if called with a non-terminal state; use `update_tx_state` instead.
     pub fn settle_tx(
         &self,
         tx_id: Txid,
@@ -222,19 +229,31 @@ impl CoordinatorStorage {
             .collect())
     }
 
-    /// Remove transactions that have been in a terminal state for at least
-    /// `max_tracking_confirmations` blocks, emitting a `TransactionEvicted`
-    /// news item for each one.
+    /// Remove transactions that have been in a terminal state for at least `max_tracking_confirmations`
+    /// blocks, emitting a `TransactionEvicted` news item for each one.
+    ///
+    /// `NeedsSpeedup` parents that still appear in the pending-speedup-parents set are NEVER evicted,
+    /// regardless of age. Their `SpeedupData` is required to build the corresponding CPF. Once the CPFP
+    /// is built, `create_cpfp_batch` removes the parent from PendingSpeedupParents; the parent then
+    /// becomes eligible for normal eviction on subsequent ticks.
     pub fn evict_stale_txs(
         &self,
         current_height: BlockHeight,
     ) -> Result<(), BitcoinCoordinatorError> {
         let settled = self.get_settled_txs()?;
+        let psp: Vec<Txid> = {
+            let key = self.get_key(StoreKey::PendingSpeedupParents);
+            self.storage.get(&key, None)?.unwrap_or_default()
+        };
         for tx in settled {
             if let Some(settled_height) = tx.settled_block_height {
                 if current_height.saturating_sub(settled_height)
                     >= self.settings.max_tracking_confirmations
                 {
+                    if matches!(tx.kind, TxKind::NeedsSpeedup(_)) && psp.contains(&tx.txid) {
+                        // CPFP not built yet; keep the parent so its SpeedupData survives for the next build attempt.
+                        continue;
+                    }
                     self.remove_tx(tx.txid)?;
                     self.add_news(CoordinatorNews::TransactionEvicted {
                         txid: tx.txid,
@@ -244,6 +263,151 @@ impl CoordinatorStorage {
             }
         }
         Ok(())
+    }
+
+    // ================================
+    //  Speedup
+    // ================================
+
+    /// Insert a speedup transaction and append its txid to the ordered SpeedupList.
+    /// Use this instead of `insert_tx` for all CPFP/RBF transactions so that
+    /// `get_speedups_ordered` returns them in creation order.
+    pub fn insert_speedup(&self, tx: CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
+        let txid = tx.txid;
+        self.insert_tx(tx)?;
+        let key = self.get_key(StoreKey::SpeedupList);
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        if !list.contains(&txid) {
+            list.push(txid);
+            self.storage.set(&key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    /// Return in-flight speedups (`InMempool` or `Confirmed`) in creation order.
+    pub fn get_active_speedups(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        Ok(self
+            .get_speedups_ordered()?
+            .into_iter()
+            .filter(|tx| {
+                matches!(
+                    tx.state,
+                    TransactionState::InMempool | TransactionState::Confirmed
+                )
+            })
+            .collect())
+    }
+
+    /// Return speedup transactions in creation order (oldest first).
+    /// Txids that no longer exist in storage are skipped as a safety net against
+    /// any inconsistency between the list and the tx store.
+    pub fn get_speedups_ordered(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::SpeedupList);
+        let list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let mut result = Vec::new();
+        for txid in list {
+            if let Some(tx) = self.get_tx_by_id(txid)? {
+                result.push(tx);
+            }
+        }
+        Ok(result)
+    }
+
+    fn remove_speedup_from_list(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        let list_key = self.get_key(StoreKey::SpeedupList);
+        let mut list: Vec<Txid> = self.storage.get(&list_key, None)?.unwrap_or_default();
+        let before = list.len();
+        list.retain(|id| id != &txid);
+        if list.len() != before {
+            self.storage.set(&list_key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    // ================================
+    // PENDING SPEEDUP PARENTS
+    // ================================
+
+    /// Record that `txid` (a `NeedsSpeedup` parent) is waiting for a CPFP.
+    pub fn add_pending_speedup_parent(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::PendingSpeedupParents);
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        if !list.contains(&txid) {
+            list.push(txid);
+            self.storage.set(&key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    /// Re-insert `txids` at the head of the pending set, in front of any already-queued parents.
+    /// Duplicates already present anywhere in the queue are skipped.
+    pub fn prepend_pending_speedup_parents(
+        &self,
+        txids: Vec<Txid>,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::PendingSpeedupParents);
+        let existing: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let mut new_list: Vec<Txid> = Vec::with_capacity(existing.len() + txids.len());
+        for txid in txids {
+            if !existing.contains(&txid) && !new_list.contains(&txid) {
+                new_list.push(txid);
+            }
+        }
+        new_list.extend(existing);
+        self.storage.set(&key, &new_list, None)?;
+        Ok(())
+    }
+
+    /// Remove `txid` from the pending set (CPFP dispatched or parent no longer active).
+    pub fn remove_pending_speedup_parent(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::PendingSpeedupParents);
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let before = list.len();
+        list.retain(|id| id != &txid);
+        if list.len() != before {
+            self.storage.set(&key, &list, None)?;
+        }
+        Ok(())
+    }
+
+    /// Return the `CoordinatedTx` records for pending speedup parents that are eligible for CPFP construction.
+    ///
+    /// Pruning rules:
+    ///   - `Failed`     → remove. The parent will never confirm; no CPFP can help.
+    ///   - missing      → remove. Missing parents will re-dispatch as new `ToDispatch`,
+    ///                    and will be re-added to PendingSpeedupParents.
+    ///   - `ToDispatch` → keep in PendingSpeedupParents but exclude from this call's result.
+    ///   - `InMempool`, `Confirmed`, `Finalized` → keep in PendingSpeedupParents and return.
+    pub fn get_pending_speedup_parents(
+        &self,
+    ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
+        let list: Vec<Txid> = {
+            let key = self.get_key(StoreKey::PendingSpeedupParents);
+            self.storage.get(&key, None)?.unwrap_or_default()
+        };
+        let mut live = Vec::new();
+        for txid in list {
+            match self.get_tx_by_id(txid)? {
+                Some(tx)
+                    if matches!(
+                        tx.state,
+                        TransactionState::InMempool
+                            | TransactionState::Confirmed
+                            | TransactionState::Finalized
+                    ) =>
+                {
+                    live.push(tx)
+                }
+                Some(tx) if tx.state == TransactionState::Failed => {
+                    self.remove_pending_speedup_parent(txid)?;
+                }
+                None => {
+                    self.remove_pending_speedup_parent(txid)?;
+                }
+                _ => {} // ToDispatch: parent not yet broadcast, defer.
+            }
+        }
+        Ok(live)
     }
 
     // ================================
@@ -297,6 +461,8 @@ impl CoordinatorStorage {
         match key {
             StoreKey::Tx(tx_id) => format!("{prefix}/txs/{tx_id}"),
             StoreKey::News => format!("{prefix}/news"),
+            StoreKey::SpeedupList => format!("{prefix}/speedup/list"),
+            StoreKey::PendingSpeedupParents => format!("{prefix}/speedup/pending_parents"),
         }
     }
 }
@@ -580,8 +746,6 @@ mod tests {
         storage_backend.remove().unwrap();
     }
 
-    // -- add_news dedup -----------------------------------------------------------
-
     /// Adding the same item multiple times stores it only once.
     #[test]
     fn test_add_news_dedup() {
@@ -597,7 +761,7 @@ mod tests {
         let returned = storage.get_news().unwrap();
         assert_eq!(returned.len(), 1);
 
-        // get_news is idempotent — calling it again returns the same items.
+        // get_news is idempotent: calling it again returns the same items.
         let returned_again = storage.get_news().unwrap();
         assert_eq!(returned_again.len(), 1);
 
@@ -684,12 +848,12 @@ mod tests {
         let txid_stale = random_txid();
         let txid_fresh = random_txid();
 
-        // stale: settled at height 5, current height = 16 → 11 blocks ago ≥ 10
+        // Stale: settled at height 5, current height = 16 -> 11 blocks ago >= 10
         let mut stale = dummy_tx(txid_stale, TransactionState::Finalized);
         stale.settled_block_height = Some(5);
         storage.insert_tx(stale).unwrap();
 
-        // fresh: settled at height 10, current height = 16 → 6 blocks ago < 10
+        // Fresh: settled at height 10, current height = 16 -> 6 blocks ago < 10
         let mut fresh = dummy_tx(txid_fresh, TransactionState::Finalized);
         fresh.settled_block_height = Some(10);
         storage.insert_tx(fresh).unwrap();
@@ -707,6 +871,184 @@ mod tests {
             &news[0],
             CoordinatorNews::TransactionEvicted { txid, .. } if *txid == txid_stale
         ));
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `remove_tx` removes the txid from the SpeedupList when the tx is a speedup.
+    #[test]
+    fn test_remove_tx_cleans_speedup_list() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid1 = random_txid();
+        let txid2 = random_txid();
+
+        storage
+            .insert_speedup(dummy_tx(txid1, TransactionState::InMempool))
+            .unwrap();
+        storage
+            .insert_speedup(dummy_tx(txid2, TransactionState::InMempool))
+            .unwrap();
+
+        assert_eq!(storage.get_speedups_ordered().unwrap().len(), 2);
+
+        storage.remove_tx(txid1).unwrap();
+
+        let remaining = storage.get_speedups_ordered().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].txid, txid2);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `evict_stale_txs` removes settled speedups from both the tx store and the SpeedupList.
+    #[test]
+    fn test_evict_speedup_removes_from_list() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid_stale = random_txid();
+        let txid_active = random_txid();
+
+        let mut stale = dummy_tx(txid_stale, TransactionState::Finalized);
+        stale.settled_block_height = Some(5);
+        storage.insert_speedup(stale).unwrap();
+
+        storage
+            .insert_speedup(dummy_tx(txid_active, TransactionState::InMempool))
+            .unwrap();
+
+        assert_eq!(storage.get_speedups_ordered().unwrap().len(), 2);
+
+        // current_height = 16: stale settled at 5 -> 11 blocks ago >= max_tracking_confirmations(10)
+        storage.evict_stale_txs(16).unwrap();
+
+        let remaining = storage.get_speedups_ordered().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].txid, txid_active);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// After a reorg a speedup stays in the SpeedupList with its updated state.
+    #[test]
+    fn test_reorg_does_not_remove_from_speedup_list() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid = random_txid();
+        let mut tx = dummy_tx(txid, TransactionState::Confirmed);
+        tx.broadcast_block_height = Some(10);
+        storage.insert_speedup(tx.clone()).unwrap();
+
+        // Simulate reorg: update state back to InMempool
+        storage
+            .update_tx_state(txid, TransactionState::InMempool)
+            .unwrap();
+
+        let speedups = storage.get_speedups_ordered().unwrap();
+        assert_eq!(speedups.len(), 1);
+        assert_eq!(speedups[0].state, TransactionState::InMempool);
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `get_pending_speedup_parents` keeps Confirmed and Finalized parents in PendingSpeedupParents.
+    /// They are still eligible for CPFP construction; only the parent hitting Failed or being missing
+    ///  should evict from PendingSpeedupParents.
+    #[test]
+    fn test_pending_parents_keep_confirmed_and_finalized() {
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let in_mempool_id = random_txid();
+        let confirmed_id = random_txid();
+        let finalized_id = random_txid();
+        let failed_id = random_txid();
+
+        storage
+            .insert_tx(dummy_tx(in_mempool_id, TransactionState::InMempool))
+            .unwrap();
+        storage
+            .insert_tx(dummy_tx(confirmed_id, TransactionState::Confirmed))
+            .unwrap();
+        let mut finalized_tx = dummy_tx(finalized_id, TransactionState::Finalized);
+        finalized_tx.settled_block_height = Some(1);
+        storage.insert_tx(finalized_tx).unwrap();
+        let mut failed_tx = dummy_tx(failed_id, TransactionState::Failed);
+        failed_tx.settled_block_height = Some(1);
+        storage.insert_tx(failed_tx).unwrap();
+
+        for id in [in_mempool_id, confirmed_id, finalized_id, failed_id] {
+            storage.add_pending_speedup_parent(id).unwrap();
+        }
+
+        // First read returns the 3 still-CPFP-eligible parents and lazily prunes
+        // the Failed one.
+        let returned = storage.get_pending_speedup_parents().unwrap();
+        let returned_ids: Vec<Txid> = returned.iter().map(|t| t.txid).collect();
+        assert_eq!(returned.len(), 3);
+        assert!(returned_ids.contains(&in_mempool_id));
+        assert!(returned_ids.contains(&confirmed_id));
+        assert!(returned_ids.contains(&finalized_id));
+        assert!(!returned_ids.contains(&failed_id));
+
+        // The non-Failed parents are still retained for future CPFP construction:
+        // a second call returns the same three.
+        let again = storage.get_pending_speedup_parents().unwrap();
+        let again_ids: Vec<Txid> = again.iter().map(|t| t.txid).collect();
+        assert_eq!(again_ids.len(), 3);
+        assert!(again_ids.contains(&in_mempool_id));
+        assert!(again_ids.contains(&confirmed_id));
+        assert!(again_ids.contains(&finalized_id));
+
+        drop(storage);
+        storage_backend.remove().unwrap();
+    }
+
+    /// `evict_stale_txs` refuses to evict a `NeedsSpeedup` parent that is still in PendingSpeedupParents,
+    /// even after `max_tracking_confirmations` have elapsed.
+    #[test]
+    fn test_evict_stale_keeps_needs_speedup_parent() {
+        use protocol_builder::types::{output::SpeedupData, Utxo};
+
+        let storage_backend = StorageTestConfig::new();
+        let storage = new_storage(&storage_backend);
+
+        let txid = random_txid();
+        let mut tx = dummy_tx(txid, TransactionState::Finalized);
+        let pub_key = crate::test_utils::dummy_pubkey();
+        tx.kind = TxKind::NeedsSpeedup(SpeedupData::new(Utxo::new(txid, 0, 100_000, &pub_key)));
+        tx.settled_block_height = Some(1);
+        storage.insert_tx(tx).unwrap();
+        storage.add_pending_speedup_parent(txid).unwrap();
+
+        // Past the eviction threshold but parent is still in PendingSpeedupParents.
+        storage.evict_stale_txs(100).unwrap();
+
+        assert!(
+            storage.get_tx_by_id(txid).unwrap().is_some(),
+            "NeedsSpeedup parent in PendingSpeedupParents must NOT be evicted (SpeedupData must survive)"
+        );
+        assert!(
+            storage.get_news().unwrap().is_empty(),
+            "no TransactionEvicted news while the parent is still in PendingSpeedupParents"
+        );
+
+        // After the CPFP is built, parent is removed from PendingSpeedupParents and eviction
+        // proceeds normally on the next tick.
+        storage.remove_pending_speedup_parent(txid).unwrap();
+        storage.evict_stale_txs(100).unwrap();
+
+        assert!(
+            storage.get_tx_by_id(txid).unwrap().is_none(),
+            "parent must be evicted once removed from PendingSpeedupParents"
+        );
 
         drop(storage);
         storage_backend.remove().unwrap();
