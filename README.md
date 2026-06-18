@@ -5,10 +5,6 @@ sits between application code and a Bitcoin node, taking care of broadcasting
 transactions, monitoring their lifecycle on-chain, and keeping stuck transactions
 moving via Child-Pays-For-Parent (CPFP) and Replace-By-Fee (RBF) speedups.
 
-It is a modular rewrite of `rust-bitcoin-coordinator` with a clearer separation
-between the transaction engine, the speedup engine, the dispatcher, the fee
-manager, and the funding manager.
-
 ## Documentation
 
 The `docs/` folder explains the concepts a new developer needs without reading
