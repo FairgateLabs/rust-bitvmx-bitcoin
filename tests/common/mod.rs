@@ -359,27 +359,10 @@ pub fn generate_block_with(
     address: &Address,
     txs: &[&Transaction],
 ) -> anyhow::Result<bitcoin::BlockHash> {
-    let raw_hexes: Vec<serde_json::Value> = txs
-        .iter()
-        .map(|tx| serde_json::Value::String(bitcoin::consensus::encode::serialize_hex(*tx)))
-        .collect();
-    let result: serde_json::Value = bitcoin_client
-        .client
-        .call(
-            "generateblock",
-            &[
-                serde_json::Value::String(format!("{}", address)),
-                serde_json::Value::Array(raw_hexes),
-            ],
-        )
-        .map_err(|e| anyhow::anyhow!("generateblock failed: {:?}", e))?;
-    let hash_str = result
-        .get("hash")
-        .and_then(|h| h.as_str())
-        .ok_or_else(|| anyhow::anyhow!("generateblock returned no hash: {:?}", result))?;
-    hash_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("parse block hash failed: {:?}", e))
+    let owned: Vec<Transaction> = txs.iter().map(|tx| (*tx).clone()).collect();
+    bitcoin_client
+        .generate_block_with_txs(address, &owned)
+        .map_err(|e| anyhow::anyhow!("generateblock failed: {:?}", e))
 }
 
 /// Build a (parent, child) pair of signed, unbroadcast transactions where the
@@ -605,11 +588,7 @@ pub fn expire_mempool(bitcoin_client: &BitcoinClient, address: &Address) -> anyh
     // Jump 15 days ahead, comfortably past the default 336 h (14 d) expiry.
     let eviction_time = header.time as i64 + 15 * 24 * 3600;
     bitcoin_client
-        .client
-        .call::<serde_json::Value>(
-            "setmocktime",
-            &[serde_json::Value::Number(eviction_time.into())],
-        )
+        .set_mock_time(eviction_time)
         .map_err(|e| anyhow::anyhow!("setmocktime failed: {:?}", e))?;
 
     // Trigger the eviction sweep by pushing a fresh wallet tx through the
@@ -618,14 +597,7 @@ pub fn expire_mempool(bitcoin_client: &BitcoinClient, address: &Address) -> anyh
         .init_wallet("test_wallet")
         .map_err(|e| anyhow::anyhow!("init_wallet failed: {:?}", e))?;
     bitcoin_client
-        .client
-        .call::<serde_json::Value>(
-            "sendtoaddress",
-            &[
-                serde_json::Value::String(format!("{}", wallet_addr)),
-                serde_json::Value::String("0.00001".to_string()),
-            ],
-        )
+        .send_to_address(&wallet_addr, Amount::from_sat(1_000))
         .map_err(|e| anyhow::anyhow!("sendtoaddress failed: {:?}", e))?;
 
     // Advance height once so the coordinator sees a new block tick.
@@ -638,17 +610,9 @@ pub fn mine_empty_blocks(
     n: u64,
     address: &Address,
 ) -> anyhow::Result<()> {
-    let addr_str = address.to_string();
     for _ in 0..n {
-        bitcoin_client // TODO: abstract this behind a `mine_empty_block` method on `BitcoinClient`
-            .client
-            .call::<serde_json::Value>(
-                "generateblock",
-                &[
-                    serde_json::Value::String(addr_str.clone()),
-                    serde_json::Value::Array(vec![]),
-                ],
-            )
+        bitcoin_client
+            .mine_empty_block(address)
             .map_err(|e| anyhow::anyhow!("generateblock failed: {:?}", e))?;
     }
     Ok(())

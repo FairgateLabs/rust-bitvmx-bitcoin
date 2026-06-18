@@ -84,22 +84,7 @@ impl CoordinatorStorage {
     /// Get all the txs, but not in insertion order
     pub fn get_all_txs(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
         let prefix = self.tx_prefix();
-
-        let entries = self.storage.partial_compare(&prefix, None)?;
-
-        let mut txs = Vec::with_capacity(entries.len());
-
-        for (_, value) in entries {
-            let tx: CoordinatedTx = serde_json::from_str(&value).map_err(|_| {
-                //TODO: add fn partial_get<V> in storage
-                BitcoinCoordinatorError::StorageBackendError(
-                    storage_backend::error::StorageError::SerializationError,
-                )
-            })?;
-            txs.push(tx);
-        }
-
-        Ok(txs)
+        Ok(self.storage.partial_get(&prefix, None)?)
     }
 
     pub fn get_by_state(
