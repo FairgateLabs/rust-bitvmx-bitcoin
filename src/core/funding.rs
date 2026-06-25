@@ -251,6 +251,7 @@ mod tests {
             fee_info: FeeInfo {
                 fee: 0,
                 fee_rate: 1,
+                package_fee_rate: 1,
                 weight: 100,
             },
             context: "test".to_string(),

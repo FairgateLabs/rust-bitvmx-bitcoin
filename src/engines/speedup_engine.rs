@@ -97,10 +97,10 @@ impl SpeedupEngine {
                 // Otherwise re-queue the same tx for dispatch this tick. Step 4 sends the exact same tx. Possible outcomes:
                 //   - AlreadyKnown / AlreadyConfirmed → false positive; revert.
                 //   - Success                         → re-broadcast accepted.
-                debug!(
+                info!(
                     txid = %tx.txid,
                     state = ?tx.state,
-                    "speedup not in mempool / chain; re-queueing the same tx for dispatch",
+                    "speedup not found in mempool / chain; re-queueing the same tx for dispatch",
                 );
                 // Arm the reorg-flap fail guard.
                 self.ctx
@@ -213,8 +213,8 @@ impl SpeedupEngine {
                 return Ok(());
             }
 
-            // If the live tip is already paying at the max-fee-rate cap, do not boost it any further.
-            if last.fee_info.fee_rate >= self.ctx.fee_manager.settings.max_feerate_sat_vb {
+            // If the live tip's package is already paying at the max-fee-rate cap, do not boost it further.
+            if last.fee_info.package_fee_rate >= self.ctx.fee_manager.settings.max_feerate_sat_vb {
                 return Ok(());
             }
 
@@ -255,7 +255,7 @@ impl SpeedupEngine {
 
             (
                 last.txid,
-                last.fee_info.fee_rate,
+                last.fee_info.package_fee_rate,
                 last_context.bump_fee_used * self.settings.bump_fee_percentage,
                 use_rbf,
                 parent_entries,
@@ -312,7 +312,12 @@ impl SpeedupEngine {
         // Build succeeded: persist the boost as `ToDispatch` and register with the monitor.
         let context = Self::make_speedup_context(&build_funding_inputs, next_bump, &parent_entries);
         let new_txid = new_tx.compute_txid();
-        let fee_info = self.ctx.fee_manager.fee_info_for_paid_tx(&new_tx, fee_paid);
+        // Parents this boost credits (empty for a CPFP-of-CPFP boost, inherited protocol parents for RBF).
+        let parent_vbytes: usize = parent_entries.iter().map(|(_, vs)| *vs).sum();
+        let fee_info =
+            self.ctx
+                .fee_manager
+                .fee_info_for_paid_speedup(&new_tx, fee_paid, parent_vbytes);
         let kind = if use_rbf {
             SpeedupKind::RBF {
                 replaces: last_txid,
@@ -326,7 +331,8 @@ impl SpeedupEngine {
             }
         };
         let ctx_str = Self::ctx_for_kind(&kind).to_string();
-        let effective_rate = fee_info.fee_rate;
+        // News reports the package rate: that is the rate the cap bounds and the operator cares about.
+        let effective_rate = fee_info.package_fee_rate;
 
         self.save_speedup(new_tx, fee_info, kind, current_height)?;
 
@@ -345,7 +351,8 @@ impl SpeedupEngine {
             if use_rbf {
                 let max = self.ctx.fee_manager.settings.max_feerate_sat_vb;
                 if let Some(mut predecessor) = self.ctx.storage.get_tx_by_id(last_txid)? {
-                    predecessor.fee_info.fee_rate = max;
+                    // Mark the predecessor's package rate at the cap so the tip-at-cap check skips it.
+                    predecessor.fee_info.package_fee_rate = max;
                     self.ctx.storage.update_tx(&predecessor)?;
                 }
             }
@@ -443,21 +450,23 @@ impl SpeedupEngine {
                 .remove_pending_speedup_parent(*parent_txid)?;
         }
         let context = Self::make_speedup_context(&build_funding_inputs, bump_fee, &parent_entries);
-        let fee_info = self
-            .ctx
-            .fee_manager
-            .fee_info_for_paid_tx(&cpfp_tx, fee_paid);
+        // The protocol parents this CPFP speeds up; their vsize sets the package rate denominator.
+        let parent_vbytes: usize = parent_entries.iter().map(|(_, vs)| *vs).sum();
+        let fee_info =
+            self.ctx
+                .fee_manager
+                .fee_info_for_paid_speedup(&cpfp_tx, fee_paid, parent_vbytes);
         let kind = SpeedupKind::CPFP {
             parents: parent_txids,
             context,
         };
         if capped {
-            // If the CPFP is at the maximum fee cap, notify via news.
+            // If the CPFP package is at the maximum fee cap, notify via news with the package rate.
             self.ctx
                 .storage
                 .add_news(CoordinatorNews::MaxFeeRateReached {
                     txid: cpfp_tx.compute_txid(),
-                    effective_fee_rate: fee_info.fee_rate,
+                    effective_fee_rate: fee_info.package_fee_rate,
                     context: Self::ctx_for_kind(&kind).to_string(),
                 })?;
         }

@@ -444,8 +444,8 @@ fn test_cpfp_no_funding() {
 }
 
 /// Two related fee-cap paths::
-/// Phase A, `MaxFeeRateReached` from a fresh CPFP: Settings have `min_safe_fee_rate` close to `max_feerate_sat_vb`,
-/// so the first CPFP's computed fee exceeds the cap and `compute_speedup_fee` clamps it.
+/// Phase A, `MaxFeeRateReached` from a fresh CPFP: the bump multiplier pushes the first CPFP's
+/// computed fee above the package ceiling and `compute_speedup_fee` clamps it.
 /// Phase B, `InsufficientFunds` from a Speedup-derived primary that cannot combine: after CPFP1 finalizes-into-mempool,
 /// its tiny change becomes the only Speedup-derived chain tip. A new parent's CPFP build picks that tip as the primary input.
 /// The capped fee still exceeds available, combine is attempted but `get_combine_funding`  returns `None`.
@@ -453,13 +453,14 @@ fn test_cpfp_no_funding() {
 fn test_cpfp_capped_then_insufficient_funding_emit_news() {
     init_trace();
 
-    // min_safe_fee_rate > max/2 → first CPFP's final_fee exceeds the cap (`compute_speedup_fee` formula:
-    //(parent_vsize+child_vsize)*fee_rate vs max*child_vsize) on a ~1-in/1-out CPFP package.
+    // base_fee_multiplier 2.0 with the rate floored near the cap makes the first CPFP's final_fee
+    // exceed the package ceiling (`compute_speedup_fee` cap = max*(parent_vsize+child_vsize) - parent_credit),
+    // so the build clamps and emits MaxFeeRateReached.
     let settings = BitcoinSettings {
         fee: FeeSettings {
             min_safe_fee_rate: 80,
             max_feerate_sat_vb: 100,
-            base_fee_multiplier: 1.0,
+            base_fee_multiplier: 2.0,
         },
         ..cpfp_settings()
     };
@@ -470,12 +471,12 @@ fn test_cpfp_capped_then_insufficient_funding_emit_news() {
     let coord_storage = get_coord_storage(&setup);
 
     // ─── Phase A: fresh CPFP build is capped → MaxFeeRateReached ───────────
-    // Funding sized just above the cap so the build succeeds but `capped == true`.
+    // Funding sized above the package cap so the build succeeds but `capped == true`.
     let funding_a = create_funded_speedup_utxo(
         &setup.bitcoin_client,
         &*key_manager,
         Network::Regtest,
-        20_000,
+        40_000,
     )
     .unwrap();
     let (parent1_tx, speedup_data1) = create_coordinator_parent_tx(
@@ -508,9 +509,17 @@ fn test_cpfp_capped_then_insufficient_funding_emit_news() {
 
     let cpfp1 = coord_storage.get_tx_by_id(cpfp1_txid).unwrap().unwrap();
     let max_rate = 100u64;
+    // The cap bounds the package rate to max_feerate, so a capped CPFP sits exactly at it. (Its child
+    // standalone rate is higher because the child also absorbs the parents' shortfall.)
     assert_eq!(
-        cpfp1.fee_info.fee_rate, max_rate,
-        "capped CPFP's effective rate must equal max_feerate_sat_vb",
+        cpfp1.fee_info.package_fee_rate, max_rate,
+        "capped CPFP's package rate must equal max_feerate_sat_vb; got {}",
+        cpfp1.fee_info.package_fee_rate,
+    );
+    assert!(
+        cpfp1.fee_info.fee_rate >= max_rate,
+        "capped CPFP's standalone child rate must be >= max; got {}",
+        cpfp1.fee_info.fee_rate,
     );
 
     let news_a = coordinator.get_news().unwrap();
@@ -535,7 +544,8 @@ fn test_cpfp_capped_then_insufficient_funding_emit_news() {
     {
         assert_eq!(
             *effective_fee_rate, max_rate,
-            "MaxFeeRateReached must carry the cap-clamped effective rate",
+            "MaxFeeRateReached must carry the cap-clamped package rate (== max); got {}",
+            effective_fee_rate,
         );
     }
 
@@ -1001,14 +1011,14 @@ fn test_boost_cap_reached() {
         .dispatch_with_speedup(parent_tx, speedup_data, ctx("cap_stops_boost"), None, None)
         .unwrap();
 
-    // Build & dispatch the initial CPFP, then read its measured effective rate.
+    // Build & dispatch the initial CPFP, then read its measured package rate (what the cap bounds).
     let cpfp1_id = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
     let initial_rate = coord_storage
         .get_tx_by_id(cpfp1_id)
         .unwrap()
         .unwrap()
         .fee_info
-        .fee_rate;
+        .package_fee_rate;
     let max_rate = settings.fee.max_feerate_sat_vb;
     let bump_pct = settings.speedup.bump_fee_percentage;
     let network_rate = settings.fee.min_safe_fee_rate; // bitcoind regtest estimate falls back to this floor
@@ -1045,13 +1055,13 @@ fn test_boost_cap_reached() {
         .unwrap();
     }
 
-    // The latest speedup must now be sitting at the cap.
+    // The latest speedup must now be sitting at the cap (package rate == max).
     let speedups_at_cap = coord_storage.get_speedups_ordered().unwrap();
     let capped_tx = speedups_at_cap.last().unwrap();
     assert_eq!(
-        capped_tx.fee_info.fee_rate, max_rate,
-        "the capped speedup's effective rate must equal max_feerate_sat_vb; got {}",
-        capped_tx.fee_info.fee_rate,
+        capped_tx.fee_info.package_fee_rate, max_rate,
+        "the capped speedup's package rate must equal max_feerate_sat_vb; got {}",
+        capped_tx.fee_info.package_fee_rate,
     );
 
     // The `MaxFeeRateReached` news must reference the capped txid.
@@ -1167,15 +1177,15 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
     );
     let rbf_id = speedups[1].txid;
     assert_eq!(
-        speedups[1].fee_info.fee_rate, 10,
-        "RBF effective rate must be clamped at max_feerate_sat_vb"
+        speedups[1].fee_info.package_fee_rate, 10,
+        "RBF package rate must be clamped at max_feerate_sat_vb"
     );
 
-    // The predecessor CPFP is marked at-cap (`fee_info.fee_rate = max`) so `boost_if_stale` will skip it
-    // on subsequent stale intervals via the existing tip-at-cap check.
+    // The predecessor CPFP is marked at-cap (`fee_info.package_fee_rate = max`) so `boost_if_stale`
+    // will skip it on subsequent stale intervals via the existing tip-at-cap check.
     let predecessor = coord_storage.get_tx_by_id(cpfp1_id).unwrap().unwrap();
     assert_eq!(
-        predecessor.fee_info.fee_rate, 10,
+        predecessor.fee_info.package_fee_rate, 10,
         "predecessor must be marked at-cap so the chain stops attempting further RBFs"
     );
 

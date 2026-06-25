@@ -937,7 +937,16 @@ fn test_tx_metadata_persisted() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let coordinator = create_coordinator(&setup);
+    // max_monitoring_confirmations = 3 so the confirmation_trigger of 2 below is valid
+    // (the monitor requires the trigger to be strictly below the max it tracks).
+    let settings = BitcoinSettings {
+        monitor: MonitorSettingsConfig {
+            max_monitoring_confirmations: Some(3),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
     tick_until_ready(&coordinator).unwrap();
 
     // Use a real signed tx so the two txids are distinct.

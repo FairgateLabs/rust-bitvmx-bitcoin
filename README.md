@@ -200,7 +200,9 @@ The main groups are:
 
 - `coordinator`: retry interval and retry attempts for failed dispatches.
 - `dispatcher`: maximum allowed transaction weight.
-- `fee`: minimum, maximum, and base fee multipliers used by `FeeManager`.
+- `fee`: minimum, maximum, and base fee multipliers used by `FeeManager`. The
+  `max_feerate_sat_vb` ceiling bounds the speedup PACKAGE effective fee rate
+  (parents + child together), not the child transaction alone.
 - `speedup`: maximum unconfirmed speedups, RBF attempts, and bump-fee
   percentages.
 - `funding`: minimum sat amount required for a funding UTXO.

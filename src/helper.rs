@@ -63,6 +63,7 @@ impl CoordinatedTx {
             fee_info: FeeInfo {
                 fee: 0,
                 fee_rate: 1,
+                package_fee_rate: 1,
                 weight: 0,
             },
             context: String::new(),
@@ -297,6 +298,7 @@ mod tests {
             fee_info: FeeInfo {
                 fee: 0,
                 fee_rate: 1,
+                package_fee_rate: 1,
                 weight: 0,
             },
             context: String::new(),
@@ -329,6 +331,7 @@ mod tests {
             fee_info: FeeInfo {
                 fee: 0,
                 fee_rate: 1,
+                package_fee_rate: 1,
                 weight: 0,
             },
             context: String::new(),

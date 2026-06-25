@@ -36,7 +36,7 @@ Only one speedup sits in `ToDispatch` at a time. Reorg edges may briefly leave
 two pre-dispatched speedups, which is safe because the network already accepted
 them.
 
-### I4: the CPFP builder yields to an existing pre-built speedup
+### I3: the CPFP builder yields to an existing pre-built speedup
 
 `create_cpfp_batch` (step 6) does nothing if any speedup is already `ToDispatch`.
 A boost built in step 5 therefore prevents a duplicate CPFP in step 6 of the same

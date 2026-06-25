@@ -191,7 +191,7 @@ the client sees.
 | `DispatchError` | A non-speedup tx failed to dispatch (after retries / on fatal / on input gone). |
 | `SpeedupDispatchError` | A speedup failed to dispatch. |
 | `TransactionEvicted` | A settled record was removed after `max_tracking_confirmations`. |
-| `MaxFeeRateReached` | A speedup was saved at the `max_feerate_sat_vb` cap; no further boosts. |
+| `MaxFeeRateReached` | A speedup's package rate hit the `max_feerate_sat_vb` cap; no further boosts. |
 | `InvalidFundingUtxo` | `add_funding` got a UTXO below `min_funding_amount_sats`. |
 | `FundingNotAvailable` | A speedup was needed but no funding UTXO is available. |
 | `InsufficientFunds` | The funding UTXO cannot cover the next speedup fee. |
@@ -210,7 +210,7 @@ defaults in `src/config/settings.rs`. The groups that shape behavior:
 | `coordinator` | `retry_attempts_sending_tx` | Retry budget before a transient failure becomes `Failed`. |
 | `dispatcher` | `max_tx_weight` | Upper bound on broadcastable weight. Over it is `Fatal`. |
 | `fee` | `min_safe_fee_rate` | Floor and fallback for the effective speedup fee rate. |
-| `fee` | `max_feerate_sat_vb` | Hard cap on speedup fee rate. |
+| `fee` | `max_feerate_sat_vb` | Hard cap on the speedup package fee rate (parents + child). |
 | `fee` | `base_fee_multiplier` | Multiplier on the network estimate. |
 | `speedup` | `max_unconfirmed_speedups` | Boost stays CPFP below this in-mempool count, switches to RBF at it. |
 | `speedup` | `min_blocks_before_resend_speedup` | Blocks a speedup tip must age before it is boosted. |

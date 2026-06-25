@@ -55,7 +55,12 @@ impl PartialEq for CoordinatedTx {
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct FeeInfo {
     pub fee: u64,
+    /// This transaction's own standalone fee rate (sat/vB) = `fee / vsize`. For a CPFP/RBF speedup
+    /// this is the child-in-isolation rate.
     pub fee_rate: u64,
+    /// Effective fee rate of the whole package this tx funds (parents + this tx), sat/vB. For a
+    /// non-speedup tx the package is the tx itself, so `package_fee_rate == fee_rate`.
+    pub package_fee_rate: u64,
     pub weight: u64,
 }
 
