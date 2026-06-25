@@ -103,6 +103,7 @@ pub fn normal_coordinated_tx(seed: u8) -> CoordinatedTx {
         stuck_in_mempool_blocks: None,
         confirmation_trigger: None,
         settled_block_height: None,
+        fail_guard_until: None,
         retry_count: 0,
         fee_info: FeeInfo {
             fee: 0,
@@ -121,10 +122,11 @@ pub fn cpfp_coordinated_tx(seed: u8, fee_rate: u64) -> CoordinatedTx {
     tx.kind = TxKind::Speedup(SpeedupKind::CPFP {
         parents: vec![],
         context: SpeedupContext {
-            funding_input: Utxo::new(txid, 0, 100_000, &dummy_pubkey()),
+            funding_inputs: vec![Utxo::new(txid, 0, 100_000, &dummy_pubkey())],
             replaced_by: None,
             bump_fee_used: 1.0,
             parent_data: vec![],
+            spent: false,
         },
     });
     tx.state = TransactionState::InMempool;

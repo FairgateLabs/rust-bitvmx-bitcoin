@@ -2,13 +2,14 @@ use crate::{
     core::dispatcher::DispatchOutcome,
     errors::BitcoinCoordinatorError,
     types::{
-        CoordinatedTx, News, SpeedupContext, SpeedupKind,
+        CoordinatedTx, FeeInfo, News, SpeedupContext, SpeedupKind,
         TransactionState::{self, *},
         TxKind,
     },
 };
-use bitcoin::Txid;
+use bitcoin::{absolute::LockTime, transaction::Version, Transaction, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
+use protocol_builder::types::Utxo;
 
 impl SpeedupKind {
     pub fn context(&self) -> &SpeedupContext {
@@ -36,6 +37,38 @@ impl SpeedupKind {
 }
 
 impl CoordinatedTx {
+    /// Build a CoordinatedTx with sane defaults: empty placeholder transaction, `TxKind::Normal`,
+    /// `Finalized` state, no timing or retry info. Useful for records that don't represent a real
+    ///  broadcast (e.g. `TxKind::Funding` wrappers).
+    pub fn new_empty() -> Self {
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![],
+            output: vec![],
+        };
+        let txid = tx.compute_txid();
+        Self {
+            txid,
+            tx,
+            kind: TxKind::Normal,
+            state: TransactionState::Finalized,
+            target_block_height: 0,
+            confirmation_trigger: None,
+            stuck_in_mempool_blocks: None,
+            settled_block_height: None,
+            broadcast_block_height: None,
+            fail_guard_until: None,
+            retry_count: 0,
+            fee_info: FeeInfo {
+                fee: 0,
+                fee_rate: 1,
+                weight: 0,
+            },
+            context: String::new(),
+        }
+    }
+
     /// Returns `&SpeedupKind` or `InvariantViolation` if this tx is not a Speedup.
     pub fn speedup_kind(&self) -> Result<&SpeedupKind, BitcoinCoordinatorError> {
         match &self.kind {
@@ -66,6 +99,26 @@ impl CoordinatedTx {
             None => Err(BitcoinCoordinatorError::InvariantViolation(format!(
                 "tx {} has no outputs",
                 self.txid
+            ))),
+        }
+    }
+
+    /// Extract the funding UTXO and its spent flag from a record that lives in the FundingList.
+    /// - `TxKind::Funding(d)` → `(d.utxo, d.spent)`.
+    /// - `TxKind::Speedup(k)` → `(last-output utxo, k.context().spent)`.
+    /// - Any other kind → `InvariantViolation`.
+    pub fn get_funding_info(&self) -> Result<(Utxo, bool), BitcoinCoordinatorError> {
+        match &self.kind {
+            TxKind::Funding(d) => Ok((d.utxo.clone(), d.spent)),
+            TxKind::Speedup(k) => {
+                let (out, vout) = self.last_output()?;
+                let pub_key = &k.context().funding_inputs[0].pub_key;
+                let utxo = Utxo::new(self.txid, vout, out.value.to_sat(), pub_key);
+                Ok((utxo, k.context().spent))
+            }
+            _ => Err(BitcoinCoordinatorError::InvariantViolation(format!(
+                "get_funding_info: tx {} is not Funding or Speedup (kind={:?})",
+                self.txid, self.kind
             ))),
         }
     }
@@ -132,8 +185,8 @@ impl TransactionState {
             (Confirmed, Finalized) => true,
 
             // Crash recovery: tx already on-chain when we restart
-            (ToDispatch, Confirmed) => true, // dispatched but crash before InMempool record or someone else broadcast the tx
-            (ToDispatch, Finalized) => true, // dispatched but crash before Confirmed record or someone else broadcast the tx
+            (ToDispatch, Confirmed) => true, // crash before InMempool record, or a confirmed tx transiently re-queued to ToDispatch found confirmed on resend
+            (ToDispatch, Finalized) => true, // crash before Confirmed record, or a confirmed tx transiently re-queued to ToDispatch found finalized on resend
             (InMempool, Finalized) => true,  // confirmed so fast we never saw Confirmed
 
             // Requeue after not-found in mempool
@@ -142,8 +195,14 @@ impl TransactionState {
             // Reorg: confirmed block rolled back
             (Confirmed, InMempool) => true,
 
-            // Any state can fail
-            (_, Failed) => true,
+            // Deep reorg of a previously-Confirmed speedup whose tx is now
+            (Confirmed, ToDispatch) => true,
+
+            // Settle to Failed only from live states.
+            //   - `ToDispatch → Failed`: `handle_dispatch_result` on Fatal or retries-exhausted Retryable.
+            //   - `InMempool → Failed`: `remove_replaced_rbf` walks the `replaces` chain when an RBF finalizes.
+            (ToDispatch, Failed) => true,
+            (InMempool, Failed) => true,
 
             // Idempotency
             (a, b) if a == b => true,
@@ -154,6 +213,18 @@ impl TransactionState {
 }
 
 impl CoordinatedTx {
+    /// True when this speedup is being replaced by an RBF. Two signals, because they are written at different times:
+    ///   (a) `replaced_by` is set, written only when the RBF is dispatched (`mark_accepted` or `mark_already_confirmed`).
+    ///   (b) A live (`state != Failed`) RBF record whose `replaces == self.txid` exists. Set at RBF build time, before (a),
+    ///       and it survives a restart where (a) was not yet written.
+    pub fn has_live_replacement(&self, all_speedups: &[CoordinatedTx]) -> bool {
+        matches!(&self.kind, TxKind::Speedup(k) if k.context().is_being_replaced())
+            || all_speedups.iter().any(|s| {
+                s.state != TransactionState::Failed
+                    && matches!(&s.kind, TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) if *replaces == self.txid)
+            })
+    }
+
     /// Returns `true` when the transaction is due to be dispatched at `current_height`.
     pub fn is_ready_to_dispatch(&self, current_height: BlockHeight) -> bool {
         current_height >= self.target_block_height
@@ -175,7 +246,7 @@ impl CoordinatedTx {
     }
 }
 
-//implement is_empty for News
+// Implement is_empty for News.
 impl News {
     pub fn is_empty(&self) -> bool {
         self.monitor_news.is_empty() && self.coordinator_news.is_empty()
@@ -221,6 +292,7 @@ mod tests {
             stuck_in_mempool_blocks: None,
             confirmation_trigger: None,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,
@@ -252,6 +324,7 @@ mod tests {
             stuck_in_mempool_blocks: threshold,
             confirmation_trigger: None,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,
@@ -289,6 +362,23 @@ mod tests {
         let mut speedup_mut = cpfp_coordinated_tx(4, 1);
         let k = speedup_mut.speedup_kind_mut().unwrap();
         assert!(!k.is_rbf());
+
+        // RBF: exercises context_mut and parents RBF arms.
+        let mut rbf = cpfp_coordinated_tx(5, 1);
+        let replaced_txid = rbf.txid;
+        let context = match &rbf.kind {
+            TxKind::Speedup(SpeedupKind::CPFP { context, .. }) => context.clone(),
+            _ => panic!("expected CPFP"),
+        };
+        rbf.kind = TxKind::Speedup(SpeedupKind::RBF {
+            replaces: replaced_txid,
+            new_funding_inputs: vec![],
+            context,
+        });
+        let k = rbf.speedup_kind_mut().unwrap();
+        assert!(k.is_rbf());
+        assert!(k.parents().is_empty());
+        k.context_mut().replaced_by = Some(replaced_txid);
     }
 
     #[test]
@@ -366,5 +456,23 @@ mod tests {
 
         let other = Txid::from_raw_hash(sha256d::Hash::hash(&[99u8; 32]));
         assert!(tx.verify_tx_id(other).is_err());
+    }
+
+    #[test]
+    fn test_can_transition_to() {
+        use crate::types::TransactionState::*;
+
+        // InMempool → Failed is valid (RBF chain cleanup).
+        assert!(InMempool.can_transition_to(&Failed));
+
+        // Idempotent transitions are always valid.
+        assert!(ToDispatch.can_transition_to(&ToDispatch));
+        assert!(Finalized.can_transition_to(&Finalized));
+
+        // Invalid transitions return false.
+        assert!(!Finalized.can_transition_to(&ToDispatch));
+        assert!(!Finalized.can_transition_to(&InMempool));
+        assert!(!Failed.can_transition_to(&InMempool));
+        assert!(!Confirmed.can_transition_to(&Failed));
     }
 }

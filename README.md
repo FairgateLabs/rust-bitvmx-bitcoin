@@ -5,9 +5,17 @@ sits between application code and a Bitcoin node, taking care of broadcasting
 transactions, monitoring their lifecycle on-chain, and keeping stuck transactions
 moving via Child-Pays-For-Parent (CPFP) and Replace-By-Fee (RBF) speedups.
 
-It is a modular rewrite of `rust-bitcoin-coordinator` with a clearer separation
-between the transaction engine, the speedup engine, the dispatcher, the fee
-manager, and the funding manager.
+## Documentation
+
+The `docs/` folder explains the concepts a new developer needs without reading
+the source:
+
+- [`docs/architecture.md`](docs/architecture.md): components, the tick pipeline,
+  the transaction lifecycle, dispatch classification, and the news stream.
+- [`docs/speedup.md`](docs/speedup.md): CPFP vs RBF, the funding chain, and the
+  fee model.
+- [`docs/design.md`](docs/design.md): the durable rules and invariants the
+  coordinator is built on, plus a glossary.
 
 ## ⚠️ Disclaimer
 
@@ -53,12 +61,46 @@ The coordinator is composed of small, focused components wired together inside
 
 Each call to `tick()` runs one pass: it advances the monitor, reviews
 in-flight transactions, dispatches anything ready, and schedules speedups for
-parents that need them.
+parents that need them. Build/save of a new speedup happens in one tick and
+the broadcast happens in the next, with at most one pre-built speedup in
+flight at a time.
+
+See [`docs/architecture.md`](docs/architecture.md) for the full tick pipeline and
+component diagram, and [`docs/design.md`](docs/design.md) for the invariants
+behind the build/dispatch split.
 
 ## Public API
 
-The `BitcoinCoordinator` struct exposes the following methods (see
-`src/coordinator.rs` for full Rustdoc):
+> ⚠️ **Indirect dependencies must wait for finality.** If transaction B
+> indirectly depends on transaction A, do not register B until A has reached
+> `Finalized`. While A is still in flight it may disappear from the mempool
+> and be re-dispatched, and the coordinator does not preserve any ordering
+> between independently registered transactions.
+
+> ⚠️ **`add_funding` UTXOs must be effectively final.** Only pass UTXOs whose funding transaction is
+> deep enough on-chain that you accept it as `Finalized` (i.e., no longer reorgable in practice).
+
+> ⚠️ **Reorgs deeper than `max_monitoring_confirmations` are assumed impossible.** A `Finalized` tx is
+> treated as permanent; a reorg past the finality threshold is out of scope and not detected.
+
+> ⚠️ **External (non-coordinator-tracked) parents must already be confirmed.**
+> The dispatcher only gates on tracked parents; untracked ones are assumed on-chain.
+> Registering a tx whose input references an unregistered, not-yet-confirmed tx will be
+> rejected by bitcoind with a missing-input error.
+
+> 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold.
+> To unblock: dispatch a CPFP spending one of its outputs via `dispatch_without_speedup`. The
+> coordinator tracks both and mines them together.
+
+> ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in
+> `ToDispatch` are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` /
+> `Finalized` / `Failed`), or if the txid is internal (Speedup) or external (Funding /
+> unknown), the request is refused and a news item is emitted.
+
+> ⚠️ **Ack news only AFTER acting on it.** News is deduplicated by value.Acking early 
+> means a second occurrence of the same event within the same block will NOT re-fire.
+
+The `BitcoinCoordinator` struct exposes the following methods:
 
 | Method | Purpose |
 |---|---|
@@ -68,7 +110,7 @@ The `BitcoinCoordinator` struct exposes the following methods (see
 | `dispatch` | Dispatch a tx with optional speedup support. |
 | `dispatch_without_speedup` | Dispatch a plain tx with optional stuck-in-mempool detection. |
 | `dispatch_with_speedup` | Dispatch a tx and enable CPFP/RBF speedups. |
-| `cancel` | Cancel monitoring and remove tracked txs from storage. |
+| `cancel` | Cancel monitoring + storage for txs still in `ToDispatch` (refused once dispatched). |
 | `add_funding` | Register a funding UTXO available for future speedups. |
 | `get_transaction` | Query the on-chain / mempool status of a tx. |
 | `get_news` | Retrieve all unacknowledged monitor and coordinator news. |
@@ -146,7 +188,15 @@ let status = coordinator.get_transaction(some_txid)?;
 
 Tuning constants live in `BitcoinSettings`. A sample YAML used by the test
 suite is in `config/coordinator_config.yaml`; every field is optional and falls
-back to the defaults in `src/config/settings.rs`. The main groups are:
+back to the defaults in `src/config/settings.rs`.
+
+> ⚠️ **Do not change `BitcoinSettings` values across a restart on the same
+> storage.** Several invariants (slot accounting, fee-rate state, retention
+> bounds) assume the configuration that produced the persisted state is the
+> one used to resume it. Reload the coordinator with the same settings, or
+> start from clean storage.
+
+The main groups are:
 
 - `coordinator`: retry interval and retry attempts for failed dispatches.
 - `dispatcher`: maximum allowed transaction weight.
@@ -158,12 +208,17 @@ back to the defaults in `src/config/settings.rs`. The main groups are:
 - `monitor`: max confirmations to track and indexer settings (forwarded to
   `bitvmx-transaction-monitor`).
 
+The full settings table and the behavior each field drives are in
+[`docs/architecture.md`](docs/architecture.md#configuration).
+
 ## Development Setup
 
 Prerequisites:
 
 - Rust
 - Docker, used by integration tests
+- A Bitcoin node running with `-txindex=1` (required: see
+  [`docs/design.md`](docs/design.md#failure-classification) for more detail)
 
 Common commands:
 

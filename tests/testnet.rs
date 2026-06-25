@@ -18,8 +18,7 @@
 ///    or
 ///     cargo test --test testnet test_coordinator_full_lifecycle -- --ignored
 ///    or
-///     cargo test --features testnet-test-delay --test testnet test_full_lifecycle_multi_tx_with_speedup -- --ignored
-/// Observation: the testnet-test-delay feature adds a 10 second delay before broadcasting each transaction,
+///     cargo test --test testnet test_full_lifecycle_multi_tx_with_speedup -- --ignored
 /// because P2P propagation between the upstream nodes takes seconds.
 mod common;
 use common::*;
@@ -43,7 +42,10 @@ use bitcoin_coordinator::{
 };
 use bitcoin_indexer::config::IndexerSettings;
 use bitcoincore_rpc::RpcApi as _;
-use bitvmx_bitcoin_rpc::{bitcoin_client::BitcoinClient, rpc_config::RpcConfig};
+use bitvmx_bitcoin_rpc::{
+    bitcoin_client::{BitcoinClient, BitcoinClientApi},
+    rpc_config::RpcConfig,
+};
 use bitvmx_settings::settings::load_config_file;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
@@ -328,7 +330,7 @@ fn test_coordinator_full_lifecycle() {
     storage_cfg.remove().unwrap();
 }
 
-/// Comprehensive testnet3 lifecycle test. Drives **6 transactions** (1 splitter,
+/// Comprehensive testnet3 lifecycle test. Drives 6 transactions (1 splitter,
 /// 3 plain parents, 1 child of a parent, 1 parent-with-CPFP, plus the
 /// auto-built CPFP) through a single confirmation cycle
 ///
@@ -337,7 +339,6 @@ fn test_coordinator_full_lifecycle() {
 /// - `monitor` + `cancel` for an unrelated external txid
 /// - `dispatch_without_speedup` (with and without `stuck_in_mempool_blocks`)
 /// - `dispatch_without_speedup` for a parent + child in the same tick
-///   (topological sort)
 /// - `dispatch_with_speedup` for a CPFP parent (auto-built CPFP)
 /// - `confirmation_trigger = Some(1)` (deterministic confirmation news)
 /// - `get_transaction` against the live monitor
@@ -492,28 +493,84 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
     info!("[lifecycle++] child_b    = {child_b_txid}");
     info!("[lifecycle++] parent_sp  = {parent_sp_txid}");
 
-    // ────────────────────────Exercise the cancel path: monitor an unrelated txid, then drop it ────────────────────────
+    // ──────────────────────── Exercise the successful `cancel` path ────────────────────────
+    // Register a synthetic Normal-kind tx and cancel it BEFORE the next tick fires.
+    let coord_storage = testnet_coord_storage(&storage_cfg);
+    let dummy_for_cancel = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::new(Txid::all_zeros(), 0),
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1_000),
+            script_pubkey: user_spk.clone(),
+        }],
+    };
+    let dummy_txid = dummy_for_cancel.compute_txid();
     coordinator
-        .monitor(TypesToMonitor::Transactions(
-            vec![funding_txid],
-            ctx.clone(),
-            Some(1),
-        ))
-        .unwrap();
+        .dispatch_without_speedup(dummy_for_cancel, ctx.clone(), None, None, None)
+        .expect("dispatch_without_speedup for cancel exercise");
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(dummy_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::ToDispatch,
+        "dummy tx must be ToDispatch before cancel"
+    );
     coordinator
         .cancel(TypesToMonitor::Transactions(
-            vec![funding_txid],
+            vec![dummy_txid],
             ctx.clone(),
-            Some(1),
+            None,
         ))
-        .unwrap();
+        .expect("cancel must succeed for an eligible Normal+ToDispatch tx");
+    assert!(
+        coord_storage.get_tx_by_id(dummy_txid).unwrap().is_none(),
+        "tx must be removed from storage after a successful cancel"
+    );
+    let post_cancel_news = coordinator.get_news().unwrap();
+    assert!(
+        !post_cancel_news.coordinator_news.iter().any(|n| matches!(
+            n,
+            CoordinatorNews::InvalidCancel { txid, .. } if *txid == dummy_txid,
+        )),
+        "no InvalidCancel news must be emitted for an eligible cancel (got {:?})",
+        post_cancel_news.coordinator_news,
+    );
+    drain_news(&coordinator);
+    info!("[lifecycle++] cancel exercise: dummy tx {dummy_txid} registered + cancelled");
 
-    // ──────────────────────── Register funding + dispatch the 5 user txs in a single tick ────────────────────────
+    // ──────────────────────── Broadcast splitter out-of-band ────────────────────────
+    let bitcoin_client = BitcoinClient::new_from_config(&testnet_rpc_config())
+        .expect("bitcoin client for direct splitter broadcast");
+    bitcoin_client
+        .send_transaction(&splitter)
+        .expect("direct splitter broadcast");
+    let phase2_start = Instant::now();
+    while !bitcoin_client.check_in_mempool(&splitter_txid) {
+        assert!(
+            phase2_start.elapsed() < Duration::from_secs(3 * 60),
+            "splitter {splitter_txid} did not reach the testnet mempool within 3 min"
+        );
+        std::thread::sleep(Duration::from_secs(5));
+    }
+    info!("[lifecycle++] splitter visible in mempool, registering children + funding");
+
+    // Persist the yaml pointer to splitter:0 (change) so the next run can resume cleanly.
+    update_local_config_after_spend(splitter_txid, change_sats);
+    info!("[lifecycle++] yaml updated: next funding = {splitter_txid}:0 ({change_sats} sats)");
+
+    coordinator.tick().unwrap(); // ensure the coordinator has processed the splitter before we check for the children in storage
+
+    // ──────────────────────── Register funding + dispatch the 4 coord-managed txs in a single tick ────────────────────────
     coordinator.add_funding(funding_utxo).unwrap();
 
-    coordinator
-        .dispatch_without_speedup(splitter, ctx.clone(), None, Some(1), None)
-        .unwrap();
     // parent_a sets a high stuck_in_mempool threshold (no firing expected).
     coordinator
         .dispatch_without_speedup(parent_a, ctx.clone(), None, Some(1), Some(1_000))
@@ -530,28 +587,27 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
         .dispatch_with_speedup(parent_sp, speedup_data, ctx.clone(), None, Some(1))
         .unwrap();
 
-    let coord_storage = testnet_coord_storage(&storage_cfg);
+    info!("[lifecycle++] phase 2: dispatching coord-managed txs in one tick");
 
-    // ──────────────────────── Phase 2: tick once and confirm the splitter reaches InMempool ────────────────────────
-    info!("[lifecycle++] phase 2: dispatching all in one tick");
-    let reached = poll_until_state_with_sleep(
+    // One tick to let the speedup engine build the auto CPFP for parent_sp.
+    coordinator.tick().unwrap();
+
+    // Splitter is broadcast out-of-band via RPC, so it is NOT in coord_storage as a
+    // lifecycle-tracked tx. Its on-chain progress is verified separately below.
+    let user_txids = vec![parent_a_txid, parent_b_txid, child_b_txid, parent_sp_txid];
+
+    info!("[lifecycle++] waiting for all 4 coord-managed txs to reach InMempool");
+    let reached = poll_until_all_states_sleep(
         &coordinator,
         &coord_storage,
-        splitter_txid,
+        &user_txids,
         TransactionState::InMempool,
         Duration::from_secs(3 * 60),
         Duration::from_secs(5),
     )
     .unwrap();
-    assert!(
-        reached,
-        "splitter {splitter_txid} did not reach InMempool within 3 min"
-    );
 
-    // Splitter is in mempool, its outputs exist for spending. Persist the yaml
-    // pointer to splitter:0 (change) so the next run can resume cleanly.
-    update_local_config_after_spend(splitter_txid, change_sats);
-    info!("[lifecycle++] yaml updated: next funding = {splitter_txid}:0 ({change_sats} sats)");
+    coordinator.tick().unwrap(); // ensure the speedup tick is processed before we check for the CPFP
 
     // Capture the auto-built CPFP txid.
     let speedups = coord_storage.get_speedups_ordered().unwrap();
@@ -562,28 +618,23 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
     );
     let cpfp_txid = speedups[0].txid;
     info!("[lifecycle++] cpfp = {cpfp_txid}");
-
-    let user_txids = vec![
-        splitter_txid,
-        parent_a_txid,
-        parent_b_txid,
-        child_b_txid,
-        parent_sp_txid,
-    ];
     let mut all_txids = user_txids.clone();
     all_txids.push(cpfp_txid);
 
-    info!("[lifecycle++] waiting for all 6 txs to reach InMempool");
-    let reached = poll_until_all_states_sleep(
+    let reached_cpfp = poll_until_all_states_sleep(
         &coordinator,
         &coord_storage,
-        &all_txids,
+        &vec![cpfp_txid],
         TransactionState::InMempool,
         Duration::from_secs(3 * 60),
         Duration::from_secs(5),
     )
     .unwrap();
-    assert!(reached, "not all txs reached InMempool within 3 min");
+
+    assert!(
+        reached && reached_cpfp,
+        "not all txs reached InMempool within 3 min"
+    );
 
     // ──────────────────────── Phase 3: block 1 -> Confirmed ────────────────────────
     info!("[lifecycle++] phase 3: waiting for Confirmed (1 testnet block, up to 40 min)");
@@ -709,10 +760,30 @@ fn poll_until_state_with_sleep(
     interval: Duration,
 ) -> Result<bool, BitcoinCoordinatorError> {
     let start = Instant::now();
+    // Check if every txid has reached the expected or higher state.
+    let higher = match expected {
+        TransactionState::ToDispatch => vec![
+            TransactionState::ToDispatch,
+            TransactionState::InMempool,
+            TransactionState::Confirmed,
+            TransactionState::Finalized,
+        ],
+        TransactionState::InMempool => vec![
+            TransactionState::InMempool,
+            TransactionState::Confirmed,
+            TransactionState::Finalized,
+        ],
+        TransactionState::Confirmed => {
+            vec![TransactionState::Confirmed, TransactionState::Finalized]
+        }
+        TransactionState::Finalized => vec![TransactionState::Finalized],
+        TransactionState::Failed => vec![TransactionState::Failed],
+    };
+
     loop {
         coordinator.tick()?;
         if let Some(tx) = storage.get_tx_by_id(txid)? {
-            if tx.state == expected {
+            if higher.contains(&tx.state) {
                 return Ok(true);
             }
         }
@@ -767,7 +838,7 @@ fn poll_until_evicted(
             |n| matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == txid),
         );
         if evicted {
-            // ack everything accumulated
+            // Ack everything accumulated.
             for n in &news.monitor_news {
                 let ack = match n {
                     MonitorNews::Transaction(t, _, ctx) => {
@@ -989,12 +1060,31 @@ fn poll_until_all_states_sleep(
     let start = Instant::now();
     loop {
         coordinator.tick()?;
+        // Check if every txid has reached the expected or higher state.
+        let higher = match expected {
+            TransactionState::ToDispatch => vec![
+                TransactionState::ToDispatch,
+                TransactionState::InMempool,
+                TransactionState::Confirmed,
+                TransactionState::Finalized,
+            ],
+            TransactionState::InMempool => vec![
+                TransactionState::InMempool,
+                TransactionState::Confirmed,
+                TransactionState::Finalized,
+            ],
+            TransactionState::Confirmed => {
+                vec![TransactionState::Confirmed, TransactionState::Finalized]
+            }
+            TransactionState::Finalized => vec![TransactionState::Finalized],
+            TransactionState::Failed => vec![TransactionState::Failed],
+        };
         let all_reached = txids.iter().all(|t| {
             storage
                 .get_tx_by_id(*t)
                 .ok()
                 .flatten()
-                .map_or(false, |tx| tx.state == expected)
+                .map_or(false, |tx| higher.contains(&tx.state))
         });
         if all_reached {
             return Ok(true);

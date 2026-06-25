@@ -1,8 +1,10 @@
 mod common;
 use common::*;
 
+use bitcoin::hashes::{sha256d, Hash as _};
 use bitcoin_coordinator::{
     config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
+    core::funding::FundingStorage,
     types::{AckNews, CoordinatorNews, TransactionState},
 };
 use bitcoind::bitcoind::BitcoindFlags;
@@ -38,7 +40,7 @@ fn test_tick_until_ready() {
 
 /// Verifies the registration-to-dispatch lifecycle in a single test:
 ///
-/// 1. `dispatch_without_speedup` immediately persists the transaction in storage
+/// 1. `dispatch` immediately persists the transaction in storage
 /// 2. The first tick broadcasts the transaction, advancing its state to `InMempool`
 #[test]
 fn test_tx_dispatch_to_mempool() {
@@ -51,7 +53,16 @@ fn test_tx_dispatch_to_mempool() {
     let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let txid = tx.compute_txid();
     coordinator
-        .dispatch_without_speedup(tx, ctx("registration"), None, None, None)
+        .dispatch(tx, None, ctx("registration"), None, None)
+        .unwrap();
+
+    // `monitor` registers an additional txid for observation without dispatching it. Unnecessary for this test.
+    coordinator
+        .monitor(TypesToMonitor::Transactions(
+            vec![txid],
+            ctx("extra_monitor"),
+            None,
+        ))
         .unwrap();
 
     // Step 1: tx must be in storage as ToDispatch before any tick.
@@ -298,11 +309,10 @@ fn test_multiple_txs_dispatched_in_single_tick() {
     setup.end_all().unwrap();
 }
 
-/// Registering a parent transaction and a child transaction that spends the
-/// parent's first output, then ticking once, must dispatch both into the
-/// mempool.
+/// Trying to dispatch a parent and its child in the same tick, produces the dispatcher to defers the child
+///  to a later tick, where the parent is now in mempool and the child broadcasts.
 #[test]
-fn test_dispatch_parent_and_child_in_single_tick() {
+fn test_dispatch_parent_then_child_across_ticks() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
@@ -321,8 +331,8 @@ fn test_dispatch_parent_and_child_in_single_tick() {
         .dispatch_without_speedup(child, ctx("child"), None, None, None)
         .unwrap();
 
+    // Tick 1: parent broadcasts; child is deferred (parent not yet in monitor cache).
     coordinator.tick().unwrap();
-
     let coord_storage = get_coord_storage(&setup);
     assert_eq!(
         coord_storage
@@ -331,12 +341,26 @@ fn test_dispatch_parent_and_child_in_single_tick() {
             .unwrap()
             .state,
         TransactionState::InMempool,
-        "parent {parent_id} must be InMempool after batch dispatch"
+        "parent {parent_id} must be InMempool after first tick"
     );
     assert_eq!(
         coord_storage.get_tx_by_id(child_id).unwrap().unwrap().state,
+        TransactionState::ToDispatch,
+        "child {child_id} must remain ToDispatch until the monitor sees the parent"
+    );
+
+    // Subsequent ticks: child broadcasts once parents_ready passes.
+    let reached = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        child_id,
         TransactionState::InMempool,
-        "child {child_id} must be InMempool after batch dispatch"
+        5,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "child {child_id} must reach InMempool after the parent becomes observable"
     );
 
     assert!(coordinator.get_news().unwrap().is_empty());
@@ -346,22 +370,75 @@ fn test_dispatch_parent_and_child_in_single_tick() {
     setup.end_all().unwrap();
 }
 
-/// Adding a valid funding UTXO (above the minimum threshold) must not
-/// generate any coordinator news.
+/// Exercises `add_funding`'s validation across all three observable outcomes in a single end-to-end scenario:
+///   1. A valid UTXO (above `min_funding_amount_sats`) is accepted with no news.
+///   2. A second UTXO below the minimum is rejected and emits exactly one `InvalidFundingUtxo` news item.
+///   3. A valid UTXO added after the invalid one is still accepted with no news
 #[test]
-fn test_add_valid_funding_utxo() {
+fn test_add_funding_validation() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let coordinator = create_coordinator(&setup);
+    let coord_storage = get_coord_storage(&setup);
     tick_until_ready(&coordinator).unwrap();
 
-    // Default minimum is 10 000 sats; 20 000 is safely above it.
-    coordinator.add_funding(utxo(20_000)).unwrap();
+    // 1. Valid UTXO (default minimum is 10 000 sats; 20 000 is above it).
+    let first_utxo = utxo(20_000);
+    coordinator.add_funding(first_utxo.clone()).unwrap();
+    assert!(
+        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        "no news must fire when a valid funding UTXO is added"
+    );
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    // 2. Below-minimum UTXO rejected, news emitted.
+    coordinator.add_funding(utxo(9_999)).unwrap();
+    let news = coordinator.get_news().unwrap();
+    assert_eq!(
+        news.coordinator_news.len(),
+        1,
+        "exactly one InvalidFundingUtxo news must fire; got {:?}",
+        news.coordinator_news
+    );
+    assert!(
+        matches!(
+            &news.coordinator_news[0],
+            CoordinatorNews::InvalidFundingUtxo { amount, min_required }
+            if *amount == 9_999 && *min_required == 10_000
+        ),
+        "unexpected news payload: {:?}",
+        news.coordinator_news[0]
+    );
 
+    // 3. Valid UTXO after invalid one is still accepted with no news.
+    let third_utxo = utxo(50_000);
+    coordinator.add_funding(third_utxo.clone()).unwrap();
+    assert!(
+        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        "no news must fire when a valid funding UTXO is added, even after a previous invalid one"
+    );
+
+    let fundings = coord_storage.read_funding_records().unwrap();
+    assert_eq!(
+        fundings.len(),
+        2,
+        "both valid UTXOs must be present in storage; got {:?}",
+        fundings
+    );
+    assert_eq!(
+        fundings[0].get_funding_info().unwrap().0,
+        first_utxo,
+        "first valid UTXO must be in storage"
+    );
+    assert_eq!(
+        fundings[1].get_funding_info().unwrap().0,
+        third_utxo,
+        "second valid UTXO must be in storage"
+    );
+
+    ack_all_news(&coordinator, &news);
     drop(coordinator);
+    drop(coord_storage);
     setup.end_all().unwrap();
 }
 
@@ -602,77 +679,6 @@ fn test_dispatch_invalid_empty_tx() {
     setup.end_all().unwrap();
 }
 
-/// Adding a funding UTXO below the minimum threshold generates an
-/// `InvalidFundingUtxo` coordinator news item.  The invalid UTXO is not
-/// persisted to storage.
-#[test]
-fn test_add_funding_below_min() {
-    init_trace();
-
-    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let coordinator = create_coordinator(&setup);
-    tick_until_ready(&coordinator).unwrap();
-
-    // Default minimum is 10 000 sats; 9 999 is just below it.
-    coordinator.add_funding(utxo(9_999)).unwrap();
-
-    let news = coordinator.get_news().unwrap();
-    assert_eq!(
-        news.coordinator_news.len(),
-        1,
-        "Expected exactly one coordinator news for invalid funding; got {:?}",
-        news.coordinator_news
-    );
-    assert!(
-        matches!(
-            &news.coordinator_news[0],
-            CoordinatorNews::InvalidFundingUtxo { amount, min_required }
-            if *amount == 9_999 && *min_required == 10_000
-        ),
-        "Unexpected news item: {:?}",
-        news.coordinator_news[0]
-    );
-
-    drop(coordinator);
-    setup.end_all().unwrap();
-}
-
-/// When a valid funding UTXO is in storage and a subsequent call replaces it
-/// with an invalid one, the invalid call must generate an `InvalidFundingUtxo` news item.
-#[test]
-fn test_invalid_funding_replaces() {
-    init_trace();
-
-    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    let coordinator = create_coordinator(&setup);
-    tick_until_ready(&coordinator).unwrap();
-
-    // Set a valid UTXO first.
-    coordinator.add_funding(utxo(20_000)).unwrap();
-    assert!(
-        coordinator.get_news().unwrap().coordinator_news.is_empty(),
-        "No news expected after valid funding"
-    );
-
-    // Now replace with an invalid one.
-    coordinator.add_funding(utxo(1_000)).unwrap();
-
-    let news = coordinator.get_news().unwrap();
-    assert!(
-        news.coordinator_news.len() == 1
-            && matches!(
-                &news.coordinator_news[0],
-                CoordinatorNews::InvalidFundingUtxo { amount, .. }
-                if *amount == 1_000
-            ),
-        "Expected exactly one InvalidFundingUtxo news with correct amounts; got {:?}",
-        news.coordinator_news
-    );
-
-    drop(coordinator);
-    setup.end_all().unwrap();
-}
-
 /// When one valid and one invalid transaction are registered and the
 /// coordinator ticks, they fail independently: the valid one reaches
 /// `InMempool` while the invalid one reaches `Failed` with a `DispatchError`
@@ -745,11 +751,11 @@ fn test_valid_and_invalid_tx() {
     setup.end_all().unwrap();
 }
 
-/// Cancelling a transaction that is already in the mempool removes it from
-/// coordinator storage and cancels monitor tracking.  Subsequent ticks do not
-/// produce any errors or spurious news for that txid.
+/// Cancel rejection contract: only `Normal` / `NeedsSpeedup` in `ToDispatch` are
+/// cancellable. Everything else (post-dispatch, unknown txid, `Funding`-kind) is
+/// refused with an `InvalidCancel` news entry and storage is left untouched.
 #[test]
-fn test_cancel_dispatched_tx() {
+fn test_cancel_dispatched_tx_refused() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
@@ -757,14 +763,17 @@ fn test_cancel_dispatched_tx() {
 
     let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let txid = tx.compute_txid();
+    let funding = utxo(50_000);
+    let funding_txid = funding.txid;
+    let unknown_txid = bitcoin::Txid::from_raw_hash(sha256d::Hash::hash(b"unknown_for_cancel"));
 
     tick_until_ready(&coordinator).unwrap();
-
+    coordinator.add_funding(funding).unwrap();
     coordinator
         .dispatch_without_speedup(tx, ctx("cancel_after_dispatch"), None, None, None)
         .unwrap();
 
-    // Dispatch.
+    // Dispatch (Normal tx → InMempool).
     coordinator.tick().unwrap();
     let coord_storage = get_coord_storage(&setup);
     assert_eq!(
@@ -773,33 +782,82 @@ fn test_cancel_dispatched_tx() {
         "tx must be InMempool before cancel"
     );
 
-    // Cancel after dispatch.
+    // Batch cancel mixing all three rejection causes:
+    //   - txid:           Normal in InMempool → refused (state).
+    //   - unknown_txid:   never registered    → refused (not found).
+    //   - funding_txid:   Funding-kind        → refused (kind).
     coordinator
         .cancel(TypesToMonitor::Transactions(
-            vec![txid],
+            vec![txid, unknown_txid, funding_txid],
             ctx("cancel_after_dispatch"),
             None,
         ))
         .unwrap();
 
+    // All three records (the present ones) must remain in storage.
     assert!(
-        coord_storage.get_tx_by_id(txid).unwrap().is_none(),
-        "tx must be removed from storage after cancel"
+        coord_storage.get_tx_by_id(txid).unwrap().is_some(),
+        "dispatched tx must REMAIN in storage after cancel was refused"
+    );
+    assert!(
+        coord_storage.get_tx_by_id(funding_txid).unwrap().is_some(),
+        "Funding-kind record must REMAIN in storage after cancel was refused"
     );
 
-    // Several subsequent ticks must not produce news related to this tx.
-    for _ in 0..10 {
-        coordinator.tick().unwrap();
-    }
+    // One InvalidCancel news per refused entry.
     let news = coordinator.get_news().unwrap();
-    assert!(
-        news.is_empty(),
-        "No coordinator news expected after cancelling a dispatched tx; got {:?}",
-        news.coordinator_news
-    );
+    let rejected: Vec<bitcoin::Txid> = news
+        .coordinator_news
+        .iter()
+        .filter_map(|n| match n {
+            CoordinatorNews::InvalidCancel { txid, .. } => Some(*txid),
+            _ => None,
+        })
+        .collect();
+    for expected in [&txid, &unknown_txid, &funding_txid] {
+        assert!(
+            rejected.contains(expected),
+            "InvalidCancel news must include {} (got {:?})",
+            expected,
+            rejected,
+        );
+    }
 
     drop(coordinator);
     drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// `cancel` with a non-`Transactions` monitoring entry (here `SpendingUTXOTransaction`)
+/// must take the pass-through arm: it forwards straight to `monitor.cancel`, touches no
+/// coordinator storage, and emits no `InvalidCancel` news.
+#[test]
+fn test_cancel_passthrough_non_transactions() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Register a non-transaction monitoring entry, then cancel it via the same variant.
+    let watched = bitcoin::Txid::from_raw_hash(sha256d::Hash::hash(b"watched_utxo_for_cancel"));
+    let entry = TypesToMonitor::SpendingUTXOTransaction(watched, 0, ctx("passthrough"), None);
+    coordinator.monitor(entry.clone()).unwrap();
+
+    // The pass-through arm just forwards to monitor.cancel and returns Ok.
+    coordinator.cancel(entry).unwrap();
+
+    // No coordinator news (no InvalidCancel): the pass-through arm never classifies or rejects.
+    assert!(
+        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        "pass-through cancel must not emit any coordinator news"
+    );
+
+    // A second tick must stay clean; cancelling an unknown spending-UTXO entry is a no-op.
+    coordinator.tick().unwrap();
+    assert!(coordinator.get_news().unwrap().coordinator_news.is_empty());
+
+    drop(coordinator);
     setup.end_all().unwrap();
 }
 
@@ -849,6 +907,10 @@ fn test_selective_ack() {
         .ack_news(AckNews::Coordinator(dispatch_err))
         .unwrap();
 
+    // Advance to a new block so unacknowledged items become visible again.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+
     // Only the InvalidFundingUtxo must remain.
     let remaining = coordinator.get_news().unwrap().coordinator_news;
     assert_eq!(
@@ -882,7 +944,7 @@ fn test_tx_metadata_persisted() {
     let tx1 = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
     let tx2 = dummy_tx();
 
-    // Compute txids **before** moving the transactions.
+    // Compute txids before moving the transactions.
     let txid1 = tx1.compute_txid();
     let txid2 = tx2.compute_txid();
 
@@ -971,7 +1033,151 @@ fn test_coordinator_restart() {
     setup.end_all().unwrap();
 }
 
-/// A transaction in retry state is NOT dispatched until `retry_interval_seconds`
+/// A transaction that stays in the mempool for more than `stuck_in_mempool_blocks`
+/// blocks emits a `TransactionStuckInMempool` news item.
+#[test]
+fn test_stuck_in_mempool_news() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid = tx.compute_txid();
+
+    coordinator
+        .dispatch_without_speedup(tx, ctx("stuck"), None, None, Some(1))
+        .unwrap();
+    coordinator.tick().unwrap(); // dispatches → InMempool
+
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage.get_tx_by_id(txid).unwrap().unwrap().state,
+        TransactionState::InMempool
+    );
+
+    // Set broadcast_block_height = 0 so the current chain height always exceeds
+    // the stuck threshold of 1 block without needing to mine extra blocks.
+    let mut record = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    record.broadcast_block_height = Some(0);
+    coord_storage.update_tx(&record).unwrap();
+
+    coordinator.tick().unwrap();
+
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.coordinator_news.iter().any(|n| {
+            matches!(n, CoordinatorNews::TransactionStuckInMempool { txid: id, .. } if *id == txid)
+        }),
+        "expected TransactionStuckInMempool news; got {:?}",
+        news.coordinator_news
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// A stuck transaction can be unblocked by dispatching a CPFP via
+/// `dispatch_without_speedup`. The coordinator tracks both independently,
+/// dispatches them in topological order, and both reach `Confirmed` once a
+/// block is mined.
+#[test]
+fn test_stuck_in_mempool_cpfp_resolution() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // Parent (will be stuck) + CPFP spending parent:0.
+    let (parent_tx, cpfp_tx) = create_parent_and_child_signed_txs(&setup.bitcoin_client);
+    let parent_txid = parent_tx.compute_txid();
+    let cpfp_txid = cpfp_tx.compute_txid();
+
+    coordinator
+        .dispatch_without_speedup(parent_tx, ctx("stuck_parent"), None, None, Some(1))
+        .unwrap();
+    coordinator.tick().unwrap(); // dispatches → InMempool
+
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(parent_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool
+    );
+
+    // Force stuck: set broadcast_block_height to 0 so the threshold of 1 block
+    // is always exceeded without needing to mine extra blocks.
+    let mut record = coord_storage.get_tx_by_id(parent_txid).unwrap().unwrap();
+    record.broadcast_block_height = Some(0);
+    coord_storage.update_tx(&record).unwrap();
+
+    coordinator.tick().unwrap();
+
+    let news = coordinator.get_news().unwrap();
+    assert!(
+        news.coordinator_news.iter().any(|n| {
+            matches!(n, CoordinatorNews::TransactionStuckInMempool { txid: id, .. } if *id == parent_txid)
+        }),
+        "expected TransactionStuckInMempool before CPFP; got {:?}",
+        news.coordinator_news
+    );
+
+    // Another tick without the CPFP should not change anything.
+    let status = tick_until_state(
+        &coordinator,
+        &coord_storage,
+        parent_txid,
+        TransactionState::Confirmed,
+        5,
+    )
+    .unwrap();
+    assert!(
+        !status,
+        "parent should not reach Confirmed without CPFP resolution"
+    );
+
+    // Dispatch the CPFP spending parent:0. Both are now ToDispatch / InMempool.
+    coordinator
+        .dispatch_without_speedup(cpfp_tx, ctx("cpfp"), None, None, None)
+        .unwrap();
+    coordinator.tick().unwrap(); // dispatches CPFP → InMempool
+
+    assert_eq!(
+        coord_storage
+            .get_tx_by_id(cpfp_txid)
+            .unwrap()
+            .unwrap()
+            .state,
+        TransactionState::InMempool,
+        "CPFP must reach InMempool after dispatch"
+    );
+
+    // Mine one block: parent + CPFP confirm together.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+
+    let both_confirmed = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent_txid, cpfp_txid],
+        TransactionState::Confirmed,
+        5,
+        None,
+    )
+    .unwrap();
+    assert!(both_confirmed, "both parent and CPFP must reach Confirmed");
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// A transaction in retry state is not dispatched until `retry_interval_seconds`
 /// has elapsed since the last retry batch.
 #[test]
 fn test_retry_dispatches_after_rate_limit() {
@@ -1063,7 +1269,8 @@ fn test_retry_dispatches_after_rate_limit() {
 #[test]
 fn test_retry_failure() {
     init_trace();
-    let retry_interval_seconds = 1u64;
+    // Long enough that consecutive ticks are reliably below the rate-limit window.
+    let retry_interval_seconds = 8u64;
 
     // Non-zero min_relay_tx_fee ensures our zero-fee tx is always rejected.
     let setup = TestSetup::new(TestSetupConfig {
@@ -1130,7 +1337,7 @@ fn test_retry_failure() {
 
     // Wait for the retry interval, then tick.  Third attempt: retry_count + 1 = 3
     // >= retry_attempts_sending_tx (3) → tx is marked Failed + DispatchError news.
-    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
+    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 5));
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
     assert_eq!(
@@ -1146,6 +1353,147 @@ fn test_retry_failure() {
             .any(|n| matches!(n, CoordinatorNews::DispatchError { txid: id, .. } if *id == txid)),
         "DispatchError news must be present after retry exhaustion; got {:?}",
         news.coordinator_news
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Reorg-flap fail guard: input-consumed deferral and recovery. Reproduces the strand the guard fixes end-to-end:
+///   - T (our tx) and T' (a competing counterparty/timeout spend) both spend the same coin U.
+///   - T is dispatched and sits in the mempool, never mined. This is the case that actually reaches the guard:
+///     because T was never in a block, a later `getrawtransaction(T)` returns "not found", so the verdict falls
+///     through to "input consumed".
+///   - A competing block carrying T' is mined: U is now spent by T' and T is evicted from the mempool (vanishes
+///     / not_found). The coordinator re-dispatches T; bitcoind rejects it with "bad-txns-inputs-missingorspent".
+///   - The guard instead keeps T `ToDispatch` and defers the `Failed` verdict for `max_monitoring_confirmations`
+///     blocks. We hold here across several ticks and longer than `retry_attempts_sending_tx * retry_interval_seconds`)
+///     to prove the deferral is BLOCK-based, not retry-budget-based: T stays alive, never Failed.
+///   - REORG (revert): the competing block is invalidated. U is free again; the next re-dispatch of T succeeds and T
+///     returns to InMempool → Confirmed, guard disarmed.
+#[test]
+fn test_double_reorg_input_consumed() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let settings = BitcoinSettings {
+        monitor: MonitorSettingsConfig {
+            max_monitoring_confirmations: Some(3), // guard window = 3 blocks
+            ..Default::default()
+        },
+        coordinator: CoordinatorSettings {
+            retry_interval_seconds: 1,
+            retry_attempts_sending_tx: 2, // tiny budget: would fail fast if guard were budget-based
+            ..CoordinatorSettings::default()
+        },
+        ..Default::default()
+    };
+    let coordinator = create_coordinator_with_settings(&setup, settings);
+    let coord_storage = get_coord_storage(&setup);
+    tick_until_ready(&coordinator).unwrap();
+
+    // T and T' both spend the same confirmed coin U.
+    let (t, t_prime) = create_conflicting_txs(&setup.bitcoin_client).unwrap();
+    let txid = t.compute_txid();
+
+    // Dispatch T to the mempool.
+    coordinator
+        .dispatch_without_speedup(t.clone(), ctx("flap"), None, None, None)
+        .unwrap();
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            txid,
+            TransactionState::InMempool,
+            5
+        )
+        .unwrap(),
+        "T must reach InMempool after dispatch"
+    );
+    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+    // Competing confirm: mine a block carrying T' (U now spent by T'); T is evicted.
+    let block_with_t_prime =
+        generate_block_with(&setup.bitcoin_client, &setup.regtest_wallet, &[&t_prime]).unwrap();
+
+    // The coordinator must observe T as not_found and re-queue it to ToDispatch (which arms the fail guard).
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            txid,
+            TransactionState::ToDispatch,
+            12
+        )
+        .unwrap(),
+        "T must be re-queued to ToDispatch after T' confirmed and made it not_found"
+    );
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert!(
+        stored.fail_guard_until.is_some(),
+        "fail guard must be armed once T goes not_found; got {:?}",
+        stored.fail_guard_until
+    );
+
+    // Tick until past the guard window, but T must remain ToDispatch.
+    for round in 0..4 {
+        std::thread::sleep(std::time::Duration::from_millis(1200)); // force re-dispatch past the rate limit
+        coordinator.tick().unwrap();
+        let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+        assert_ne!(
+            stored.state,
+            TransactionState::Failed,
+            "T must NOT be Failed while inside the block guard window (round {round}, state {:?})",
+            stored.state
+        );
+        assert!(
+            stored.fail_guard_until.is_some(),
+            "fail guard must remain armed during the hold (round {round})"
+        );
+    }
+
+    //REORG #2 (revert): invalidate the competing block. U is free again; T is valid.
+    invalidate_block(&setup.bitcoin_client, &block_with_t_prime).unwrap();
+
+    // Let the retry interval elapse, then the next re-dispatch of T must succeed and bring it back to InMempool, with the guard disarmed.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            txid,
+            TransactionState::InMempool,
+            12
+        )
+        .unwrap(),
+        "T must recover to InMempool after the reorg reverted"
+    );
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(
+        stored.state,
+        TransactionState::InMempool,
+        "T must be live again, not Failed"
+    );
+    assert!(
+        stored.fail_guard_until.is_none(),
+        "fail guard must be disarmed once T is accepted again; got {:?}",
+        stored.fail_guard_until
+    );
+
+    // And it confirms normally afterwards.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            txid,
+            TransactionState::Confirmed,
+            8
+        )
+        .unwrap(),
+        "recovered T must confirm on the surviving chain"
     );
 
     drop(coordinator);

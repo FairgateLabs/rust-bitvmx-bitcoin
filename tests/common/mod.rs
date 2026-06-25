@@ -5,7 +5,7 @@ use std::collections::HashMap;
 pub use bitcoin_coordinator::types;
 use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
 
-use bitcoin::{consensus::Decodable, Address, Amount, CompressedPublicKey, OutPoint};
+use bitcoin::{Address, Amount, CompressedPublicKey, OutPoint};
 use bitcoin_coordinator::{
     config::config::{BitcoinSettings, CoordinatorStorageSettings},
     coordinator::BitcoinCoordinator,
@@ -13,7 +13,10 @@ use bitcoin_coordinator::{
     errors::BitcoinCoordinatorError,
     types::{AckNews, News},
 };
-use bitcoincore_rpc::{json::AddressType::Bech32, json::CreateRawTransactionInput, RpcApi as _};
+use bitcoincore_rpc::{
+    json::{AddressType::Bech32, CreateRawTransactionInput, SignRawTransactionInput},
+    RpcApi as _,
+};
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use key_manager::key_type::BitcoinKeyType;
 use protocol_builder::types::output::SpeedupData;
@@ -33,12 +36,66 @@ impl Default for TestSetupConfig {
     }
 }
 
+/// Wrapper around an `Rc<KeyManager>` that owns its on-disk storage
+/// directory under `temp-runs/` and removes it on drop
+pub struct TestKeyManager {
+    km: Option<Rc<KeyManager>>,
+    path: String,
+}
+
+impl TestKeyManager {
+    pub fn new() -> Self {
+        let path = format!("temp-runs/km_{}", Uuid::new_v4());
+        let config = StorageConfig {
+            path: path.clone(),
+            password: None,
+        };
+        let km = Rc::new(
+            KeyManager::new(bitcoin::Network::Regtest, None, None, &config)
+                .expect("TestKeyManager: failed to construct KeyManager"),
+        );
+        Self { km: Some(km), path }
+    }
+
+    pub fn rc(&self) -> Rc<KeyManager> {
+        Rc::clone(
+            self.km
+                .as_ref()
+                .expect("TestKeyManager: already cleaned up"),
+        )
+    }
+}
+
+impl Default for TestKeyManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::ops::Deref for TestKeyManager {
+    type Target = KeyManager;
+    fn deref(&self) -> &Self::Target {
+        self.km
+            .as_ref()
+            .expect("TestKeyManager: already cleaned up")
+    }
+}
+
+impl Drop for TestKeyManager {
+    fn drop(&mut self) {
+        self.km.take();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
 /// Test setup components that are commonly used across tests
 pub struct TestSetup {
     pub storage: StorageTestConfig,
     pub bitcoind: TestBitcoind,
     pub bitcoin_client: Rc<BitcoinClient>,
     pub regtest_wallet: Address,
+    pub key_manager: TestKeyManager,
 }
 
 impl TestSetup {
@@ -53,12 +110,14 @@ impl TestSetup {
             bitcoind.rpc_config.network,
             config.blocks_mined,
         )?;
+        let key_manager = TestKeyManager::new();
 
         Ok(TestSetup {
             bitcoind,
             storage,
             bitcoin_client,
             regtest_wallet,
+            key_manager,
         })
     }
 
@@ -104,7 +163,7 @@ pub fn create_coordinator(setup: &TestSetup) -> BitcoinCoordinator {
     BitcoinCoordinator::new_with_paths(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
-        dummy_key_manager(),
+        setup.key_manager.rc(),
         None,
     )
     .expect("Failed to create BitcoinCoordinator")
@@ -135,7 +194,7 @@ pub fn create_coordinator_with_settings(
     BitcoinCoordinator::new_with_paths(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
-        dummy_key_manager(),
+        setup.key_manager.rc(),
         Some(settings),
     )
     .expect("Failed to create BitcoinCoordinator with settings")
@@ -153,7 +212,7 @@ pub fn get_coord_storage(setup: &TestSetup) -> CoordinatorStorage {
 // Transaction helpers
 // =============================================================================
 
-/// Creates a funded, signed Bitcoin transaction that is **not yet broadcast**.
+/// Creates a funded, signed Bitcoin transaction that is not yet broadcast.
 ///
 /// Internally this:
 /// 1. Sends 'fund_amount' sats from the test wallet to itself (via `fund_address`),
@@ -165,24 +224,19 @@ pub fn get_coord_storage(setup: &TestSetup) -> CoordinatorStorage {
 ///
 /// The returned transaction is immediately valid for broadcast and can be
 /// handed to the coordinator for dispatch.
-fn create_signed_tx_to_dispatch_internal(
+/// Load the test wallet, fund a fresh address with `amount` (mines 1 block so it's confirmed),
+/// and lock the resulting UTXO so later `fund_address` calls don't spend it. Returns its outpoint.
+fn fund_and_lock_utxo(
     bitcoin_client: &BitcoinClient,
-    fund_amount: u64,
-    fee_amount: u64,
-) -> anyhow::Result<Transaction> {
-    // Ensure the wallet is loaded and get a wallet address.
+    amount: u64,
+) -> anyhow::Result<(bitcoin::Txid, u32)> {
     let wallet_address = bitcoin_client
         .init_wallet("test_wallet")
         .map_err(|e| anyhow::anyhow!("init_wallet failed: {:?}", e))?;
-
-    // Fund the wallet address (broadcasts + mines 1 block so the output is confirmed).
     let (funding_tx, funding_vout) = bitcoin_client
-        .fund_address(&wallet_address, Amount::from_sat(fund_amount))
+        .fund_address(&wallet_address, Amount::from_sat(amount))
         .map_err(|e| anyhow::anyhow!("fund_address failed: {:?}", e))?;
     let funding_txid = funding_tx.compute_txid();
-
-    // Lock the funding output so a later `fund_address` call on the same wallet
-    // doesn't pick it as an input
     bitcoin_client
         .client
         .lock_unspent(&[OutPoint {
@@ -190,44 +244,58 @@ fn create_signed_tx_to_dispatch_internal(
             vout: funding_vout,
         }])
         .map_err(|e| anyhow::anyhow!("lock_unspent failed: {:?}", e))?;
+    Ok((funding_txid, funding_vout))
+}
 
-    // Pick a fresh recipient address.
-    let recipient = bitcoin_client
+/// A fresh wallet-owned Bech32 address.
+fn fresh_wallet_address(bitcoin_client: &BitcoinClient) -> anyhow::Result<Address> {
+    Ok(bitcoin_client
         .client
-        .get_new_address(None, Some(bitcoincore_rpc::json::AddressType::Bech32))
-        .map_err(|e| anyhow::anyhow!("get_new_address failed: {:?}", e))?;
+        .get_new_address(None, Some(Bech32))
+        .map_err(|e| anyhow::anyhow!("get_new_address failed: {:?}", e))?
+        .assume_checked())
+}
 
-    // Build a raw transaction spending the funded UTXO.
-    let inputs = vec![bitcoincore_rpc::json::CreateRawTransactionInput {
+/// Build, sign, and decode a transaction spending `inputs` to `outputs`, returning it unbroadcast.
+/// `prevouts` supplies prevout info for inputs the wallet can't auto-locate (e.g. spending a parent
+/// that isn't on-chain yet); pass `None` when spending confirmed UTXOs.
+fn sign_spend(
+    bitcoin_client: &BitcoinClient,
+    inputs: &[CreateRawTransactionInput],
+    outputs: &HashMap<String, Amount>,
+    prevouts: Option<&[SignRawTransactionInput]>,
+) -> anyhow::Result<Transaction> {
+    let raw = bitcoin_client
+        .client
+        .create_raw_transaction(inputs, outputs, None, None)
+        .map_err(|e| anyhow::anyhow!("create_raw_transaction failed: {:?}", e))?;
+    let signed = bitcoin_client
+        .client
+        .sign_raw_transaction_with_wallet(&raw, prevouts, None)
+        .map_err(|e| anyhow::anyhow!("sign_raw_transaction_with_wallet failed: {:?}", e))?;
+    anyhow::ensure!(signed.complete, "signing incomplete: {:?}", signed.errors);
+    bitcoin::consensus::Decodable::consensus_decode(&mut &signed.hex[..])
+        .map_err(|e| anyhow::anyhow!("consensus_decode failed: {:?}", e))
+}
+
+fn create_signed_tx_to_dispatch_internal(
+    bitcoin_client: &BitcoinClient,
+    fund_amount: u64,
+    fee_amount: u64,
+) -> anyhow::Result<Transaction> {
+    let (funding_txid, funding_vout) = fund_and_lock_utxo(bitcoin_client, fund_amount)?;
+    let recipient = fresh_wallet_address(bitcoin_client)?;
+    let mut outputs = HashMap::new();
+    outputs.insert(
+        format!("{}", recipient),
+        Amount::from_sat(fund_amount - fee_amount),
+    );
+    let inputs = vec![CreateRawTransactionInput {
         txid: funding_txid,
         vout: funding_vout,
         sequence: None,
     }];
-    let mut outputs = std::collections::HashMap::new();
-    outputs.insert(
-        format!("{}", recipient.assume_checked()),
-        Amount::from_sat(fund_amount - fee_amount),
-    );
-    let raw_tx = bitcoin_client
-        .client
-        .create_raw_transaction(&inputs, &outputs, None, None)
-        .map_err(|e| anyhow::anyhow!("create_raw_transaction failed: {:?}", e))?;
-
-    // Sign with the wallet key.
-    let signed = bitcoin_client
-        .client
-        .sign_raw_transaction_with_wallet(&raw_tx, None, None)
-        .map_err(|e| anyhow::anyhow!("sign_raw_transaction_with_wallet failed: {:?}", e))?;
-    anyhow::ensure!(
-        signed.complete,
-        "Transaction signing incomplete: {:?}",
-        signed.errors
-    );
-
-    // Decode to a `Transaction` (still unbroadcast).
-    let tx = bitcoin::consensus::Decodable::consensus_decode(&mut &signed.hex[..])
-        .map_err(|e| anyhow::anyhow!("consensus_decode failed: {:?}", e))?;
-    Ok(tx)
+    sign_spend(bitcoin_client, &inputs, &outputs, None)
 }
 
 /// Creates a funded, signed Bitcoin transaction with 100 000 sats fee, ready for dispatch.
@@ -240,105 +308,112 @@ pub fn create_zero_fee_tx(bitcoin_client: &BitcoinClient) -> anyhow::Result<Tran
     create_signed_tx_to_dispatch_internal(bitcoin_client, 1_000_000, 0)
 }
 
+/// Build two conflicting signed, unbroadcast transactions (`t`, `t_prime`) that both
+/// spend the same confirmed wallet UTXO to different destinations. They therefore have
+/// different txids but cannot both be mined. Exactly the shape of a reorg double-spend
+/// (with `t` = our tx, `t_prime` = a competing counterparty/timeout spend).
+pub fn create_conflicting_txs(
+    bitcoin_client: &BitcoinClient,
+) -> anyhow::Result<(Transaction, Transaction)> {
+    // One confirmed UTXO both txs will fight over.
+    let (funding_txid, funding_vout) = fund_and_lock_utxo(bitcoin_client, 1_000_000)?;
+    let inputs = vec![CreateRawTransactionInput {
+        txid: funding_txid,
+        vout: funding_vout,
+        sequence: None,
+    }];
+
+    // Build + sign one spend of the shared UTXO to a fresh wallet address, paying `fee`.
+    let build = |fee: u64| -> anyhow::Result<Transaction> {
+        let recipient = fresh_wallet_address(bitcoin_client)?;
+        let mut outputs = HashMap::new();
+        outputs.insert(format!("{}", recipient), Amount::from_sat(1_000_000 - fee));
+        sign_spend(bitcoin_client, &inputs, &outputs, None)
+    };
+
+    // Different fees → different output amounts → different txids, same input.
+    let t = build(100_000)?;
+    let t_prime = build(50_000)?;
+    anyhow::ensure!(
+        t.compute_txid() != t_prime.compute_txid(),
+        "conflicting txs must have distinct txids"
+    );
+    Ok((t, t_prime))
+}
+
+/// Invalidate a block by hash, rolling the chain back below it (used to simulate reorgs).
+pub fn invalidate_block(
+    bitcoin_client: &BitcoinClient,
+    hash: &bitcoin::BlockHash,
+) -> anyhow::Result<()> {
+    bitcoin_client
+        .client
+        .invalidate_block(hash)
+        .map_err(|e| anyhow::anyhow!("invalidate_block failed: {:?}", e))
+}
+
+/// Mine a block containing exactly the given transactions (plus coinbase), ignoring the mempool.
+/// Returns the new block hash.
+pub fn generate_block_with(
+    bitcoin_client: &BitcoinClient,
+    address: &Address,
+    txs: &[&Transaction],
+) -> anyhow::Result<bitcoin::BlockHash> {
+    let owned: Vec<Transaction> = txs.iter().map(|tx| (*tx).clone()).collect();
+    bitcoin_client
+        .generate_block_with_txs(address, &owned)
+        .map_err(|e| anyhow::anyhow!("generateblock failed: {:?}", e))
+}
+
 /// Build a (parent, child) pair of signed, unbroadcast transactions where the
 /// child spends the parent's first output.  Both pay 100_000 sats in fees.
 pub fn create_parent_and_child_signed_txs(
     bitcoin_client: &BitcoinClient,
 ) -> (Transaction, Transaction) {
-    let wallet_address = bitcoin_client.init_wallet("test_wallet").unwrap();
-
     // Fund 2_000_000 sats so the parent + child chain can each pay a 100_000 fee.
-    let (funding_tx, funding_vout) = bitcoin_client
-        .fund_address(&wallet_address, Amount::from_sat(2_000_000))
-        .unwrap();
-    let funding_txid = funding_tx.compute_txid();
-    bitcoin_client
-        .client
-        .lock_unspent(&[OutPoint {
-            txid: funding_txid,
-            vout: funding_vout,
-        }])
-        .unwrap();
+    let (funding_txid, funding_vout) = fund_and_lock_utxo(bitcoin_client, 2_000_000).unwrap();
 
-    // Parent: spends funded UTXO and sends 1_900_000 sats to a wallet-owned
-    // address so the wallet can sign the child.
-    let parent_dest = bitcoin_client
-        .client
-        .get_new_address(None, Some(Bech32))
-        .unwrap()
-        .assume_checked();
+    // Parent: spends the funded UTXO and sends 1_900_000 sats to a wallet-owned address so the
+    // wallet can sign the child.
+    let parent_dest = fresh_wallet_address(bitcoin_client).unwrap();
     let mut parent_outputs = HashMap::new();
     parent_outputs.insert(format!("{}", parent_dest), Amount::from_sat(1_900_000));
-    let parent_raw = bitcoin_client
-        .client
-        .create_raw_transaction(
-            &[CreateRawTransactionInput {
-                txid: funding_txid,
-                vout: funding_vout,
-                sequence: None,
-            }],
-            &parent_outputs,
-            None,
-            None,
-        )
-        .unwrap();
-    let parent_signed = bitcoin_client
-        .client
-        .sign_raw_transaction_with_wallet(&parent_raw, None, None)
-        .unwrap();
-    assert!(
-        parent_signed.complete,
-        "Parent transaction signing incomplete: {:?}",
-        parent_signed.errors
-    );
-    let parent: Transaction = Decodable::consensus_decode(&mut &parent_signed.hex[..]).unwrap();
+    let parent = sign_spend(
+        bitcoin_client,
+        &[CreateRawTransactionInput {
+            txid: funding_txid,
+            vout: funding_vout,
+            sequence: None,
+        }],
+        &parent_outputs,
+        None,
+    )
+    .unwrap();
     let parent_txid = parent.compute_txid();
 
-    // Child: spends parent:0 and sends 1_800_000 sats to a fresh address.
-    let child_dest = bitcoin_client
-        .client
-        .get_new_address(None, Some(Bech32))
-        .unwrap()
-        .assume_checked();
-    let mut child_outputs = std::collections::HashMap::new();
+    // Child: spends parent:0 and sends 1_800_000 sats to a fresh address. The parent isn't on-chain
+    // yet, so supply its prevout explicitly for signing.
+    let child_dest = fresh_wallet_address(bitcoin_client).unwrap();
+    let mut child_outputs = HashMap::new();
     child_outputs.insert(format!("{}", child_dest), Amount::from_sat(1_800_000));
-    let child_raw = bitcoin_client
-        .client
-        .create_raw_transaction(
-            &[CreateRawTransactionInput {
-                txid: parent_txid,
-                vout: 0,
-                sequence: None,
-            }],
-            &child_outputs,
-            None,
-            None,
-        )
-        .unwrap();
-
-    // The parent isn't on-chain yet, so signrawtransactionwithwallet can't
-    // auto-locate its prevout. Supply it explicitly.
     let parent_out0 = &parent.output[0];
-    let child_signed = bitcoin_client
-        .client
-        .sign_raw_transaction_with_wallet(
-            &child_raw,
-            Some(&[bitcoincore_rpc::json::SignRawTransactionInput {
-                txid: parent_txid,
-                vout: 0,
-                script_pub_key: parent_out0.script_pubkey.clone(),
-                redeem_script: None,
-                amount: Some(parent_out0.value),
-            }]),
-            None,
-        )
-        .unwrap();
-    assert!(
-        child_signed.complete,
-        "Child transaction signing incomplete: {:?}",
-        child_signed.errors
-    );
-    let child: Transaction = Decodable::consensus_decode(&mut &child_signed.hex[..]).unwrap();
+    let child = sign_spend(
+        bitcoin_client,
+        &[CreateRawTransactionInput {
+            txid: parent_txid,
+            vout: 0,
+            sequence: None,
+        }],
+        &child_outputs,
+        Some(&[bitcoincore_rpc::json::SignRawTransactionInput {
+            txid: parent_txid,
+            vout: 0,
+            script_pub_key: parent_out0.script_pubkey.clone(),
+            redeem_script: None,
+            amount: Some(parent_out0.value),
+        }]),
+    )
+    .unwrap();
 
     (parent, child)
 }
@@ -400,45 +475,21 @@ pub fn create_coordinator_parent_tx(
         .map_err(|e| anyhow::anyhow!("compress pubkey: {:?}", e))?;
     let coordinator_addr = Address::p2wpkh(&compressed, network);
 
-    // Fund the test wallet so we have a confirmed UTXO to spend.
-    let wallet_addr = bitcoin_client
-        .init_wallet("test_wallet")
-        .map_err(|e| anyhow::anyhow!("init_wallet: {:?}", e))?;
-    let (funding_tx, funding_vout) = bitcoin_client
-        .fund_address(&wallet_addr, Amount::from_sat(output_sats + 100_000))
-        .map_err(|e| anyhow::anyhow!("fund_address: {:?}", e))?;
-    let funding_txid = funding_tx.compute_txid();
+    // Fund + lock a confirmed wallet UTXO to spend (fee = 100 000 sats).
+    let (funding_txid, funding_vout) = fund_and_lock_utxo(bitcoin_client, output_sats + 100_000)?;
 
-    // Build raw tx: wallet UTXO → coordinator address; fee = 100 000 sats.
+    // Build, sign, decode: wallet UTXO → coordinator address.
     let inputs = vec![CreateRawTransactionInput {
         txid: funding_txid,
         vout: funding_vout,
         sequence: None,
     }];
-    let mut outputs = std::collections::HashMap::new();
+    let mut outputs = HashMap::new();
     outputs.insert(
         format!("{}", coordinator_addr),
         Amount::from_sat(output_sats),
     );
-
-    let raw_tx = bitcoin_client
-        .client
-        .create_raw_transaction(&inputs, &outputs, None, None)
-        .map_err(|e| anyhow::anyhow!("create_raw_transaction: {:?}", e))?;
-
-    let signed = bitcoin_client
-        .client
-        .sign_raw_transaction_with_wallet(&raw_tx, None, None)
-        .map_err(|e| anyhow::anyhow!("sign_raw_transaction_with_wallet: {:?}", e))?;
-    anyhow::ensure!(signed.complete, "signing incomplete: {:?}", signed.errors);
-
-    bitcoin_client
-        .client
-        .lock_unspent(&[OutPoint::new(funding_txid, funding_vout)])
-        .map_err(|e| anyhow::anyhow!("lock_unspent: {:?}", e))?;
-
-    let tx: Transaction = bitcoin::consensus::Decodable::consensus_decode(&mut &signed.hex[..])
-        .map_err(|e| anyhow::anyhow!("decode tx: {:?}", e))?;
+    let tx = sign_spend(bitcoin_client, &inputs, &outputs, None)?;
 
     let speedup_data = SpeedupData::new(Utxo::new(tx.compute_txid(), 0, output_sats, &out_pub_key));
     Ok((tx, speedup_data))
@@ -495,8 +546,12 @@ pub fn tick_until_all_states(
     txids: &[bitcoin::Txid],
     expected_state: TransactionState,
     max_ticks: u32,
+    sleep_ms: Option<u64>, // Optional wall-clock pause before each tick, in milliseconds.
 ) -> Result<bool, BitcoinCoordinatorError> {
     for i in 0..max_ticks {
+        if let Some(ms) = sleep_ms {
+            std::thread::sleep(std::time::Duration::from_millis(ms));
+        }
         coordinator.tick()?;
         let all_reached = txids.iter().all(|txid| {
             storage
@@ -519,7 +574,7 @@ pub fn tick_until_all_states(
 }
 
 /// Evict all transactions from the mempool by advancing the node's mock clock
-/// past the default 336-hour mempool expiry window
+/// past the default mempool-expiry window (336 h) and triggering the sweep.
 pub fn expire_mempool(bitcoin_client: &BitcoinClient, address: &Address) -> anyhow::Result<()> {
     let best_hash = bitcoin_client
         .client
@@ -529,16 +584,23 @@ pub fn expire_mempool(bitcoin_client: &BitcoinClient, address: &Address) -> anyh
         .client
         .get_block_header_info(&best_hash)
         .map_err(|e| anyhow::anyhow!("get_block_header_info failed: {:?}", e))?;
-    // Jump past the Bitcoin Core default mempoolexpiry of 336 hours.
-    let eviction_time = header.time as i64 + 336 * 3600 + 1;
+
+    // Jump 15 days ahead, comfortably past the default 336 h (14 d) expiry.
+    let eviction_time = header.time as i64 + 15 * 24 * 3600;
     bitcoin_client
-        .client
-        .call::<serde_json::Value>(
-            "setmocktime", //TODO: abstract this behind a `set_mock_time` method on `BitcoinClient`
-            &[serde_json::Value::Number(eviction_time.into())],
-        )
+        .set_mock_time(eviction_time)
         .map_err(|e| anyhow::anyhow!("setmocktime failed: {:?}", e))?;
-    // Connecting a new block triggers expiry.
+
+    // Trigger the eviction sweep by pushing a fresh wallet tx through the
+    // mempool. The wallet was funded with mined blocks in `setup_wallet_and_mine_blocks`.
+    let wallet_addr = bitcoin_client
+        .init_wallet("test_wallet")
+        .map_err(|e| anyhow::anyhow!("init_wallet failed: {:?}", e))?;
+    bitcoin_client
+        .send_to_address(&wallet_addr, Amount::from_sat(1_000))
+        .map_err(|e| anyhow::anyhow!("sendtoaddress failed: {:?}", e))?;
+
+    // Advance height once so the coordinator sees a new block tick.
     mine_empty_blocks(bitcoin_client, 1, address)
 }
 
@@ -548,17 +610,9 @@ pub fn mine_empty_blocks(
     n: u64,
     address: &Address,
 ) -> anyhow::Result<()> {
-    let addr_str = address.to_string();
     for _ in 0..n {
-        bitcoin_client // TODO: abstract this behind a `mine_empty_block` method on `BitcoinClient`
-            .client
-            .call::<serde_json::Value>(
-                "generateblock",
-                &[
-                    serde_json::Value::String(addr_str.clone()),
-                    serde_json::Value::Array(vec![]),
-                ],
-            )
+        bitcoin_client
+            .mine_empty_block(address)
             .map_err(|e| anyhow::anyhow!("generateblock failed: {:?}", e))?;
     }
     Ok(())

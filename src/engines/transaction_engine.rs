@@ -6,7 +6,6 @@ use crate::{
     helper::find_tx_in_batch,
     types::{CoordinatedTx, CoordinatorNews, TransactionState, TxKind},
 };
-use bitcoin::Transaction;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use tracing::{debug, error, info, warn};
 
@@ -17,34 +16,6 @@ pub struct TransactionEngine {
 impl TransactionEngine {
     pub fn new(ctx: Rc<EngineContext>) -> Self {
         Self { ctx }
-    }
-
-    /// Step 4 of `tick`: broadcast every non-speedup transaction currently in
-    /// `ToDispatch` whose `target_block_height` has been reached.
-    pub fn dispatch_pending(&self) -> Result<(), BitcoinCoordinatorError> {
-        let current_height = self.ctx.monitor.get_monitor_height()?;
-        let active_txs = self.ctx.storage.get_active_txs()?;
-        if active_txs.is_empty() {
-            return Ok(());
-        }
-
-        let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
-        for tx in active_txs {
-            if matches!(tx.kind, TxKind::Speedup(_)) {
-                continue;
-            }
-            if tx.state == TransactionState::ToDispatch && tx.is_ready_to_dispatch(current_height) {
-                to_dispatch.push(tx);
-            }
-        }
-
-        if to_dispatch.is_empty() {
-            return Ok(());
-        }
-
-        debug!("Dispatching {} pending transactions", to_dispatch.len());
-        self.dispatch_batch(to_dispatch, current_height)?;
-        Ok(())
     }
 
     /// Step 1 of `tick`: walk in-flight non-speedup transactions and update
@@ -61,7 +32,8 @@ impl TransactionEngine {
         let to_review: Vec<CoordinatedTx> = active_txs
             .into_iter()
             .filter(|tx| {
-                !matches!(tx.kind, TxKind::Speedup(_))
+                // Speedups are handled by the speedup engine; Funding records are not broadcastable.
+                matches!(tx.kind, TxKind::Normal | TxKind::NeedsSpeedup(_))
                     && matches!(
                         tx.state,
                         TransactionState::InMempool | TransactionState::Confirmed
@@ -74,6 +46,35 @@ impl TransactionEngine {
         }
 
         self.review_transactions(to_review, current_height)?;
+        Ok(())
+    }
+
+    /// Step 3 of `tick`: broadcast every non-speedup transaction currently in
+    /// `ToDispatch` whose `target_block_height` has been reached.
+    pub fn dispatch_pending(&self) -> Result<(), BitcoinCoordinatorError> {
+        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let active_txs = self.ctx.storage.get_active_txs()?;
+        if active_txs.is_empty() {
+            return Ok(());
+        }
+
+        let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
+        for tx in active_txs {
+            // Speedups are handled by the speedup engine; Funding records are not broadcastable.
+            if matches!(tx.kind, TxKind::Speedup(_) | TxKind::Funding(_)) {
+                continue;
+            }
+            if tx.state == TransactionState::ToDispatch && tx.is_ready_to_dispatch(current_height) {
+                to_dispatch.push(tx);
+            }
+        }
+
+        if to_dispatch.is_empty() {
+            return Ok(());
+        }
+
+        debug!("Dispatching {} pending transactions", to_dispatch.len());
+        self.dispatch_batch(to_dispatch, current_height)?;
         Ok(())
     }
 
@@ -99,42 +100,45 @@ impl TransactionEngine {
             if status.is_in_mempool() {
                 if tx.state == TransactionState::Confirmed {
                     info!("Transaction({}) reorged back to mempool", tx.txid);
-                    self.ctx.handle_reorg(&tx, current_height)?;
+                    self.ctx.mark_reorg(&tx, current_height)?;
                 } else if tx.is_stuck_in_mempool(current_height) {
-                    warn!(
-                        "Transaction({}) stuck in mempool for {} blocks (threshold: {})",
-                        tx.txid,
-                        tx.broadcast_block_height
-                            .map(|h| current_height.saturating_sub(h))
-                            .unwrap_or(0),
-                        tx.stuck_in_mempool_blocks.unwrap_or(0),
-                    );
-                    self.ctx
-                        .storage
-                        .add_news(CoordinatorNews::TransactionStuckInMempool {
-                            txid: tx.txid,
-                            context: tx.context.clone(),
-                        })?;
+                    let news_was_added =
+                        self.ctx
+                            .storage
+                            .add_news(CoordinatorNews::TransactionStuckInMempool {
+                                txid: tx.txid,
+                                context: tx.context.clone(),
+                            })?;
+                    if news_was_added {
+                        warn!(
+                            "Transaction({}) stuck in mempool for {} blocks (threshold: {}). \
+                            This news will repeat once per block until the transaction is mined. \
+                            Options: (1) cancel() to stop tracking: the transaction remains in the \
+                            mempool but will no longer be monitored; (2) dispatch a CPFP via \
+                            dispatch_without_speedup() spending one of its outputs to raise the \
+                            effective fee rate: the coordinator will track both and mine them together.",
+                            tx.txid,
+                            tx.broadcast_block_height
+                                .map(|h| current_height.saturating_sub(h))
+                                .unwrap_or(0),
+                            tx.stuck_in_mempool_blocks.unwrap_or(0),
+                        );
+                    }
                 }
                 continue;
             }
 
             if status.is_not_found() {
                 debug!(
-                    "Transaction({}) not found, re-queuing for dispatch next tick",
+                    "Transaction({}) not found, re-queuing for dispatch this tick",
                     tx.txid
                 );
+                // Re-queue and arm the reorg-flap fail guard.
                 self.ctx
                     .storage
-                    .update_tx_state(tx.txid, TransactionState::ToDispatch)?;
-                // A NeedsSpeedup parent that has lost its mempool placement also loses its CPFP coverage
-                // Re-add the parent so that once the re-dispatch puts it back into InMempool, `create_cpfp_batch`
-                // will build a fresh CPFP
-                if matches!(tx.kind, TxKind::NeedsSpeedup(_)) {
-                    self.ctx
-                        .storage
-                        .prepend_pending_speedup_parents(vec![tx.txid])?;
-                }
+                    .requeue_not_found(tx.txid, current_height + max_confs)?;
+                // No need to re-add a NeedsSpeedup parent to PendingSpeedupParents here: the
+                // covering CPFP is independently re-queued in `review_speedups`'s not_found arm
                 continue;
             }
 
@@ -143,7 +147,7 @@ impl TransactionEngine {
                     "Transaction({}) finalized ({} confirmations)",
                     tx.txid, status.confirmations
                 );
-                self.ctx.handle_finalized(tx.txid, current_height)?;
+                self.ctx.mark_finalized(tx.txid, current_height)?;
                 continue;
             }
 
@@ -152,13 +156,13 @@ impl TransactionEngine {
                     "Transaction({}) confirmed ({} confirmations)",
                     tx.txid, status.confirmations
                 );
-                self.ctx.handle_confirmed(tx.txid)?;
+                self.ctx.mark_confirmed(tx.txid)?;
                 continue;
             }
 
             if status.is_orphan() {
                 debug!("Transaction({}) orphaned, keeping InMempool", tx.txid);
-                self.ctx.handle_orphan(tx.txid)?;
+                self.ctx.mark_orphan(tx.txid)?;
                 continue;
             }
 
@@ -186,8 +190,10 @@ impl TransactionEngine {
         }
 
         let txs = self.ctx.apply_retry_rate_limit(txs);
-        let raw_txs: Vec<Transaction> = txs.iter().map(|t| t.tx.clone()).collect();
-        let results = self.ctx.dispatcher.dispatch(raw_txs);
+        let results = self
+            .ctx
+            .dispatcher
+            .dispatch(txs.clone(), &self.ctx.monitor)?;
 
         for (txid, outcome) in results {
             let tx = find_tx_in_batch(&txs, txid)?;

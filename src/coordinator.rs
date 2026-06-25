@@ -2,7 +2,9 @@ use std::rc::Rc;
 
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::{
-    bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
+    bitcoin_client::{BitcoinClient, BitcoinClientApi},
+    rpc_config::RpcConfig,
+    types::BlockHeight,
 };
 use bitvmx_transaction_monitor::{
     monitor::Monitor,
@@ -12,7 +14,7 @@ use bitvmx_transaction_monitor::{
 use key_manager::key_manager::KeyManager;
 use protocol_builder::types::{output::SpeedupData, Utxo};
 use storage_backend::storage::Storage;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     config::{
@@ -27,7 +29,7 @@ use crate::{
         common::EngineContext, speedup_engine::SpeedupEngine, transaction_engine::TransactionEngine,
     },
     errors::BitcoinCoordinatorError,
-    types::{AckNews, CoordinatedTx, News, TransactionState, TxKind},
+    types::{AckNews, CoordinatedTx, CoordinatorNews, News, TransactionState, TxKind},
 };
 
 pub struct BitcoinCoordinator {
@@ -53,11 +55,25 @@ impl BitcoinCoordinator {
         settings.validate()?;
 
         let bitcoin_client = Rc::new(BitcoinClient::new_from_config(rpc_config)?);
+
+        // Fail fast if it is off.
+        if !bitcoin_client.is_txindex_enabled()? {
+            return Err(BitcoinCoordinatorError::InvalidConfiguration(
+                "the Bitcoin node must run with -txindex=1".to_string(),
+            ));
+        }
+
         let monitor = Monitor::new_with_paths(rpc_config, storage.clone(), Some(settings.monitor))?;
 
-        let funding_manager = FundingManager::new(settings.funding, storage.clone());
-        let coordinator_storage = CoordinatorStorage::new(storage, settings.storage);
-        let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client);
+        // Share a single Rc<CoordinatorStorage> between EngineContext and FundingManager.
+        let coordinator_storage = Rc::new(CoordinatorStorage::new(storage, settings.storage));
+        let cs_for_funding: Rc<CoordinatorStorage> = Rc::clone(&coordinator_storage);
+        let funding_storage: Rc<dyn crate::core::funding::FundingStorage> = cs_for_funding;
+        let funding_manager = FundingManager::new(settings.funding, funding_storage);
+        let cs_for_dispatcher: Rc<CoordinatorStorage> = Rc::clone(&coordinator_storage);
+        let dispatcher_storage: Rc<dyn crate::core::dispatcher::DispatcherStorage> =
+            cs_for_dispatcher;
+        let dispatcher = Dispatcher::new(settings.dispatcher, bitcoin_client, dispatcher_storage);
         let fee_manager = FeeManager::new(settings.fee);
         let coordinator_config = settings.coordinator;
 
@@ -97,10 +113,11 @@ impl BitcoinCoordinator {
     ///
     /// 1. Review in-flight non-speedups; no dispatch here.
     /// 2. Review in-flight speedups; no dispatch here.
-    /// 3. Dispatch TO-DISPATCH speedups built in a previous tick.
-    /// 4. Dispatch TO-DISPATCH non-speedups (parents and plain txs).
-    /// 5. Boost the latest live speedup if stale; save TO-DISPATCH for next tick.
-    /// 6. Build one CPFP batch for pending parents; save TO-DISPATCH for next tick.
+    /// 3. Dispatch `ToDispatch` non-speedups (parents and plain txs).
+    /// 4. Dispatch `ToDispatch` speedups built in a previous tick (or
+    ///    re-queued by step 2's not_found path).
+    /// 5. Boost the latest live speedup if stale; save `ToDispatch` for next tick.
+    /// 6. Build one CPFP batch for pending parents; save `ToDispatch` for next tick.
     pub fn tick(&self) -> Result<(), BitcoinCoordinatorError> {
         self.tx_engine.ctx.monitor.tick()?;
 
@@ -109,10 +126,13 @@ impl BitcoinCoordinator {
             return Ok(());
         }
 
+        let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
+        self.tx_engine.ctx.storage.cleanup_news(current_height)?; // Cleanup acknowledged news
+
         self.tx_engine.review_active()?;
         self.speedup_engine.review_speedups()?;
-        self.speedup_engine.dispatch_pending_speedups()?;
         self.tx_engine.dispatch_pending()?;
+        self.speedup_engine.dispatch_pending_speedups()?;
         self.speedup_engine.boost_if_stale()?;
         self.speedup_engine.create_cpfp_batch()?;
 
@@ -223,20 +243,25 @@ impl BitcoinCoordinator {
         }
     }
 
-    /// Cancels monitoring and removes the targeted transactions from coordinator
-    /// storage.
+    /// Cancels monitoring and removes the targeted transactions from coordinator storage.
     ///
-    /// * `data` - Monitoring entry to cancel. When it carries txids, those
-    ///   entries are also dropped from coordinator storage.
+    /// Only client-registered txs (`Normal` / `NeedsSpeedup`) still in `ToDispatch` state are cancellable.
+    /// Already-dispatched, Speedup-kind, Funding-kind, or missing txids are refused and a news item is
+    /// emitted per rejected txid. Non-`Transactions` variants (`OutputPattern`, `SpendingUTXOTransaction`,
+    /// `NewBlock`) pass through to monitor cancellation as-is.
+    ///
+    /// * `data` - Monitoring entry to cancel.
     pub fn cancel(&self, data: TypesToMonitor) -> Result<(), BitcoinCoordinatorError> {
-        self.tx_engine.ctx.monitor.cancel(data.clone())?;
-        if let TypesToMonitor::Transactions(txids, _, _) = data.clone() {
-            for txid in txids {
-                self.tx_engine.ctx.storage.remove_tx(txid)?;
+        match data {
+            TypesToMonitor::Transactions(txids, context, confirmation_trigger) => {
+                self.cancel_transactions(txids, context, confirmation_trigger)
+            }
+            other => {
+                self.tx_engine.ctx.monitor.cancel(other.clone())?;
+                info!("Cancelled monitoring for {:?}", other);
+                Ok(())
             }
         }
-        info!("Cancelled monitoring for {:?}", data);
-        Ok(())
     }
 
     /// Registers a funding UTXO available to pay future speedup fees. Emits an
@@ -269,8 +294,13 @@ impl BitcoinCoordinator {
     /// Returns all unacknowledged monitor and coordinator news. Internal
     /// CPFP/RBF speedup news entries are filtered out.
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
+        let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
         let monitor_news = self.tx_engine.ctx.monitor.get_news()?;
-        let coordinator_news = self.tx_engine.ctx.storage.get_news()?;
+        let coordinator_news = self
+            .tx_engine
+            .ctx
+            .storage
+            .get_and_mark_news(current_height)?;
 
         // Filter out internal coordinator transactions (CPFP/RBF speedups),
         // since the client's Context does not distinguish speedup variants.
@@ -298,7 +328,10 @@ impl BitcoinCoordinator {
     pub fn ack_news(&self, news: AckNews) -> Result<(), BitcoinCoordinatorError> {
         match news {
             AckNews::Monitor(n) => self.tx_engine.ctx.monitor.ack_news(n)?,
-            AckNews::Coordinator(n) => self.tx_engine.ctx.storage.ack_news(n)?,
+            AckNews::Coordinator(n) => {
+                let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
+                self.tx_engine.ctx.storage.ack_news(n, current_height)?;
+            }
         }
         Ok(())
     }
@@ -329,6 +362,16 @@ impl BitcoinCoordinator {
         stuck_in_mempool_blocks: Option<u32>,
     ) -> Result<(), BitcoinCoordinatorError> {
         let txid = tx.compute_txid();
+
+        // Check if the txid is already registered before doing any work.
+        if let Some(tx) = self.tx_engine.ctx.storage.get_tx_by_id(txid)? {
+            warn!(
+                "Transaction({}) is already registered, skipping. Transaction info: {:?}",
+                txid, tx
+            );
+            return Ok(());
+        }
+
         let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
         let target_height = target_block_height.unwrap_or(current_height);
         let fee_manager = &self.tx_engine.ctx.fee_manager;
@@ -353,6 +396,7 @@ impl BitcoinCoordinator {
             stuck_in_mempool_blocks,
             confirmation_trigger,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info,
             context,
@@ -366,5 +410,80 @@ impl BitcoinCoordinator {
         }
 
         Ok(())
+    }
+
+    /// Classify each txid, emit `InvalidCancel` news for rejected ones, then drop
+    /// PSP entries + cancel monitoring + remove storage for the eligible set.
+    fn cancel_transactions(
+        &self,
+        txids: Vec<Txid>,
+        context: String,
+        confirmation_trigger: Option<u32>,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let mut eligible: Vec<Txid> = Vec::new();
+        for txid in &txids {
+            match self.classify_cancel_request(*txid)? {
+                Ok(()) => eligible.push(*txid),
+                Err(reason) => {
+                    warn!(%txid, %reason, "cancel refused");
+                    self.tx_engine
+                        .ctx
+                        .storage
+                        .add_news(CoordinatorNews::InvalidCancel {
+                            txid: *txid,
+                            reason,
+                        })?;
+                }
+            }
+        }
+
+        if eligible.is_empty() {
+            return Ok(());
+        }
+
+        // Drop NeedsSpeedup parents from PSP explicitly.
+        for txid in &eligible {
+            self.tx_engine
+                .ctx
+                .storage
+                .remove_pending_speedup_parent(*txid)?;
+        }
+        self.tx_engine
+            .ctx
+            .monitor
+            .cancel(TypesToMonitor::Transactions(
+                eligible.clone(),
+                context,
+                confirmation_trigger,
+            ))?;
+        for txid in &eligible {
+            self.tx_engine.ctx.storage.remove_tx(*txid)?;
+        }
+        info!("Cancelled {} tx(s): {:?}", eligible.len(), eligible);
+        Ok(())
+    }
+
+    /// `Ok(Ok(()))` when the txid is eligible for cancel; `Ok(Err(reason))` when
+    /// rejected, with the reason string the operator will see in the news.
+    fn classify_cancel_request(
+        &self,
+        txid: Txid,
+    ) -> Result<Result<(), String>, BitcoinCoordinatorError> {
+        let Some(tx) = self.tx_engine.ctx.storage.get_tx_by_id(txid)? else {
+            return Ok(Err("tx not found in coordinator storage".to_string()));
+        };
+        if !matches!(tx.kind, TxKind::Normal | TxKind::NeedsSpeedup(_)) {
+            return Ok(Err(format!(
+                "tx kind {:?} is not cancellable (only Normal / NeedsSpeedup)",
+                tx.kind
+            )));
+        }
+        if tx.state != TransactionState::ToDispatch {
+            return Ok(Err(format!(
+                "tx already dispatched (state={:?}); cancel is only valid in ToDispatch",
+                tx.state
+            )));
+        }
+        Ok(Ok(()))
     }
 }

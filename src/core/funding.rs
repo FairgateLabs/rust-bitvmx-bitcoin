@@ -1,41 +1,51 @@
+use bitcoin::Txid;
 use protocol_builder::types::Utxo;
 use std::rc::Rc;
-use storage_backend::storage::{KeyValueStore, Storage};
 use tracing::warn;
 
 use crate::{
     config::config::FundingSettings,
     errors::BitcoinCoordinatorError,
-    types::{CoordinatedTx, CoordinatorNews, TransactionState},
+    types::{CoordinatedTx, CoordinatorNews, TransactionState, TxKind},
 };
 
-const FUNDING_KEY: &str = "bitcoin_coordinator/funding/utxo";
+/// Storage operations the funding manager needs.
+pub trait FundingStorage {
+    /// Read every `TxKind::Funding` record in insertion order.
+    fn read_funding_records(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError>;
 
-/// `FundingManager` owns its own storage slice (same underlying [`Storage`]
-/// shared with the rest of the coordinator, but under its own key prefix).
-/// It does not depend on [`CoordinatorStorage`].
+    /// Append a new funding record with `spent = false`.
+    fn append_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError>;
+
+    /// Toggle the spent flag on a stored record.
+    fn set_spent(&self, txid: Txid, spent: bool) -> Result<(), BitcoinCoordinatorError>;
+
+    /// Remove every funding record.
+    fn clear_funding_records(&self) -> Result<(), BitcoinCoordinatorError>;
+
+    /// On finalization of the speedup, replace every funding record whose utxo matches one of the speedup's
+    /// `funding_inputs` with a single new funding record holding the speedup's change output.
+    fn replace_funding_on_finalize(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError>;
+}
+
 pub struct FundingManager {
     settings: FundingSettings,
-    storage: Rc<Storage>,
+    storage: Rc<dyn FundingStorage>,
 }
 
 impl FundingManager {
-    pub fn new(settings: FundingSettings, storage: Rc<Storage>) -> Self {
+    pub fn new(settings: FundingSettings, storage: Rc<dyn FundingStorage>) -> Self {
         Self { settings, storage }
     }
 
-    /// Validate `utxo` and append it to the back of the funding queue. The
-    /// head of the queue (index 0) is the active base; subsequent entries are
-    /// pending fallbacks consumed in FIFO order by `advance_funding`.
+    /// Validate `utxo` and append it as an unspent funding record.
     pub fn set_funding(
         &self,
         utxo: Utxo,
     ) -> Result<Option<CoordinatorNews>, BitcoinCoordinatorError> {
         match self.validate(&utxo) {
             Ok(()) => {
-                let mut queue = self.read_queue()?;
-                queue.push(utxo);
-                self.write_queue(&queue)?;
+                self.storage.append_funding(utxo)?;
                 Ok(None)
             }
             Err(news) => {
@@ -45,19 +55,26 @@ impl FundingManager {
         }
     }
 
-    /// Unified funding query. Returns the correct spendable UTXO for the current
-    /// state of the speedup chain.
+    pub fn clear_funding(&self) -> Result<(), BitcoinCoordinatorError> {
+        self.storage.clear_funding_records()
+    }
+
+    pub fn has_funding(&self) -> Result<bool, BitcoinCoordinatorError> {
+        Ok(!self.storage.read_funding_records()?.is_empty())
+    }
+
+    /// First-call. Returns the chosen UTXO and a boolean. The bool is `true` for Speedup-kind
+    /// records and `false` for plain Funding-kind records. This is because combine is only valid
+    ///  when the primary is Speedup-kind.
     ///
-    /// Pass 1 (newest to oldest): last live speedup (`InMempool | Confirmed | Finalized`) whose
-    /// change output meets `min_funding_amount_sats`. If the chain tip exists but is too small,
-    /// older live txs are already spent by it, so Pass 1 stops and falls through.
-    ///
-    /// Pass 2: `get_base_funding()`, the head of the funding queue.
+    /// - Pass 1: latest live speedup in SpeedupList that is not being replaced and not already spent.
+    /// - Pass 2: first unspent record in FundingList (Funding or Speedup kind).
+    /// - `None`: no funding available.
     pub fn get_funding(
         &self,
         speedups: &[CoordinatedTx],
-    ) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
-        // Pass 1: live chain tip
+    ) -> Result<Option<(Utxo, bool)>, BitcoinCoordinatorError> {
+        // Pass 1: live unspent chain tip from SpeedupList.
         for tx in speedups.iter().rev() {
             if !matches!(
                 tx.state,
@@ -67,102 +84,73 @@ impl FundingManager {
             ) {
                 continue;
             }
-            let k = tx.speedup_kind()?;
-            // Skip a speedup that has been superseded by an RBF: its change UTXO
-            // will be invalidated once the replacement lands.
-            if k.context().is_being_replaced() {
+            let ctx = tx.speedup_kind()?.context();
+            if tx.has_live_replacement(speedups) || ctx.spent {
                 continue;
             }
-            if let Some(out) = tx.tx.output.last() {
-                let amount = out.value.to_sat();
-                if amount >= self.settings.min_funding_amount_sats {
-                    let vout = tx.tx.output.len().saturating_sub(1) as u32;
-                    return Ok(Some(Utxo::new(
-                        tx.txid,
-                        vout,
-                        amount,
-                        &k.context().funding_input.pub_key,
-                    )));
-                }
+            let (utxo, _spent) = tx.get_funding_info()?;
+            self.storage.set_spent(tx.txid, true)?;
+            return Ok(Some((utxo, true)));
+        }
+
+        // Pass 2: first unspent record in FundingList. May be a plain Funding entry (user-provided) or
+        // a Speedup entry (finalized chain tip moved into the queue by `replace_funding_on_finalize`).
+        for record in self.storage.read_funding_records()? {
+            let (utxo, spent) = record.get_funding_info()?;
+            if spent {
+                continue;
             }
-            // Chain tip is live but unusable (amount too small or no output).
-            // Older live txs are already spent, so stop Pass 1.
-            break;
+            self.storage.set_spent(record.txid, true)?;
+            let is_speedup = matches!(record.kind, TxKind::Speedup(_));
+            return Ok(Some((utxo, is_speedup)));
         }
-        // Pass 2: queue head (last finalized chain output, or user-provided funding)
-        self.get_base_funding()
+
+        // No funding available.
+        Ok(None)
     }
 
-    /// Return the head of the funding queue, or `None` if empty.
-    pub fn get_base_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
-        Ok(self.read_queue()?.into_iter().next())
-    }
-
-    /// Pop the head of the queue and return the new head, or `None` if the
-    /// queue is now empty.
-    pub fn advance_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
-        let mut queue = self.read_queue()?;
-        if queue.is_empty() {
-            return Ok(None);
+    /// Second-call when the primary alone cannot cover fee + dust. Returns the
+    /// next unspent Funding-kind record from the FundingList and marks it spent.
+    /// Does NOT auto-release on `None`.
+    pub fn get_combine_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
+        for record in self.storage.read_funding_records()? {
+            if !matches!(record.kind, TxKind::Funding(_)) {
+                continue;
+            }
+            let (utxo, spent) = record.get_funding_info()?;
+            if spent {
+                continue;
+            }
+            self.storage.set_spent(record.txid, true)?;
+            return Ok(Some(utxo));
         }
-        queue.remove(0);
-        self.write_queue(&queue)?;
-        Ok(queue.into_iter().next())
+        Ok(None)
     }
 
-    // Update the head of the queue with a new UTXO derived from a finalized speedup tx
-    pub fn update_funding_from_tx(
-        &self,
-        tx: &CoordinatedTx,
-    ) -> Result<(), BitcoinCoordinatorError> {
+    /// Unmark each UTXO in `utxos` when a build fails partway through.
+    pub fn release_marks(&self, utxos: &[Utxo]) -> Result<(), BitcoinCoordinatorError> {
+        for u in utxos {
+            // Mark as unspent
+            self.storage.set_spent(u.txid, false)?;
+        }
+        Ok(())
+    }
+
+    /// Release every funding input of `tx`.
+    pub fn mark_parents_unspent(&self, tx: &CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
         let k = tx.speedup_kind()?;
-        let (out, vout) = tx.last_output()?;
-        self.update_funding(Utxo::new(
-            tx.txid,
-            vout,
-            out.value.to_sat(),
-            &k.context().funding_input.pub_key,
-        ))?;
-        Ok(())
+        self.release_marks(&k.context().funding_inputs)
     }
 
-    /// Remove every funding UTXO from storage.
-    pub fn clear_funding(&self) -> Result<(), BitcoinCoordinatorError> {
-        self.storage.remove(FUNDING_KEY, None)?;
-        Ok(())
+    /// On finalization of the speedup, replace every funding record whose utxo matches one of the speedup's
+    /// `funding_inputs` with a single new funding record holding the speedup's change output.
+    pub fn replace_on_finalize(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
+        self.storage.replace_funding_on_finalize(txid)
     }
 
-    /// Return `true` when at least one funding UTXO is currently queued.
-    pub fn has_funding(&self) -> Result<bool, BitcoinCoordinatorError> {
-        Ok(!self.read_queue()?.is_empty())
-    }
-
-    // -------------------------------------------------------------------------
-    // Private helpers
-    // -------------------------------------------------------------------------
-
-    /// Overwrite the head of the funding queue without validation. Only
-    /// for `Finalized` txs, so the head always holds a confirmed UTXO and is
-    /// resilient to mempool evictions and reorgs.
-    fn update_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
-        let mut queue = self.read_queue()?;
-        if queue.is_empty() {
-            queue.push(utxo);
-        } else {
-            queue[0] = utxo;
-        }
-        self.write_queue(&queue)?;
-        Ok(())
-    }
-
-    fn read_queue(&self) -> Result<Vec<Utxo>, BitcoinCoordinatorError> {
-        Ok(self.storage.get(FUNDING_KEY, None)?.unwrap_or_default())
-    }
-
-    fn write_queue(&self, queue: &[Utxo]) -> Result<(), BitcoinCoordinatorError> {
-        self.storage.set(FUNDING_KEY, &queue, None)?;
-        Ok(())
-    }
+    // ---------------------------------------------------------------------
+    // Private
+    // ---------------------------------------------------------------------
 
     fn validate(&self, utxo: &Utxo) -> Result<(), CoordinatorNews> {
         if utxo.amount < self.settings.min_funding_amount_sats {
@@ -180,9 +168,10 @@ impl FundingManager {
 mod tests {
     use super::*;
     use crate::{
-        config::config::FundingSettings,
+        config::config::{CoordinatorStorageSettings, FundingSettings},
+        core::storage::CoordinatorStorage,
         test_utils::{utxo, StorageTestConfig},
-        types::{FeeInfo, SpeedupContext, SpeedupKind, TxKind},
+        types::{FeeInfo, SpeedupContext, SpeedupKind},
     };
     use bitcoin::{
         absolute::LockTime,
@@ -193,25 +182,35 @@ mod tests {
 
     const MIN: u64 = 10_000;
 
+    // -----------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------
+
     fn settings() -> FundingSettings {
         FundingSettings {
             min_funding_amount_sats: MIN,
         }
     }
 
-    fn make_manager() -> (FundingManager, StorageTestConfig) {
-        let config = StorageTestConfig::new();
-        let storage = config.get_raw_storage();
-        (FundingManager::new(settings(), storage), config)
+    fn make_manager() -> (FundingManager, Rc<CoordinatorStorage>) {
+        let backend = StorageTestConfig::new();
+        let storage = Rc::new(CoordinatorStorage::new(
+            backend.get_raw_storage(),
+            CoordinatorStorageSettings::default(),
+        ));
+        let mgr = FundingManager::new(settings(), Rc::clone(&storage) as Rc<dyn FundingStorage>);
+        (mgr, storage)
+    }
+
+    fn get_funding(mgr: &FundingManager, storage: &CoordinatorStorage) -> Option<(Utxo, bool)> {
+        mgr.get_funding(storage.get_speedups_ordered().unwrap().as_slice())
+            .unwrap()
     }
 
     fn det_txid(seed: u8) -> Txid {
         Txid::from_raw_hash(sha256d::Hash::hash(&[seed; 32]))
     }
 
-    /// Build a CPFP speedup tx with a deterministic txid (seed), given state,
-    /// funding_input, and change amount.  Each step in a chain should pass
-    /// `change_of(prev)` as the funding_input.
     fn speedup_tx(
         seed: u8,
         state: TransactionState,
@@ -219,28 +218,27 @@ mod tests {
         change_sats: u64,
     ) -> CoordinatedTx {
         let txid = det_txid(seed);
-        let change = bitcoin::TxOut {
-            value: Amount::from_sat(change_sats),
-            script_pubkey: bitcoin::ScriptBuf::new(),
-        };
         let tx = Transaction {
             version: Version::TWO,
             lock_time: LockTime::ZERO,
             input: vec![],
-            output: vec![change],
-        };
-        let context = SpeedupContext {
-            funding_input,
-            replaced_by: None,
-            bump_fee_used: 1.0,
-            parent_data: vec![],
+            output: vec![bitcoin::TxOut {
+                value: Amount::from_sat(change_sats),
+                script_pubkey: bitcoin::ScriptBuf::new(),
+            }],
         };
         CoordinatedTx {
             txid,
             tx,
             kind: TxKind::Speedup(SpeedupKind::CPFP {
                 parents: vec![],
-                context,
+                context: SpeedupContext {
+                    funding_inputs: vec![funding_input],
+                    replaced_by: None,
+                    bump_fee_used: 1.0,
+                    parent_data: vec![],
+                    spent: false,
+                },
             }),
             state,
             broadcast_block_height: None,
@@ -248,6 +246,7 @@ mod tests {
             stuck_in_mempool_blocks: None,
             confirmation_trigger: None,
             settled_block_height: None,
+            fail_guard_until: None,
             retry_count: 0,
             fee_info: FeeInfo {
                 fee: 0,
@@ -258,346 +257,373 @@ mod tests {
         }
     }
 
-    /// Derive the UTXO that the next tx in the chain should use as its
-    /// funding_input
-    fn change_of(tx: &CoordinatedTx) -> Utxo {
-        let out = tx.tx.output.last().unwrap();
-        let vout = (tx.tx.output.len() - 1) as u32;
-        let pub_key = match &tx.kind {
-            TxKind::Speedup(k) => k.context().funding_input.pub_key,
-            _ => panic!("expected Speedup"),
-        };
-        Utxo::new(tx.txid, vout, out.value.to_sat(), &pub_key)
+    fn funding_spent(storage: &CoordinatorStorage, txid: Txid) -> bool {
+        match storage.get_tx_by_id(txid).unwrap().unwrap().kind {
+            TxKind::Funding(d) => d.spent,
+            _ => panic!("expected Funding"),
+        }
     }
 
-    #[test]
-    fn test_set_valid_funding_persists() {
-        let (mgr, config) = make_manager();
-
-        let news = mgr.set_funding(utxo(MIN)).unwrap();
-        assert!(news.is_none());
-
-        let stored = mgr.get_base_funding().unwrap();
-        assert!(stored.is_some());
-        assert_eq!(stored.unwrap().amount, MIN);
-
-        drop(mgr);
-        config.remove().unwrap();
+    fn speedup_spent(storage: &CoordinatorStorage, txid: Txid) -> bool {
+        storage
+            .get_tx_by_id(txid)
+            .unwrap()
+            .unwrap()
+            .speedup_kind()
+            .unwrap()
+            .context()
+            .spent
     }
 
+    // A user adds funding UTXOs (valid and below-min), the manager hands them out in queue order,
+    // marks them spent, exhausts the queue, and correctly resets after clear_funding.
     #[test]
-    fn test_invalid_funding_keeps_queue() {
-        let (mgr, config) = make_manager();
+    fn test_funding_lifecycle() {
+        let (mgr, storage) = make_manager();
 
-        let valid = utxo(MIN);
-        mgr.set_funding(valid.clone()).unwrap();
-
+        // Below-min is rejected with news; nothing is stored.
         let news = mgr.set_funding(utxo(MIN - 1)).unwrap();
         assert!(matches!(
             news,
             Some(CoordinatorNews::InvalidFundingUtxo { .. })
         ));
-
-        // The invalid set_funding leaves the queue untouched.
-        let head = mgr.get_base_funding().unwrap().unwrap();
-        assert_eq!(head.txid, valid.txid);
-        assert_eq!(head.amount, MIN);
-        assert!(mgr.advance_funding().unwrap().is_none());
-
-        drop(mgr);
-        config.remove().unwrap();
-    }
-
-    #[test]
-    fn test_add_funding_appends_to_queue() {
-        let (mgr, config) = make_manager();
-
-        let a = utxo(MIN);
-        let b = utxo(MIN * 2);
-        mgr.set_funding(a.clone()).unwrap();
-        mgr.set_funding(b.clone()).unwrap();
-
-        // Head is the first added.
-        assert_eq!(mgr.get_base_funding().unwrap().unwrap().txid, a.txid);
-
-        // After advancing, the second entry becomes the head.
-        let new_head = mgr.advance_funding().unwrap().unwrap();
-        assert_eq!(new_head.txid, b.txid);
-        assert_eq!(mgr.get_base_funding().unwrap().unwrap().txid, b.txid);
-
-        drop(mgr);
-        config.remove().unwrap();
-    }
-
-    #[test]
-    fn test_advance_funding_returns_none_when_empty() {
-        let (mgr, config) = make_manager();
-
-        // Empty queue.
-        assert!(mgr.advance_funding().unwrap().is_none());
-
-        // Single-entry queue: advancing leaves the queue empty.
-        mgr.set_funding(utxo(MIN)).unwrap();
-        assert!(mgr.advance_funding().unwrap().is_none());
         assert!(!mgr.has_funding().unwrap());
 
-        drop(mgr);
-        config.remove().unwrap();
-    }
-
-    #[test]
-    fn test_update_funding_replaces_head_only() {
-        let (mgr, config) = make_manager();
-
-        let a = utxo(MIN);
-        let b = utxo(MIN * 2);
-        let c = utxo(MIN * 3);
-        mgr.set_funding(a).unwrap();
-        mgr.set_funding(b.clone()).unwrap();
-
-        // Replace the head; the tail (b) must remain.
-        mgr.update_funding(c.clone()).unwrap();
-        assert_eq!(mgr.get_base_funding().unwrap().unwrap().txid, c.txid);
-        assert_eq!(
-            mgr.advance_funding().unwrap().unwrap().txid,
-            b.txid,
-            "second queue entry must be preserved across update_funding"
-        );
-
-        drop(mgr);
-        config.remove().unwrap();
-    }
-
-    #[test]
-    fn test_funding_queue_survives_restart() {
-        let config = StorageTestConfig::new();
-        let storage = config.get_raw_storage();
-
-        let a = utxo(MIN);
-        let b = utxo(MIN * 2);
-
-        let mgr1 = FundingManager::new(settings(), Rc::clone(&storage));
-        mgr1.set_funding(a.clone()).unwrap();
-        mgr1.set_funding(b.clone()).unwrap();
-        drop(mgr1);
-
-        let mgr2 = FundingManager::new(settings(), Rc::clone(&storage));
-        assert_eq!(mgr2.get_base_funding().unwrap().unwrap().txid, a.txid);
-        assert_eq!(mgr2.advance_funding().unwrap().unwrap().txid, b.txid);
-        drop(mgr2);
-
-        drop(storage);
-        config.remove().unwrap();
-    }
-
-    #[test]
-    fn test_get_base_funding_when_empty() {
-        let (mgr, config) = make_manager();
-
-        let stored = mgr.get_base_funding().unwrap();
-        assert!(stored.is_none());
-
-        drop(mgr);
-        config.remove().unwrap();
-    }
-
-    #[test]
-    fn test_has_funding() {
-        let (mgr, config) = make_manager();
-
-        assert!(!mgr.has_funding().unwrap());
-        mgr.set_funding(utxo(MIN)).unwrap();
+        // Two valid UTXOs are stored in insertion order.
+        mgr.set_funding(utxo(MIN * 5)).unwrap();
+        mgr.set_funding(utxo(MIN * 3)).unwrap();
         assert!(mgr.has_funding().unwrap());
 
-        drop(mgr);
-        config.remove().unwrap();
-    }
+        // Pass 2 returns the first UTXO and marks it spent; queue order is preserved.
+        let (first, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(!is_speedup);
+        assert_eq!(first.amount, MIN * 5);
+        assert!(funding_spent(&storage, first.txid));
 
-    #[test]
-    fn test_update_funding_overwrites_without_validation() {
-        let (mgr, config) = make_manager();
+        let (second, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(!is_speedup);
+        assert_eq!(second.amount, MIN * 3);
+        assert!(funding_spent(&storage, second.txid));
 
-        // Below-minimum amount is accepted by update_funding (no validation).
-        mgr.update_funding(utxo(MIN - 1)).unwrap();
-        let stored = mgr.get_base_funding().unwrap().unwrap();
-        assert_eq!(stored.amount, MIN - 1);
+        // Both exhausted.
+        assert!(get_funding(&mgr, &storage).is_none());
 
-        // Overwrite with a different UTXO.
-        mgr.update_funding(utxo(MIN * 3)).unwrap();
-        let stored = mgr.get_base_funding().unwrap().unwrap();
-        assert_eq!(stored.amount, MIN * 3);
-
-        drop(mgr);
-        config.remove().unwrap();
-    }
-
-    #[test]
-    fn test_clear_funding() {
-        let (mgr, config) = make_manager();
-
-        mgr.set_funding(utxo(MIN)).unwrap();
+        // clear_funding wipes the queue; new funding can be added afterwards.
         mgr.clear_funding().unwrap();
         assert!(!mgr.has_funding().unwrap());
-
-        drop(mgr);
-        config.remove().unwrap();
+        mgr.set_funding(utxo(MIN * 2)).unwrap();
+        assert!(mgr.has_funding().unwrap());
     }
 
-    /// Simulates a coordinator restart: a second `FundingManager` built from
-    /// the same storage must see the UTXO set by the first.
+    // A live InMempool speedup (chain-tip) is always preferred over the user-provided queue.
+    // Once the chain tip is being replaced or is ToDispatch (not yet live), the manager falls
+    // through to the queue.
     #[test]
-    fn test_funding_survives_restart() {
-        let config = StorageTestConfig::new();
-        let storage = config.get_raw_storage();
+    fn test_chain_tip_preferred_over_queue() {
+        let (mgr, storage) = make_manager();
 
-        let mgr1 = FundingManager::new(settings(), Rc::clone(&storage));
-        mgr1.set_funding(utxo(MIN * 2)).unwrap();
-        drop(mgr1);
+        let q = utxo(MIN * 10);
+        mgr.set_funding(q.clone()).unwrap();
 
-        let mgr2 = FundingManager::new(settings(), Rc::clone(&storage));
-        let stored = mgr2.get_base_funding().unwrap();
-        assert!(stored.is_some());
-        assert_eq!(stored.unwrap().amount, MIN * 2);
-        drop(mgr2);
+        // A ToDispatch speedup is NOT live. Pass 1 must skip it and return the queue.
+        let s_pending = speedup_tx(0, TransactionState::ToDispatch, q.clone(), MIN * 9);
+        storage.insert_speedup(s_pending.clone()).unwrap();
+        let (got, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(
+            !is_speedup,
+            "ToDispatch speedup must not count as chain tip"
+        );
+        assert_eq!(got.txid, q.txid);
+        storage.set_spent(q.txid, false).unwrap(); // reset for next sub-scenario
 
-        drop(storage);
-        config.remove().unwrap();
+        // An InMempool speedup is the chain tip and takes priority over the queue.
+        let s1 = speedup_tx(1, TransactionState::InMempool, q.clone(), MIN * 8);
+        storage.insert_speedup(s1.clone()).unwrap();
+
+        let (got, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(is_speedup, "InMempool speedup must be preferred over queue");
+        assert_eq!(got.txid, s1.txid);
+        assert_eq!(got.amount, MIN * 8);
+        assert!(speedup_spent(&storage, s1.txid));
+        assert!(
+            !funding_spent(&storage, q.txid),
+            "queue UTXO must be untouched"
+        );
+
+        // Mark s1 as being replaced (and reset spent so pass 1 would otherwise pick it).
+        let mut s1_replaced = storage.get_tx_by_id(s1.txid).unwrap().unwrap();
+        if let TxKind::Speedup(SpeedupKind::CPFP {
+            ref mut context, ..
+        }) = s1_replaced.kind
+        {
+            context.replaced_by = Some(det_txid(99));
+            context.spent = false;
+        }
+        storage.update_tx(&s1_replaced).unwrap();
+
+        // Pass 1 skips the replaced tip; pass 2 returns the queue UTXO.
+        let (got2, is_speedup2) = get_funding(&mgr, &storage).unwrap();
+        assert!(
+            !is_speedup2,
+            "replaced tip must be skipped; fall through to queue"
+        );
+        assert_eq!(got2.txid, q.txid);
+        assert!(funding_spent(&storage, q.txid));
+
+        // Both sources exhausted.
+        assert!(get_funding(&mgr, &storage).is_none());
     }
 
-    // -------------------------------------------------------------------------
-    // get_funding tests
-    // -------------------------------------------------------------------------
-
-    // Pass 2: no speedups, no stored UTXO returns None.
+    // Three CPFP rounds. Each round the chain tip advances as speedups go InMempool and finalize.
+    // replace_on_finalize keeps the funding queue pointing at the latest change output. A mismatch
+    // on replace_on_finalize is also verified at the end.
     #[test]
-    fn test_get_funding_empty() {
-        let (mgr, config) = make_manager();
-        assert!(mgr.get_funding(&[]).unwrap().is_none());
-        drop(mgr);
-        config.remove().unwrap();
+    fn test_cpfp_chain_multi_round() {
+        let (mgr, storage) = make_manager();
+
+        // Round 1: fresh start, no speedups. Pass 2 returns the user's queue UTXO.
+        let q1_amount = MIN * 100;
+        mgr.set_funding(utxo(q1_amount)).unwrap();
+        let (q1, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(!is_speedup);
+        assert_eq!(q1.amount, q1_amount);
+
+        // Build S1 consuming Q1.
+        let c1_sats = q1_amount - 1_000;
+        let s1 = speedup_tx(1, TransactionState::InMempool, q1.clone(), c1_sats);
+        storage.insert_speedup(s1.clone()).unwrap();
+
+        // Round 2: S1 is the live chain tip. Pass 1 returns S1's change.
+        let (s1_change, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(is_speedup);
+        assert_eq!(s1_change.txid, s1.txid);
+        assert_eq!(s1_change.amount, c1_sats);
+        assert!(speedup_spent(&storage, s1.txid));
+
+        // Build S2 consuming S1's change.
+        let c2_sats = c1_sats - 1_000;
+        let s2 = speedup_tx(2, TransactionState::InMempool, s1_change.clone(), c2_sats);
+        storage.insert_speedup(s2.clone()).unwrap();
+
+        // S1 finalizes: queue entry for Q1 is replaced with S1's change.
+        let mut s1_final = storage.get_tx_by_id(s1.txid).unwrap().unwrap();
+        s1_final.state = TransactionState::Finalized;
+        storage.update_tx(&s1_final).unwrap();
+        mgr.replace_on_finalize(s1.txid).unwrap();
+
+        // Round 3: S1 finalized+spent, S2 live. Pass 1 returns S2's change.
+        let (s2_change, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(is_speedup);
+        assert_eq!(s2_change.txid, s2.txid);
+        assert_eq!(s2_change.amount, c2_sats);
+        assert!(speedup_spent(&storage, s2.txid));
+
+        // Build S3 consuming S2's change.
+        let c3_sats = c2_sats - 1_000;
+        let s3 = speedup_tx(3, TransactionState::InMempool, s2_change.clone(), c3_sats);
+        storage.insert_speedup(s3.clone()).unwrap();
+
+        // S2 finalizes: queue advances from S1's change to S2's change.
+        let mut s2_final = storage.get_tx_by_id(s2.txid).unwrap().unwrap();
+        s2_final.state = TransactionState::Finalized;
+        storage.update_tx(&s2_final).unwrap();
+        mgr.replace_on_finalize(s2.txid).unwrap();
+
+        // Funding queue now holds S2's change as the single entry.
+        let records = storage.read_funding_records().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].txid, s2.txid);
+
+        // replace_on_finalize on a tx whose funding_inputs don't match any queue entry
+        // is treated defensively: warn + Ok(()), queue untouched.
+        let unrelated = speedup_tx(9, TransactionState::Finalized, utxo(MIN * 50), MIN * 40);
+        storage.insert_tx(unrelated.clone()).unwrap();
+        mgr.replace_on_finalize(unrelated.txid).unwrap();
+        let records_after = storage.read_funding_records().unwrap();
+        assert_eq!(records_after.len(), 1);
+        assert_eq!(records_after[0].txid, s2.txid);
     }
 
-    // Pass 2: no speedups, stored UTXO returns the stored UTXO.
+    // A sub-minimum leftover sits at the front of the queue. A second UTXO is added by the user. get_funding
+    // picks the leftover as primary; get_combine_funding picks the second as the combine partner. On build
+    // failure, release_marks restores both. When there is no combine partner at all, get_combine_funding
+    // returns None and auto-releases the primary.
     #[test]
-    fn test_get_funding_no_speedups() {
-        let (mgr, config) = make_manager();
+    fn test_combine_leftover_sweep_and_release() {
+        let (mgr, storage) = make_manager();
+
+        // A sub-minimum leftover enters the queue directly.
+        let leftover = utxo(MIN / 2);
+        storage.append_funding(leftover.clone()).unwrap();
+
+        // A proper second UTXO from the user.
+        let q2 = utxo(MIN * 5);
+        mgr.set_funding(q2.clone()).unwrap();
+
+        // get_funding returns the leftover (first unspent in queue).
+        let (primary, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(!is_speedup);
+        assert_eq!(primary.txid, leftover.txid);
+        assert!(funding_spent(&storage, leftover.txid));
+        assert!(!funding_spent(&storage, q2.txid));
+
+        // get_combine_funding skips the already-spent leftover via the spent filter and returns Q2.
+        let secondary = mgr.get_combine_funding().unwrap().unwrap();
+        assert_eq!(secondary.txid, q2.txid);
+        assert!(funding_spent(&storage, q2.txid));
+
+        // Build failure: release_marks restores both entries.
+        mgr.release_marks(&[primary, secondary]).unwrap();
+        assert!(!funding_spent(&storage, leftover.txid));
+        assert!(!funding_spent(&storage, q2.txid));
+
+        // With only one UTXO in the queue, combine returns None and DOES NOT release.
+        mgr.clear_funding().unwrap();
+        mgr.set_funding(utxo(MIN * 3)).unwrap();
+        let (sole, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(!is_speedup);
+        let combine = mgr.get_combine_funding().unwrap();
+        assert!(
+            combine.is_none(),
+            "no second entry means no combine partner"
+        );
+        assert!(
+            funding_spent(&storage, sole.txid),
+            "primary stays spent on combine None — caller owns the release"
+        );
+        // Caller releases explicitly.
+        mgr.release_marks(&[sole.clone()]).unwrap();
+        assert!(!funding_spent(&storage, sole.txid));
+    }
+
+    // get_funding claims a UTXO (marks it spent); the build later fails. mark_parents_unspent must
+    // restore the spent flag so the next tick can retry with the same UTXO. The cycle then completes:
+    // funding is re-claimed and the second build succeeds via get_funding returning the same UTXO again.
+    #[test]
+    fn test_failed_build_releases_funding() {
+        let (mgr, storage) = make_manager();
+
         mgr.set_funding(utxo(MIN * 4)).unwrap();
-        assert_eq!(mgr.get_funding(&[]).unwrap().unwrap().amount, MIN * 4);
-        drop(mgr);
-        config.remove().unwrap();
+        let (claimed, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(!is_speedup);
+        assert!(funding_spent(&storage, claimed.txid));
+
+        // A speedup in ToDispatch references the claimed UTXO as its funding input.
+        let s = speedup_tx(5, TransactionState::ToDispatch, claimed.clone(), MIN * 2);
+        storage.insert_speedup(s.clone()).unwrap();
+
+        // Build fails: mark_parents_unspent releases the funding record.
+        mgr.mark_parents_unspent(&s).unwrap();
+        assert!(!funding_spent(&storage, claimed.txid));
+
+        // Next round: same UTXO is available again.
+        let (reclaimed, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(!is_speedup);
+        assert_eq!(reclaimed.txid, claimed.txid);
+
+        // A chain-tip speedup's context.spent is also released correctly via release_marks.
+        let tip = speedup_tx(6, TransactionState::InMempool, reclaimed.clone(), MIN * 3);
+        storage.insert_speedup(tip.clone()).unwrap();
+        let (tip_funding, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(is_speedup);
+        assert!(speedup_spent(&storage, tip.txid));
+        mgr.release_marks(&[tip_funding]).unwrap();
+        assert!(!speedup_spent(&storage, tip.txid));
     }
 
-    // Pass 1: InMempool speedup returns its change output.
+    // S1 is InMempool with a tiny change that cannot cover the next speedup fee alone. A
+    // second user-provided queue UTXO Q2 is present. get_funding returns S1's chain-tip
+    // change; get_combine_funding picks Q2. S2 is built with both as funding_inputs. When
+    // S2 finalize, replace_on_finalize removes both old funding records and replaces them with
+    // a single record pointing to S2's change output.
     #[test]
-    fn test_get_funding_in_mempool() {
-        let (mgr, config) = make_manager();
-        let root = utxo(MIN * 4);
-        let cpfp1 = speedup_tx(1, TransactionState::InMempool, root, MIN * 3);
-        let result = mgr.get_funding(&[cpfp1.clone()]).unwrap().unwrap();
-        assert_eq!(result.txid, cpfp1.txid);
-        assert_eq!(result.vout, 0);
-        assert_eq!(result.amount, MIN * 3);
-        drop(mgr);
-        config.remove().unwrap();
-    }
+    fn test_combined_funding_and_replace_on_finalize() {
+        let (mgr, storage) = make_manager();
 
-    // Pass 1: newest live wins (CPFP2 Finalized over CPFP1 Confirmed).
-    // Regression: derive_funding skipped Finalized, returning CPFP1's change (already spent).
-    #[test]
-    fn test_get_funding_confirmed_then_finalized() {
-        let (mgr, config) = make_manager();
-        let root = utxo(MIN * 4);
-        let cpfp1 = speedup_tx(1, TransactionState::Confirmed, root, MIN * 3);
-        let cpfp2 = speedup_tx(2, TransactionState::Finalized, change_of(&cpfp1), MIN * 2);
-        let result = mgr.get_funding(&[cpfp1, cpfp2.clone()]).unwrap().unwrap();
-        assert_eq!(result.txid, cpfp2.txid);
-        assert_eq!(result.amount, MIN * 2);
-        drop(mgr);
-        config.remove().unwrap();
-    }
+        // A prior speedup's change is already in the funding queue, spent because S1
+        // already consumed it when S1 was originally built.
+        let s_prev_change = utxo(MIN * 50);
+        storage.append_funding(s_prev_change.clone()).unwrap();
+        storage.set_spent(s_prev_change.txid, true).unwrap();
 
-    // Pass 1: both Finalized returns newer one's change.
-    #[test]
-    fn test_get_funding_all_finalized() {
-        let (mgr, config) = make_manager();
-        let root = utxo(MIN * 4);
-        let cpfp1 = speedup_tx(1, TransactionState::Finalized, root, MIN * 3);
-        let cpfp2 = speedup_tx(2, TransactionState::Finalized, change_of(&cpfp1), MIN * 2);
-        let result = mgr.get_funding(&[cpfp1, cpfp2.clone()]).unwrap().unwrap();
-        assert_eq!(result.txid, cpfp2.txid);
-        assert_eq!(result.amount, MIN * 2);
-        drop(mgr);
-        config.remove().unwrap();
-    }
+        // S1: InMempool, consumes s_prev_change, tiny change output.
+        let s1_change_sats = MIN / 3;
+        let s1 = speedup_tx(
+            1,
+            TransactionState::InMempool,
+            s_prev_change.clone(),
+            s1_change_sats,
+        );
+        storage.insert_speedup(s1.clone()).unwrap();
 
-    // Pass 2: all ToDispatch (chain evicted from mempool) returns stored base UTXO.
-    #[test]
-    fn test_get_funding_all_evicted() {
-        let (mgr, config) = make_manager();
-        let root = utxo(MIN * 4);
-        mgr.set_funding(root.clone()).unwrap();
-        let cpfp1 = speedup_tx(1, TransactionState::ToDispatch, root.clone(), MIN * 3);
-        let cpfp2 = speedup_tx(2, TransactionState::ToDispatch, change_of(&cpfp1), MIN * 2);
-        let result = mgr.get_funding(&[cpfp1, cpfp2]).unwrap().unwrap();
-        assert_eq!(result.txid, root.txid);
-        assert_eq!(result.amount, MIN * 4);
-        drop(mgr);
-        config.remove().unwrap();
-    }
+        // Q2: fresh user-provided queue UTXO.
+        let q2 = utxo(MIN * 20);
+        mgr.set_funding(q2.clone()).unwrap();
 
-    // Pass 2: Failed speedup returns stored base UTXO (same invariant as above).
-    #[test]
-    fn test_get_funding_failed() {
-        let (mgr, config) = make_manager();
-        let root = utxo(MIN * 4);
-        mgr.set_funding(root.clone()).unwrap();
-        let cpfp1 = speedup_tx(1, TransactionState::Failed, root.clone(), MIN * 3);
-        let result = mgr.get_funding(&[cpfp1]).unwrap().unwrap();
-        assert_eq!(result.txid, root.txid);
-        assert_eq!(result.amount, MIN * 4);
-        drop(mgr);
-        config.remove().unwrap();
-    }
+        // Pass 1: S1's chain-tip change is returned; S1.context.spent is set.
+        let (chain_tip, is_speedup) = get_funding(&mgr, &storage).unwrap();
+        assert!(is_speedup);
+        assert_eq!(chain_tip.txid, s1.txid);
+        assert_eq!(chain_tip.amount, s1_change_sats);
+        assert!(speedup_spent(&storage, s1.txid));
 
-    // Pass 1 skips chain tip below min_funding_amount_sats; Pass 2 returns stored UTXO.
-    // Ensures a fresh set_funding call is honoured even while a dust chain tip is live.
-    #[test]
-    fn test_get_funding_chain_tip_too_small_uses_stored() {
-        let (mgr, config) = make_manager();
-        let fresh = utxo(MIN * 4);
-        mgr.set_funding(fresh.clone()).unwrap();
-        let root = utxo(MIN * 2);
-        let cpfp1 = speedup_tx(1, TransactionState::InMempool, root, MIN - 1);
-        let result = mgr.get_funding(&[cpfp1]).unwrap().unwrap();
-        assert_eq!(result.txid, fresh.txid);
-        assert_eq!(result.amount, MIN * 4);
-        drop(mgr);
-        config.remove().unwrap();
-    }
+        // s_prev_change is already spent → skipped. Q2 is the combine partner.
+        let secondary = mgr.get_combine_funding().unwrap().unwrap();
+        assert_eq!(secondary.txid, q2.txid);
+        assert!(funding_spent(&storage, q2.txid));
 
-    #[test]
-    fn test_skip_being_replaced() {
-        let (mgr, config) = make_manager();
-        let root = utxo(MIN * 4);
-        let cpfp1 = speedup_tx(1, TransactionState::InMempool, root.clone(), MIN * 3);
-        let mut cpfp2 = speedup_tx(2, TransactionState::InMempool, change_of(&cpfp1), MIN * 2);
-        // Simulate cpfp1 being replaced by an RBF before it confirms.
-        cpfp2.kind = TxKind::Speedup(SpeedupKind::RBF {
-            replaces: cpfp1.txid,
-            context: SpeedupContext {
-                funding_input: change_of(&cpfp1),
-                replaced_by: None,
-                bump_fee_used: 1.0,
-                parent_data: vec![],
-            },
-        });
-        let result = mgr
-            .get_funding(&[cpfp1.clone(), cpfp2.clone()])
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.txid, cpfp2.txid);
-        assert_eq!(result.amount, MIN * 2);
-        drop(mgr);
-        config.remove().unwrap();
+        // Build S2 with both funding inputs.
+        let s2_change_sats = MIN * 10;
+        let mut s2 = speedup_tx(
+            2,
+            TransactionState::InMempool,
+            chain_tip.clone(),
+            s2_change_sats,
+        );
+        if let TxKind::Speedup(SpeedupKind::CPFP {
+            ref mut context, ..
+        }) = s2.kind
+        {
+            context.funding_inputs = vec![chain_tip.clone(), secondary.clone()];
+        }
+        storage.insert_speedup(s2.clone()).unwrap();
+
+        // S1 finalizes: s_prev_change funding record is replaced by a new record at
+        // S1.txid carrying S1's change output (spent=true because S1.context.spent is true).
+        let mut s1_fin = storage.get_tx_by_id(s1.txid).unwrap().unwrap();
+        s1_fin.state = TransactionState::Finalized;
+        storage.update_tx(&s1_fin).unwrap();
+        mgr.replace_on_finalize(s1.txid).unwrap();
+
+        let mid = storage.read_funding_records().unwrap();
+        assert_eq!(mid.len(), 2, "S1's change + Q2 must both be in the queue");
+        assert_eq!(mid[0].txid, s1.txid);
+        assert_eq!(mid[1].txid, q2.txid);
+
+        // S2 finalizes: both S1.txid and Q2.txid funding records are matched by
+        // S2.funding_inputs and replaced by a single record for S2's change output.
+        let mut s2_fin = storage.get_tx_by_id(s2.txid).unwrap().unwrap();
+        s2_fin.state = TransactionState::Finalized;
+        storage.update_tx(&s2_fin).unwrap();
+        mgr.replace_on_finalize(s2.txid).unwrap();
+
+        let final_records = storage.read_funding_records().unwrap();
+        assert_eq!(
+            final_records.len(),
+            1,
+            "both old records must be replaced by one"
+        );
+        assert_eq!(final_records[0].txid, s2.txid);
+        match &final_records[0].kind {
+            TxKind::Speedup(k) => {
+                assert!(
+                    !k.context().spent,
+                    "S2 was never claimed; context.spent stays false"
+                );
+            }
+            _ => panic!("expected TxKind::Speedup (kind preserved on finalize)"),
+        }
+        let (change_out, _) = final_records[0].last_output().unwrap();
+        assert_eq!(change_out.value.to_sat(), s2_change_sats);
     }
 }
