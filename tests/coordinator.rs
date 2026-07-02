@@ -426,13 +426,11 @@ fn test_add_funding_validation() {
         fundings
     );
     assert_eq!(
-        fundings[0].get_funding_info().unwrap().0,
-        first_utxo,
+        fundings[0].utxo, first_utxo,
         "first valid UTXO must be in storage"
     );
     assert_eq!(
-        fundings[1].get_funding_info().unwrap().0,
-        third_utxo,
+        fundings[1].utxo, third_utxo,
         "second valid UTXO must be in storage"
     );
 
@@ -785,7 +783,7 @@ fn test_cancel_dispatched_tx_refused() {
     // Batch cancel mixing all three rejection causes:
     //   - txid:           Normal in InMempool → refused (state).
     //   - unknown_txid:   never registered    → refused (not found).
-    //   - funding_txid:   Funding-kind        → refused (kind).
+    //   - funding_txid:   funding UTXO, not a tracked tx → refused (not found).
     coordinator
         .cancel(TypesToMonitor::Transactions(
             vec![txid, unknown_txid, funding_txid],
@@ -794,14 +792,18 @@ fn test_cancel_dispatched_tx_refused() {
         ))
         .unwrap();
 
-    // All three records (the present ones) must remain in storage.
+    // The dispatched tx must remain in storage, and the funding UTXO must remain in the funding queue.
     assert!(
         coord_storage.get_tx_by_id(txid).unwrap().is_some(),
         "dispatched tx must REMAIN in storage after cancel was refused"
     );
     assert!(
-        coord_storage.get_tx_by_id(funding_txid).unwrap().is_some(),
-        "Funding-kind record must REMAIN in storage after cancel was refused"
+        coord_storage
+            .read_funding_records()
+            .unwrap()
+            .iter()
+            .any(|r| r.utxo.txid == funding_txid),
+        "funding UTXO must REMAIN in the funding queue after cancel was refused"
     );
 
     // One InvalidCancel news per refused entry.

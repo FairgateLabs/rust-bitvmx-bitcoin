@@ -1,15 +1,20 @@
 mod common;
 use common::*;
 
-use bitcoin::Network;
+use std::rc::Rc;
+
+use bitcoin::{Network, OutPoint};
 use bitcoin_coordinator::{
     config::config::{
         BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings, FeeSettings,
-        SpeedupSettings,
+        FundingSettings, SpeedupSettings,
     },
     coordinator::BitcoinCoordinator,
-    core::{funding::FundingStorage, storage::CoordinatorStorage},
-    types::{CoordinatorNews, TransactionState, TxKind},
+    core::{
+        funding::{FundingManager, FundingStorage},
+        storage::CoordinatorStorage,
+    },
+    types::{CoordinatorNews, TransactionState},
 };
 use bitcoincore_rpc::RpcApi as _;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
@@ -31,9 +36,7 @@ fn cpfp_settings() -> BitcoinSettings {
         },
         speedup: SpeedupSettings {
             max_unconfirmed_speedups: 2, // A second boost creates RBF
-            max_rbf_attempts: 10,
             min_blocks_before_resend_speedup: 1, // Enables boost after one block
-            rbf_fee_multiplier: 1.5,
             bump_fee_percentage: 1.5,
         },
         coordinator: CoordinatorSettings {
@@ -49,9 +52,7 @@ fn boost_settings(max_unconfirmed: u32) -> BitcoinSettings {
     BitcoinSettings {
         speedup: SpeedupSettings {
             max_unconfirmed_speedups: max_unconfirmed,
-            max_rbf_attempts: 10,
             min_blocks_before_resend_speedup: 1,
-            rbf_fee_multiplier: 1.5,
             bump_fee_percentage: 2.0,
         },
         ..cpfp_settings()
@@ -84,9 +85,7 @@ fn cap_settings() -> BitcoinSettings {
         },
         speedup: SpeedupSettings {
             max_unconfirmed_speedups: 5,
-            max_rbf_attempts: 10,
             min_blocks_before_resend_speedup: 1,
-            rbf_fee_multiplier: 1.5,
             bump_fee_percentage: 2.0,
         },
         ..cpfp_settings()
@@ -200,23 +199,14 @@ fn test_cpfp_lifecycle() {
     );
     ack_all_news(&coordinator, &coordinator.get_news().unwrap());
 
-    // Block 2: both Finalized. When the CPFP finalizes, `replace_funding_on_finalize`
-    // replaces the Funding-kind record with the finalized CPFP and must emit
-    // `TransactionEvicted` for the original funding UTXO.
+    // Block 2: both Finalized. When the CPFP finalizes, `replace_funding_on_finalize` consumes the
+    // user funding record and materializes the CPFP change into the funding queue. Funding-queue
+    // mutations are silent: `TransactionEvicted` is only for CoordinatedTx records leaving storage.
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
-    let mut funding_evicted = false;
     let mut reached_finalized = false;
     for _ in 0..10 {
         coordinator.tick().unwrap();
         let news = coordinator.get_news().unwrap();
-        for n in &news.coordinator_news {
-            if matches!(
-                n,
-                CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == funding_txid
-            ) {
-                funding_evicted = true;
-            }
-        }
         ack_all_news(&coordinator, &news);
         let parent_state = coord_storage
             .get_tx_by_id(parent_txid)
@@ -237,17 +227,15 @@ fn test_cpfp_lifecycle() {
         reached_finalized,
         "parent and CPFP must both reach Finalized after 2 blocks"
     );
+    // The user funding UTXO was consumed: silently gone from the funding queue, replaced by the CPFP change.
+    let records = coord_storage.read_funding_records().unwrap();
     assert!(
-        funding_evicted,
-        "TransactionEvicted news must fire for the Funding UTXO via replace_funding_on_finalize"
-    );
-    assert!(
-        coord_storage.get_tx_by_id(funding_txid).unwrap().is_none(),
-        "Funding record must be removed from storage once the CPFP finalizes"
+        !records.iter().any(|r| r.utxo.txid == funding_txid),
+        "user funding UTXO must be consumed and removed from the funding queue"
     );
 
-    // Block 3: parent is eligible for eviction but the finalized CPFP must NOT be evicted:
-    // replace_on_finalize moved it into the FundingList and the eviction guard protects it.
+    // Block 3: parent is eligible for eviction. The finalized CPFP's tx record now evicts normally too.
+    // Its spendable change survives as an independent funding record.
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
     let mut parent_evicted = false;
     for _ in 0..10 {
@@ -258,10 +246,6 @@ fn test_cpfp_lifecycle() {
             {
                 parent_evicted = true;
             }
-            assert!(
-                !matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == cpfp_txid),
-                "CPFP must NOT be evicted while it lives in the FundingList"
-            );
         }
         ack_all_news(&coordinator, &news);
         if parent_evicted {
@@ -276,19 +260,157 @@ fn test_cpfp_lifecycle() {
         coord_storage.get_tx_by_id(parent_txid).unwrap().is_none(),
         "parent must be removed from storage after eviction"
     );
-    // CPFP record still present and parked in the FundingList.
-    let cpfp_record = coord_storage
-        .get_tx_by_id(cpfp_txid)
-        .unwrap()
-        .expect("CPFP must remain in storage while in the FundingList");
-    assert_eq!(cpfp_record.state, TransactionState::Finalized);
-    assert!(matches!(cpfp_record.kind, TxKind::Speedup(_)));
+    // The CPFP's change output survives as a funding-queue record even though the CPFP tx record itself is now eligible for eviction.
     let funding_records = coord_storage.read_funding_records().unwrap();
     assert!(
-        funding_records.iter().any(|r| r.txid == cpfp_txid),
-        "finalized CPFP must be present in the FundingList as the chain tip"
+        funding_records
+            .iter()
+            .any(|r| r.utxo.txid == cpfp_txid && r.from_speedup),
+        "finalized CPFP's change must remain in the funding queue"
     );
 
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// Regression for the same-txid funding collision: two funding UTXOs produced by one transaction
+/// (shared txid, different vouts) must both be stored and both be independently consumable.
+#[test]
+fn test_two_funding_utxos_same_txid_both_consumed() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), cpfp_settings());
+    let coord_storage = get_coord_storage(&setup);
+
+    // One real on-chain tx, two coordinator-owned outputs: same txid, different vouts.
+    let (u0, u1) = create_two_funding_utxos_same_txid(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        500_000,
+    )
+    .unwrap();
+    assert_eq!(u0.txid, u1.txid, "the two funding UTXOs must share a txid");
+    assert_ne!(
+        u0.vout, u1.vout,
+        "the two funding UTXOs must differ by vout"
+    );
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(u0.clone()).unwrap();
+    coordinator.add_funding(u1.clone()).unwrap();
+
+    // Both must be stored (old bug: the second same-txid UTXO was dropped).
+    let records = coord_storage.read_funding_records().unwrap();
+    assert_eq!(
+        records.len(),
+        2,
+        "both same-txid funding UTXOs must be stored; got {:?}",
+        records
+    );
+    assert!(records.iter().any(|r| r.utxo == u0));
+    assert!(records.iter().any(|r| r.utxo == u1));
+
+    // Both must be independently handed out by the funding queue. A FundingManager over the same shared
+    // storage claims them one after another: get_funding returns u0 then u1.
+    let fstore = Rc::new(get_coord_storage(&setup));
+    let mgr = FundingManager::new(
+        FundingSettings {
+            min_funding_amount_sats: 10_000,
+        },
+        Rc::clone(&fstore) as Rc<dyn FundingStorage>,
+    );
+    let no_speedups = fstore.get_speedups_ordered().unwrap();
+    let (first, _) = mgr.get_funding(&no_speedups).unwrap().expect("first claim");
+    let (second, _) = mgr
+        .get_funding(&no_speedups)
+        .unwrap()
+        .expect("second claim: the sibling same-txid UTXO must be claimable");
+    assert!(
+        mgr.get_funding(&no_speedups).unwrap().is_none(),
+        "exactly two funding UTXOs were available"
+    );
+    let claimed: std::collections::HashSet<OutPoint> = [
+        OutPoint::new(first.txid, first.vout),
+        OutPoint::new(second.txid, second.vout),
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        claimed.len(),
+        2,
+        "the two claims must be distinct outpoints"
+    );
+    assert!(claimed.contains(&OutPoint::new(u0.txid, u0.vout)));
+    assert!(claimed.contains(&OutPoint::new(u1.txid, u1.vout)));
+
+    // Release the manual reservations so the coordinator can spend them for real.
+    mgr.release_marks(&[first, second]).unwrap();
+    for r in coord_storage.read_funding_records().unwrap() {
+        assert!(!r.spent, "funding must be unspent again after release");
+    }
+
+    // End-to-end: a real parent + CPFP consumes one of the same-txid UTXOs on-chain.
+    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+    let parent_txid = parent_tx.compute_txid();
+    coordinator
+        .dispatch(parent_tx, Some(speedup_data), ctx("same_txid"), None, None)
+        .unwrap();
+
+    let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+    let cpfp = coord_storage.get_tx_by_id(cpfp_txid).unwrap().unwrap();
+    let consumed = &cpfp.speedup_kind().unwrap().context().funding_inputs;
+    assert_eq!(consumed.len(), 1, "CPFP must fund from a single UTXO");
+    let consumed_op = OutPoint::new(consumed[0].txid, consumed[0].vout);
+    assert!(
+        consumed_op == OutPoint::new(u0.txid, u0.vout)
+            || consumed_op == OutPoint::new(u1.txid, u1.vout),
+        "CPFP must consume one of the two same-txid funding UTXOs"
+    );
+
+    // The other same-txid UTXO must still be present and unspent: not dropped, still usable.
+    let sibling = if consumed_op == OutPoint::new(u0.txid, u0.vout) {
+        &u1
+    } else {
+        &u0
+    };
+    let sib = coord_storage
+        .get_funding_record(&OutPoint::new(sibling.txid, sibling.vout))
+        .unwrap()
+        .expect("sibling same-txid funding must still exist");
+    assert!(
+        !sib.spent,
+        "sibling same-txid funding must remain unspent and available"
+    );
+
+    // Drive parent + CPFP to Confirmed to prove the on-chain spend is valid.
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    let reached = tick_until_all_states(
+        &coordinator,
+        &coord_storage,
+        &[parent_txid, cpfp_txid],
+        TransactionState::Confirmed,
+        10,
+        None,
+    )
+    .unwrap();
+    assert!(
+        reached,
+        "parent and CPFP must confirm, proving the same-txid funding was spent on-chain"
+    );
+
+    // Drop every storage handle before tearing down so the DB file is not still open (Windows lock).
+    drop(mgr);
+    drop(fstore);
     drop(coordinator);
     drop(coord_storage);
     setup.end_all().unwrap();
@@ -1120,9 +1242,7 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
         },
         speedup: SpeedupSettings {
             max_unconfirmed_speedups: 1,
-            max_rbf_attempts: 10,
             min_blocks_before_resend_speedup: 1,
-            rbf_fee_multiplier: 1.5,
             bump_fee_percentage: 1.5,
         },
         ..cpfp_settings()
@@ -1752,14 +1872,15 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
     );
 
     // CPFP's funding UTXO must have been released by `mark_parents_unspent`.
-    let funding_record = coord_storage.get_tx_by_id(funding_txid).unwrap().unwrap();
-    match funding_record.kind {
-        TxKind::Funding(d) => assert!(
-            !d.spent,
-            "funding mark must be released after the CPFP was cascade-failed"
-        ),
-        _ => panic!("expected Funding kind for the funding record"),
-    }
+    let funding_records = coord_storage.read_funding_records().unwrap();
+    let funding_record = funding_records
+        .iter()
+        .find(|r| r.utxo.txid == funding_txid)
+        .expect("funding record must still be present");
+    assert!(
+        !funding_record.spent,
+        "funding mark must be released after the CPFP was cascade-failed"
+    );
 
     // RBF settle path: `replaced_by` on its predecessor must have been cleared by `settle_failed_dispatch`.
     let boost_cpfp = coord_storage
@@ -2116,22 +2237,24 @@ fn test_chain_tip_combine_after_finalize() {
     assert!(reached, "parent1 and CPFP1 must reach Finalized");
     ack_all_news(&coordinator, &coordinator.get_news().unwrap());
 
-    // After finalize the FundingList holds: CPFP1 (Speedup-kind, preserved), funding_extra (Funding-kind, unspent).
+    // After finalize the funding queue holds: CPFP1's materialized change (from_speedup) + funding_extra (user, unspent).
     let funding_records = coord_storage.read_funding_records().unwrap();
     assert_eq!(
         funding_records.len(),
         2,
-        "FundingList must hold CPFP1 + funding_extra"
+        "funding queue must hold CPFP1's change + funding_extra"
     );
     let cpfp1_record = funding_records
         .iter()
-        .find(|r| r.txid == cpfp1_txid)
-        .expect("CPFP1 must be parked in FundingList");
+        .find(|r| r.utxo.txid == cpfp1_txid)
+        .expect("CPFP1's change must be parked in the funding queue");
     assert!(
-        matches!(cpfp1_record.kind, TxKind::Speedup(_)),
-        "finalized speedup's kind must be preserved"
+        cpfp1_record.from_speedup,
+        "materialized change must be flagged from_speedup"
     );
-    assert!(funding_records.iter().any(|r| r.txid == funding_extra.txid));
+    assert!(funding_records
+        .iter()
+        .any(|r| r.utxo.txid == funding_extra.txid));
 
     // Phase 3: dispatch P2. CPFP2 combines chain tip + extra Fi.
     let (parent2, sd2) = create_coordinator_parent_tx(
@@ -2435,9 +2558,7 @@ fn test_rbf_combines_when_inherited_funding_insufficient() {
         },
         speedup: SpeedupSettings {
             max_unconfirmed_speedups: 2,
-            max_rbf_attempts: 10,
             min_blocks_before_resend_speedup: 1,
-            rbf_fee_multiplier: 2.0,
             bump_fee_percentage: 2.0,
         },
         ..cpfp_settings()
@@ -2628,11 +2749,12 @@ fn test_cancel_parent_edge_cases() {
     );
     let records = coord_storage.read_funding_records().unwrap();
     assert_eq!(records.len(), 1, "funding queue must be untouched");
-    assert_eq!(records[0].txid, funding_txid);
-    match &records[0].kind {
-        TxKind::Funding(d) => assert!(!d.spent, "funding must stay unspent after cancel"),
-        _ => panic!("expected Funding-kind record"),
-    }
+    assert_eq!(records[0].utxo.txid, funding_txid);
+    assert!(
+        !records[0].from_speedup,
+        "user funding is not speedup-derived"
+    );
+    assert!(!records[0].spent, "funding must stay unspent after cancel");
 
     // ---------------------------------------------------------------
     // Phase B: cancel AFTER dispatch, REFUSED

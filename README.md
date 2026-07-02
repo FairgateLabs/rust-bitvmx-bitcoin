@@ -36,7 +36,8 @@ introduce breaking changes without preserving backward compatibility.
   attempt.
 - 💰 **Funding Management**: Maintains a funding UTXO chain that survives
   reorgs and mempool evictions, so speedup fees always come from a known
-  spendable output.
+  spendable output. Funding is keyed by `OutPoint` (txid + vout), so several
+  UTXOs from the same funding transaction can be registered without collision.
 - 📰 **News Stream**: Emits structured news for state transitions, dispatch
   errors, stuck transactions, and other lifecycle events that the client
   acknowledges explicitly.
@@ -94,8 +95,8 @@ behind the build/dispatch split.
 
 > ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in
 > `ToDispatch` are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` /
-> `Finalized` / `Failed`), or if the txid is internal (Speedup) or external (Funding /
-> unknown), the request is refused and a news item is emitted.
+> `Finalized` / `Failed`), or if the txid is internal (Speedup) or not a tracked tx (a funding
+> UTXO, or an unknown txid), the request is refused and a news item is emitted.
 
 > ⚠️ **Ack news only AFTER acting on it.** News is deduplicated by value.Acking early 
 > means a second occurrence of the same event within the same block will NOT re-fire.
@@ -203,8 +204,8 @@ The main groups are:
 - `fee`: minimum, maximum, and base fee multipliers used by `FeeManager`. The
   `max_feerate_sat_vb` ceiling bounds the speedup PACKAGE effective fee rate
   (parents + child together), not the child transaction alone.
-- `speedup`: maximum unconfirmed speedups, RBF attempts, and bump-fee
-  percentages.
+- `speedup`: maximum unconfirmed speedups, resend spacing, and bump-fee
+  percentage.
 - `funding`: minimum sat amount required for a funding UTXO.
 - `storage`: how long settled txs are tracked before eviction.
 - `monitor`: max confirmations to track and indexer settings (forwarded to

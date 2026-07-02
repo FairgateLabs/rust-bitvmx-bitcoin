@@ -60,8 +60,8 @@ impl TransactionEngine {
 
         let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
         for tx in active_txs {
-            // Speedups are handled by the speedup engine; Funding records are not broadcastable.
-            if matches!(tx.kind, TxKind::Speedup(_) | TxKind::Funding(_)) {
+            // Speedups are handled by the speedup engine. Funding UTXOs are not in the Tx store.
+            if matches!(tx.kind, TxKind::Speedup(_)) {
                 continue;
             }
             if tx.state == TransactionState::ToDispatch && tx.is_ready_to_dispatch(current_height) {

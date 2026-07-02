@@ -58,6 +58,25 @@ Rules that keep the chain pointing at reality:
 - When a funding UTXO is too small for the next fee, the coordinator advances the
   funding queue, and emits `InsufficientFunds` once the queue is empty.
 
+## The funding queue
+
+The queue is persisted as an ordered list of `OutPoint`s (txid + vout), each resolving to a
+`FundingData` record stored under its own outpoint key. Funding records are not `CoordinatedTx` and do
+not live in the transaction store.
+
+- Keying by `OutPoint` means several UTXOs from the same funding transaction (same txid, different
+  vouts) coexist. Registering two same-txid UTXOs stores both and both are handed out independently.
+- `get_funding` first tries the live speedup chain tip (pass 1), then the queue in insertion order
+  (pass 2). Each record carries `from_speedup`: `false` for a user UTXO, `true` for a finalized
+  speedup's change materialized into the queue by `replace_funding_on_finalize`.
+- `combine` (sweeping a second input when the primary alone cannot cover fee + dust) only pulls
+  user-provided funding, never a speedup-derived record.
+- A `spent` flag reserves a record for an in-flight build; it is reset on build failure so the next
+  tick can reuse it.
+- When a speedup finalizes, `replace_funding_on_finalize` silently removes the funding inputs it
+  consumed and inserts its change. These queue mutations emit no news: `TransactionEvicted` is reserved
+  for settled `CoordinatedTx` records removed after `max_tracking_confirmations`, not funding UTXOs.
+
 ## CPFP versus RBF
 
 Each boost is either a new CPFP or an RBF. The choice depends only on how many

@@ -1,6 +1,6 @@
 use std::rc::Rc;
 
-use bitcoin::{Transaction, Txid};
+use bitcoin::{OutPoint, Transaction, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use bitvmx_transaction_monitor::types::TypesToMonitor;
 use key_manager::key_manager::KeyManager;
@@ -500,12 +500,12 @@ impl SpeedupEngine {
         let (mut funding_inputs, inherited_count, primary_is_speedup) =
             if let Some(inputs) = rbf_initial_inputs {
                 let inherited = inputs.len();
-                // Determine if the predecessor's primary is Speedup or Funding type.
+                // Determine if the predecessor's primary is speedup-derived (only then may combine sweep a second input).
                 let primary_speedup = match inputs.first() {
-                    Some(fi) => matches!(
-                        self.ctx.storage.get_tx_by_id(fi.txid)?,
-                        Some(rec) if matches!(rec.kind, TxKind::Speedup(_))
-                    ),
+                    Some(fi) => self
+                        .ctx
+                        .storage
+                        .is_speedup_derived(&OutPoint::new(fi.txid, fi.vout))?,
                     None => false,
                 };
                 (inputs, inherited, primary_speedup)

@@ -460,6 +460,69 @@ pub fn create_funded_speedup_utxo(
     ))
 }
 
+/// Build ONE on-chain transaction with two outputs paid to two distinct coordinator-owned P2WPKH
+/// addresses, then broadcast and confirm it. The two returned UTXOs therefore SHARE a txid and differ
+/// only by vout, exactly the case that the old txid-keyed funding store silently collapsed.
+pub fn create_two_funding_utxos_same_txid(
+    bitcoin_client: &BitcoinClient,
+    key_manager: &KeyManager,
+    network: Network,
+    amount_each: u64,
+) -> anyhow::Result<(Utxo, Utxo)> {
+    let pk0 = key_manager
+        .next_keypair(BitcoinKeyType::P2wpkh)
+        .map_err(|e| anyhow::anyhow!("next_keypair: {:?}", e))?;
+    let pk1 = key_manager
+        .next_keypair(BitcoinKeyType::P2wpkh)
+        .map_err(|e| anyhow::anyhow!("next_keypair: {:?}", e))?;
+    let addr0 = Address::p2wpkh(
+        &CompressedPublicKey::try_from(pk0).map_err(|e| anyhow::anyhow!("compress pk0: {:?}", e))?,
+        network,
+    );
+    let addr1 = Address::p2wpkh(
+        &CompressedPublicKey::try_from(pk1).map_err(|e| anyhow::anyhow!("compress pk1: {:?}", e))?,
+        network,
+    );
+
+    // Spend a confirmed wallet UTXO into both coordinator outputs (fee = 100 000 sats).
+    let (funding_txid, funding_vout) = fund_and_lock_utxo(bitcoin_client, amount_each * 2 + 100_000)?;
+    let inputs = vec![CreateRawTransactionInput {
+        txid: funding_txid,
+        vout: funding_vout,
+        sequence: None,
+    }];
+    let mut outputs = HashMap::new();
+    outputs.insert(format!("{}", addr0), Amount::from_sat(amount_each));
+    outputs.insert(format!("{}", addr1), Amount::from_sat(amount_each));
+    let tx = sign_spend(bitcoin_client, &inputs, &outputs, None)?;
+    let txid = tx.compute_txid();
+
+    // Broadcast and confirm so both outputs are spendable funding UTXOs.
+    bitcoin_client
+        .send_transaction(&tx)
+        .map_err(|e| anyhow::anyhow!("send_transaction: {:?}", e))?;
+    let miner = fresh_wallet_address(bitcoin_client)?;
+    mine_blocks(bitcoin_client, 1, &miner)?;
+
+    // Output order is not guaranteed to match insertion; match each by scriptPubKey.
+    let spk0 = addr0.script_pubkey();
+    let spk1 = addr1.script_pubkey();
+    let mut u0 = None;
+    let mut u1 = None;
+    for (i, out) in tx.output.iter().enumerate() {
+        if out.script_pubkey == spk0 {
+            u0 = Some(Utxo::new(txid, i as u32, out.value.to_sat(), &pk0));
+        } else if out.script_pubkey == spk1 {
+            u1 = Some(Utxo::new(txid, i as u32, out.value.to_sat(), &pk1));
+        }
+    }
+    let u0 = u0.ok_or_else(|| anyhow::anyhow!("first output not found"))?;
+    let u1 = u1.ok_or_else(|| anyhow::anyhow!("second output not found"))?;
+    anyhow::ensure!(u0.txid == u1.txid, "funding utxos must share a txid");
+    anyhow::ensure!(u0.vout != u1.vout, "funding utxos must differ by vout");
+    Ok((u0, u1))
+}
+
 /// Create an unbroadcast parent transaction plus a `SpeedupData`.
 pub fn create_coordinator_parent_tx(
     bitcoin_client: &BitcoinClient,

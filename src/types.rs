@@ -71,15 +71,19 @@ pub enum TxKind {
     /// metadata until the coordinator builds a CPFP in the same tick.
     NeedsSpeedup(SpeedupData),
     Speedup(SpeedupKind),
-    /// User-provided funding UTXO tracked as a coordinator transaction.
-    Funding(FundingData),
 }
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+/// A spendable funding UTXO in the funding queue. Stored on its own, keyed by the UTXO's `OutPoint`
+/// (txid + vout), so several UTXOs from the same funding transaction coexist without colliding.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 pub struct FundingData {
     pub utxo: Utxo,
+    /// Reserved by an in-flight speedup build. Reset on build failure so the next tick can reuse it.
     #[serde(default)]
     pub spent: bool,
+    /// True when this record was materialized from a finalized speedup's change output, false for a user-provided UTXO.
+    #[serde(default)]
+    pub from_speedup: bool,
 }
 
 /// Shared context stored in every speedup transaction regardless of CPFP/RBF variant.

@@ -118,6 +118,7 @@ transaction can outlive the retry budget without being failed.
 | A funding UTXO below `min_funding_amount_sats` is rejected with `InvalidFundingUtxo`. | Dust cannot pay a useful fee. |
 | The funding walk skips `Failed` and `replaced_by` speedups. | The next boost must chain off the live tip, not a dead branch. |
 | Funding marks are released when a speedup is failed or replaced. | A released UTXO becomes spendable again for the next attempt. |
+| Funding is keyed by `OutPoint` (txid + vout), not txid. | Several UTXOs from one funding transaction coexist. |
 | `add_funding` UTXOs must be effectively final on-chain. | The funding chain assumes its base output is not reorgable in practice. |
 
 ## Cancel contract
@@ -129,7 +130,7 @@ still in `ToDispatch`.
 |---|---|
 | `Normal` or `NeedsSpeedup` in `ToDispatch` | Cancelled: removed from storage, monitoring, and the pending-speedup set. |
 | Already dispatched (`InMempool` / `Confirmed` / `Finalized` / `Failed`) | Refused with `InvalidCancel`. |
-| `Speedup` or `Funding` kind, or an unknown txid | Refused with `InvalidCancel`. |
+| `Speedup` kind, or an unknown txid (a funding UTXO is not a tracked tx, so it is refused as not found) | Refused with `InvalidCancel`. |
 | A non-`Transactions` monitoring entry | Passed straight through to the monitor. |
 
 ## News rules

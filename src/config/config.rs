@@ -112,9 +112,7 @@ impl Default for FeeSettings {
 #[derive(Debug, Deserialize, Clone)]
 pub struct SpeedupSettings {
     pub max_unconfirmed_speedups: u32,
-    pub max_rbf_attempts: u32,
     pub min_blocks_before_resend_speedup: u32,
-    pub rbf_fee_multiplier: f64,
     pub bump_fee_percentage: f64,
 }
 
@@ -122,9 +120,7 @@ impl Default for SpeedupSettings {
     fn default() -> Self {
         Self {
             max_unconfirmed_speedups: DEFAULT_MAX_UNCONFIRMED_SPEEDUPS,
-            max_rbf_attempts: DEFAULT_MAX_RBF_ATTEMPTS,
             min_blocks_before_resend_speedup: DEFAULT_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP,
-            rbf_fee_multiplier: DEFAULT_RBF_FEE_MULTIPLIER,
             bump_fee_percentage: DEFAULT_BUMP_FEE_PERCENTAGE,
         }
     }
@@ -171,20 +167,8 @@ impl BitcoinSettings {
         );
 
         ensure!(
-            self.speedup.max_rbf_attempts > 0
-                && self.speedup.max_rbf_attempts <= MAX_LIMIT_RBF_ATTEMPTS,
-            "invalid max_rbf_attempts"
-        );
-
-        ensure!(
             self.funding.min_funding_amount_sats >= MIN_LIMIT_FUNDING_AMOUNT_SATS,
             "funding below dust threshold"
-        );
-
-        ensure!(
-            self.speedup.rbf_fee_multiplier >= 1.0
-                && self.speedup.rbf_fee_multiplier <= MAX_RBF_FEE_MULTIPLIER,
-            "invalid rbf_fee_multiplier"
         );
 
         ensure!(
@@ -289,42 +273,10 @@ mod tests {
             ..Default::default()
         });
 
-        // max_rbf_attempts: must be 1..=MAX_LIMIT_RBF_ATTEMPTS
-        check(BitcoinSettings {
-            speedup: SpeedupSettings {
-                max_rbf_attempts: 0,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        check(BitcoinSettings {
-            speedup: SpeedupSettings {
-                max_rbf_attempts: MAX_LIMIT_RBF_ATTEMPTS + 1,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-
         // min_funding_amount_sats: must be >= MIN_LIMIT_FUNDING_AMOUNT_SATS
         check(BitcoinSettings {
             funding: FundingSettings {
                 min_funding_amount_sats: MIN_LIMIT_FUNDING_AMOUNT_SATS - 1,
-            },
-            ..Default::default()
-        });
-
-        // rbf_fee_multiplier: must be 1.0..=MAX_RBF_FEE_MULTIPLIER
-        check(BitcoinSettings {
-            speedup: SpeedupSettings {
-                rbf_fee_multiplier: 0.9,
-                ..Default::default()
-            },
-            ..Default::default()
-        });
-        check(BitcoinSettings {
-            speedup: SpeedupSettings {
-                rbf_fee_multiplier: MAX_RBF_FEE_MULTIPLIER + 0.1,
-                ..Default::default()
             },
             ..Default::default()
         });

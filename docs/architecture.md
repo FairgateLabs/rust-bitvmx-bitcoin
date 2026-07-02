@@ -57,7 +57,10 @@ decides which engine owns it and what the coordinator may do with it.
 | `Normal` | Plain transaction, no speedup support. | `TransactionEngine` |
 | `NeedsSpeedup(data)` | Parent that wants a CPFP. Carries signing/UTXO metadata until the CPFP is built. | `TransactionEngine` |
 | `Speedup(CPFP \| RBF)` | A speedup the coordinator built. | `SpeedupEngine` |
-| `Funding(data)` | A funding UTXO registered through `add_funding`. Never broadcast on its own. | `FundingManager` |
+
+Funding UTXOs are not `CoordinatedTx` records. They live in a separate funding queue keyed by their
+`OutPoint` (txid + vout), so several UTXOs from the same funding transaction coexist. See
+[speedup.md](speedup.md) for the queue model.
 
 ## Transaction lifecycle
 
@@ -214,8 +217,7 @@ defaults in `src/config/settings.rs`. The groups that shape behavior:
 | `fee` | `base_fee_multiplier` | Multiplier on the network estimate. |
 | `speedup` | `max_unconfirmed_speedups` | Boost stays CPFP below this in-mempool count, switches to RBF at it. |
 | `speedup` | `min_blocks_before_resend_speedup` | Blocks a speedup tip must age before it is boosted. |
-| `speedup` | `rbf_fee_multiplier`, `bump_fee_percentage` | Fee escalation factors. |
-| `speedup` | `max_rbf_attempts` | Upper bound on RBF escalation. |
+| `speedup` | `bump_fee_percentage` | Fee escalation factor applied on each boost/RBF. |
 | `funding` | `min_funding_amount_sats` | Minimum accepted funding UTXO size. |
 | `storage` | `max_tracking_confirmations` | Blocks a settled record is kept before eviction. |
 | `monitor` | `max_monitoring_confirmations` | Confirmations to reach `Finalized`. Also the fail-guard window. |
