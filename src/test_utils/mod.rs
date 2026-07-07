@@ -108,6 +108,7 @@ pub fn normal_coordinated_tx(seed: u8) -> CoordinatedTx {
         fee_info: FeeInfo {
             fee: 0,
             fee_rate: 1,
+            package_fee_rate: 1,
             weight: 0,
         },
         context: String::new(),
@@ -131,6 +132,7 @@ pub fn cpfp_coordinated_tx(seed: u8, fee_rate: u64) -> CoordinatedTx {
     });
     tx.state = TransactionState::InMempool;
     tx.fee_info.fee_rate = fee_rate;
+    tx.fee_info.package_fee_rate = fee_rate;
     tx
 }
 

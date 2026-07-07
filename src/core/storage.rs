@@ -4,7 +4,7 @@ use crate::{
     errors::BitcoinCoordinatorError,
     types::{CoordinatedTx, CoordinatorNews, FundingData, SpeedupKind, TransactionState, TxKind},
 };
-use bitcoin::Txid;
+use bitcoin::{OutPoint, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use protocol_builder::types::Utxo;
 use serde::{Deserialize, Serialize};
@@ -37,9 +37,12 @@ enum StoreKey {
     /// Set of NeedsSpeedup parent txids that still require a CPFP to be built.
     /// Added on dispatch_with_speedup; removed when the covering CPFP is dispatched.
     PendingSpeedupParents,
-    /// Ordered list of TxKind::Funding record txids, insertion order. It may contain
-    /// TxKind::Funding records and TxKind::Speedup records, when speedups are finalized.
+    /// Ordered list of funding-queue `OutPoint`s (txid + vout), insertion order. Each resolves to a
+    /// `FundingData` record under `StoreKey::Funding`. Holds user-provided UTXOs and, once a speedup
+    /// finalizes, its materialized change output.
     FundingList,
+    /// A single funding-queue `FundingData` record, keyed by its UTXO `OutPoint`.
+    Funding(OutPoint),
 }
 
 impl CoordinatorStorage {
@@ -274,7 +277,8 @@ impl CoordinatorStorage {
     ///   1. The parent is currently listed in `PendingSpeedupParents`, or
     ///   2. Any non-Failed-and-non-Finalized speedup references the parent
     ///      in `SpeedupKind::CPFP.parents` (live coverage).
-    /// Eviction also protects speedups that are part of the FundingList
+    /// Funding-queue records live in their own keyspace (not the Tx store), so they are never eviction
+    /// candidates here; a finalized speedup's spendable change survives as an independent `FundingData`.
     pub fn evict_stale_txs(
         &self,
         current_height: BlockHeight,
@@ -282,10 +286,6 @@ impl CoordinatorStorage {
         let settled = self.get_settled_txs()?;
         let psp: Vec<Txid> = {
             let key = self.get_key(StoreKey::PendingSpeedupParents);
-            self.storage.get(&key, None)?.unwrap_or_default()
-        };
-        let funding_list: Vec<Txid> = {
-            let key = self.get_key(StoreKey::FundingList);
             self.storage.get(&key, None)?.unwrap_or_default()
         };
         // Build the set of NeedsSpeedup parent txids that are referenced by a non-Failed/non-Finalized speedup ("live coverage").
@@ -312,10 +312,6 @@ impl CoordinatorStorage {
                     if matches!(tx.kind, TxKind::NeedsSpeedup(_))
                         && (psp.contains(&tx.txid) || live_covered.contains(&tx.txid))
                     {
-                        continue;
-                    }
-                    // Finalized speedup: protected while its change output still backs an entry in the funding queue.
-                    if funding_list.contains(&tx.txid) {
                         continue;
                     }
                     self.remove_tx(tx.txid)?;
@@ -488,6 +484,29 @@ impl CoordinatorStorage {
         Ok(())
     }
 
+    /// ================================
+    /// Funding queue
+    /// ================================
+
+    pub fn get_funding_record(
+        &self,
+        outpoint: &OutPoint,
+    ) -> Result<Option<FundingData>, BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::Funding(*outpoint));
+        Ok(self.storage.get(&key, None)?)
+    }
+
+    /// True when `outpoint` is speedup-derived: either a materialized finalized-speedup change in the
+    /// funding queue, or the live change of a speedup still in the Tx store.
+    pub fn is_speedup_derived(&self, outpoint: &OutPoint) -> Result<bool, BitcoinCoordinatorError> {
+        if let Some(rec) = self.get_funding_record(outpoint)? {
+            return Ok(rec.from_speedup);
+        }
+        Ok(self
+            .get_tx_by_id(outpoint.txid)?
+            .is_some_and(|tx| matches!(tx.kind, TxKind::Speedup(_))))
+    }
+
     // ================================
     //  NEWS
     // ================================
@@ -585,7 +604,29 @@ impl CoordinatorStorage {
             StoreKey::SpeedupList => format!("{prefix}/speedup/list"),
             StoreKey::PendingSpeedupParents => format!("{prefix}/speedup/pending_parents"),
             StoreKey::FundingList => format!("{prefix}/funding/list"),
+            StoreKey::Funding(op) => format!("{prefix}/funding/record/{op}"),
         }
+    }
+
+    fn funding_list(&self) -> Result<Vec<OutPoint>, BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::FundingList);
+        Ok(self.storage.get(&key, None)?.unwrap_or_default())
+    }
+
+    fn set_funding_list(&self, list: &[OutPoint]) -> Result<(), BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::FundingList);
+        self.storage.set(&key, &list.to_vec(), None)?;
+        Ok(())
+    }
+
+    fn put_funding_record(
+        &self,
+        outpoint: &OutPoint,
+        record: &FundingData,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        let key = self.get_key(StoreKey::Funding(*outpoint));
+        self.storage.set(&key, record, None)?;
+        Ok(())
     }
 }
 
@@ -593,60 +634,61 @@ impl CoordinatorStorage {
 // FUNDING STORAGE
 // ================================
 impl FundingStorage for CoordinatorStorage {
-    fn read_funding_records(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
-        let list_key = self.get_key(StoreKey::FundingList);
-        let list: Vec<Txid> = self.storage.get(&list_key, None)?.unwrap_or_default();
+    fn read_funding_records(&self) -> Result<Vec<FundingData>, BitcoinCoordinatorError> {
+        let list = self.funding_list()?;
         let mut out = Vec::with_capacity(list.len());
-        for id in list {
-            if let Some(tx) = self.get_tx_by_id(id)? {
-                out.push(tx);
+        for op in list {
+            if let Some(rec) = self.get_funding_record(&op)? {
+                out.push(rec);
             }
         }
         Ok(out)
     }
 
     fn append_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError> {
-        let txid = utxo.txid;
-        let mut record = CoordinatedTx::new_empty();
-        record.txid = txid;
-        record.kind = TxKind::Funding(FundingData { utxo, spent: false });
-        self.insert_tx(record)?;
-        let list_key = self.get_key(StoreKey::FundingList);
-        let mut list: Vec<Txid> = self.storage.get(&list_key, None)?.unwrap_or_default();
-        if !list.contains(&txid) {
-            list.push(txid);
-            self.storage.set(&list_key, &list, None)?;
+        let op = OutPoint::new(utxo.txid, utxo.vout);
+        let record = FundingData {
+            utxo,
+            spent: false,
+            from_speedup: false,
+        };
+        // Key by OutPoint (txid + vout): multiple UTXOs from the same funding tx coexist.
+        self.put_funding_record(&op, &record)?;
+        let mut list = self.funding_list()?;
+        if !list.contains(&op) {
+            list.push(op);
+            self.set_funding_list(&list)?;
         }
         Ok(())
     }
 
-    fn set_spent(&self, txid: Txid, spent: bool) -> Result<(), BitcoinCoordinatorError> {
-        if let Some(mut tx) = self.get_tx_by_id(txid)? {
-            let changed = match tx.kind {
-                TxKind::Funding(ref mut d) if d.spent != spent => {
-                    d.spent = spent;
-                    true
-                }
-                TxKind::Speedup(ref mut k) if k.context().spent != spent => {
+    fn set_spent(&self, outpoint: OutPoint, spent: bool) -> Result<(), BitcoinCoordinatorError> {
+        // Funding-queue record first (user UTXO or materialized change).
+        if let Some(mut rec) = self.get_funding_record(&outpoint)? {
+            if rec.spent != spent {
+                rec.spent = spent;
+                self.put_funding_record(&outpoint, &rec)?;
+            }
+            return Ok(());
+        }
+        // Otherwise a live chain-tip speedup being reserved/released: toggle its context.spent.
+        if let Some(mut tx) = self.get_tx_by_id(outpoint.txid)? {
+            if let TxKind::Speedup(ref mut k) = tx.kind {
+                if k.context().spent != spent {
                     k.context_mut().spent = spent;
-                    true
+                    self.update_tx(&tx)?;
                 }
-                _ => false,
-            };
-            if changed {
-                self.update_tx(&tx)?;
             }
         }
         Ok(())
     }
 
     fn clear_funding_records(&self) -> Result<(), BitcoinCoordinatorError> {
-        let list_key = self.get_key(StoreKey::FundingList);
-        let list: Vec<Txid> = self.storage.get(&list_key, None)?.unwrap_or_default();
-        for id in list {
-            let tx_key = self.get_key(StoreKey::Tx(id));
-            self.storage.remove(&tx_key, None)?;
+        for op in self.funding_list()? {
+            let key = self.get_key(StoreKey::Funding(op));
+            self.storage.remove(&key, None)?;
         }
+        let list_key = self.get_key(StoreKey::FundingList);
         self.storage.remove(&list_key, None)?;
         Ok(())
     }
@@ -659,8 +701,9 @@ impl FundingStorage for CoordinatorStorage {
                 return Ok(());
             }
         };
-        let k = match tx.speedup_kind() {
-            Ok(k) => k,
+        // Only speedups have a change output to move into the funding queue.
+        let change = match tx.speedup_change_utxo() {
+            Ok(u) => u,
             Err(_) => {
                 warn!(
                     "replace_funding_on_finalize: tx {} is not a Speedup (kind={:?})",
@@ -669,32 +712,21 @@ impl FundingStorage for CoordinatorStorage {
                 return Ok(());
             }
         };
-        let ctx = k.context();
+        let ctx = tx.speedup_kind()?.context();
+        let consumed_spent = ctx.spent;
+        let consumed: Vec<OutPoint> = ctx
+            .funding_inputs
+            .iter()
+            .map(|fi| OutPoint::new(fi.txid, fi.vout))
+            .collect();
 
-        let list_key = self.get_key(StoreKey::FundingList);
-        let mut list: Vec<Txid> = self.storage.get(&list_key, None)?.unwrap_or_default();
+        let mut list = self.funding_list()?;
 
-        // Find positions in `list` whose record's change output matches one of tx.funding_inputs.
-        // Records may be Funding (utxo field) or Speedup (its last output is the change consumed by the next speedup).
+        // Find queue positions whose outpoint is one of the speedup's consumed funding inputs.
         let mut to_remove_idx: Vec<usize> = Vec::new();
         let mut insert_pos: Option<usize> = None;
-        for (idx, id) in list.iter().enumerate() {
-            let Some(rec) = self.get_tx_by_id(*id)? else {
-                continue;
-            };
-            let (rec_txid, rec_vout) = match &rec.kind {
-                TxKind::Funding(d) => (d.utxo.txid, d.utxo.vout),
-                TxKind::Speedup(_) => {
-                    let (_, v) = rec.last_output()?;
-                    (rec.txid, v)
-                }
-                _ => continue,
-            };
-            let matched = ctx
-                .funding_inputs
-                .iter()
-                .any(|fi| fi.txid == rec_txid && fi.vout == rec_vout);
-            if matched {
+        for (idx, op) in list.iter().enumerate() {
+            if consumed.contains(op) {
                 to_remove_idx.push(idx);
                 if insert_pos.map_or(true, |p| idx < p) {
                     insert_pos = Some(idx);
@@ -710,32 +742,26 @@ impl FundingStorage for CoordinatorStorage {
             return Ok(());
         }
 
-        // Remove (list entry + tx record) from highest to lowest index. Emit a
-        // `TransactionEvicted` news entry for every removed record.
+        // Remove matched records (record + list entry) from highest to lowest index.
         for idx in to_remove_idx.iter().rev() {
-            let removed_id = list.remove(*idx);
-            let removed_ctx = self
-                .get_tx_by_id(removed_id)?
-                .map(|rec| rec.context.clone());
-            let tx_key = self.get_key(StoreKey::Tx(removed_id));
-            self.storage.remove(&tx_key, None)?;
-            self.remove_speedup_from_list(removed_id)?;
-            if let Some(ctx_str) = removed_ctx {
-                self.add_news(CoordinatorNews::TransactionEvicted {
-                    txid: removed_id,
-                    context: ctx_str,
-                })?;
-            }
+            let removed = list.remove(*idx);
+            let key = self.get_key(StoreKey::Funding(removed));
+            self.storage.remove(&key, None)?;
         }
 
-        // Insert the finalized speedup's txid at the smallest removed position.
-        let pos = insert_pos.unwrap();
-        if pos <= list.len() {
-            list.insert(pos, tx.txid);
-        } else {
-            list.push(tx.txid);
-        }
-        self.storage.set(&list_key, &list, None)?;
+        // Materialize the finalized speedup's change as a plain funding record at the smallest removed
+        // position. `consumed_spent` carries over: a change already consumed by the next speedup stays spent.
+        let change_op = OutPoint::new(change.txid, change.vout);
+        let record = FundingData {
+            utxo: change,
+            spent: consumed_spent,
+            from_speedup: true,
+        };
+        self.put_funding_record(&change_op, &record)?;
+        let pos = insert_pos.unwrap().min(list.len());
+        list.insert(pos, change_op);
+        self.set_funding_list(&list)?;
+        // Take the finalized speedup out of the SpeedupList; its Tx record now evicts normally.
         self.remove_speedup_from_list(tx.txid)?;
         Ok(())
     }
@@ -745,13 +771,9 @@ impl FundingStorage for CoordinatorStorage {
 // DISPATCHER STORAGE
 // ================================
 impl DispatcherStorage for CoordinatorStorage {
-    /// Funding-kind records are operator-supplied external UTXOs (must already be
-    /// confirmed per the README disclaimer). Treat them as untracked so the
-    /// dispatcher does NOT gate on them.
+    // Only tracked coordinator transactions (Normal / NeedsSpeedup / Speedup) gate.
     fn is_tx_known(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
-        Ok(self
-            .get_tx_by_id(*txid)?
-            .is_some_and(|tx| !matches!(tx.kind, TxKind::Funding(_))))
+        Ok(self.get_tx_by_id(*txid)?.is_some())
     }
 }
 
@@ -790,6 +812,7 @@ mod tests {
             fee_info: FeeInfo {
                 fee: 1000,
                 fee_rate: 1,
+                package_fee_rate: 1,
                 weight: 100,
             },
             context: "test".to_string(),
@@ -806,6 +829,17 @@ mod tests {
     fn random_txid() -> Txid {
         use bitcoin::hashes::{sha256d, Hash};
         Txid::from_raw_hash(sha256d::Hash::hash(&rand::random::<[u8; 32]>()))
+    }
+
+    fn speedup_ctx_spent(storage: &CoordinatorStorage, txid: Txid) -> bool {
+        storage
+            .get_tx_by_id(txid)
+            .unwrap()
+            .unwrap()
+            .speedup_kind()
+            .unwrap()
+            .context()
+            .spent
     }
 
     #[test]
@@ -1656,7 +1690,8 @@ mod tests {
         t
     }
 
-    /// Surface check: append → read order → set_spent on both kinds → no-op semantics on wrong-kind / missing → clear wipes everything.
+    /// Surface check: append (OutPoint-keyed) → read order → same-txid coexistence → set_spent on funding
+    /// and on a live speedup → no-op on wrong-kind / missing → clear wipes everything.
     #[test]
     fn test_funding_storage_surface() {
         let storage_backend = StorageTestConfig::new();
@@ -1668,39 +1703,35 @@ mod tests {
             .unwrap()
             .is_empty());
 
-        // Append two Funding records; insertion order preserved, spent=false initially.
-        let u1 = Utxo::new(random_txid(), 0, 1_000, &pub_key);
-        let u2 = Utxo::new(random_txid(), 1, 2_000, &pub_key);
+        // Append two records SHARING a txid but different vouts: both must be stored (the old bug dropped one).
+        let shared = random_txid();
+        let u1 = Utxo::new(shared, 0, 1_000, &pub_key);
+        let u2 = Utxo::new(shared, 1, 2_000, &pub_key);
         FundingStorage::append_funding(&storage, u1.clone()).unwrap();
         FundingStorage::append_funding(&storage, u2.clone()).unwrap();
         let records = FundingStorage::read_funding_records(&storage).unwrap();
-        assert_eq!(records.len(), 2);
-        assert_eq!(records[0].txid, u1.txid);
-        assert_eq!(records[1].txid, u2.txid);
-        match (&records[0].kind, &records[1].kind) {
-            (TxKind::Funding(a), TxKind::Funding(b)) => {
-                assert_eq!(a.utxo.amount, 1_000);
-                assert_eq!(b.utxo.amount, 2_000);
-                assert!(!a.spent && !b.spent);
-            }
-            _ => panic!("both must be Funding kind"),
-        }
+        assert_eq!(records.len(), 2, "same-txid UTXOs must both survive");
+        assert_eq!(records[0].utxo, u1);
+        assert_eq!(records[1].utxo, u2);
+        assert!(!records[0].spent && !records[1].spent);
+        assert!(!records[0].from_speedup && !records[1].from_speedup);
 
-        // set_spent toggles Funding.spent.
-        FundingStorage::set_spent(&storage, u1.txid, true).unwrap();
-        if let TxKind::Funding(d) = &storage.get_tx_by_id(u1.txid).unwrap().unwrap().kind {
-            assert!(d.spent);
-        } else {
-            panic!("expected Funding");
-        }
-        FundingStorage::set_spent(&storage, u1.txid, false).unwrap();
-        if let TxKind::Funding(d) = &storage.get_tx_by_id(u1.txid).unwrap().unwrap().kind {
-            assert!(!d.spent);
-        } else {
-            panic!("expected Funding");
-        }
+        // set_spent toggles exactly the addressed outpoint, not its same-txid sibling.
+        let op1 = OutPoint::new(shared, 0);
+        FundingStorage::set_spent(&storage, op1, true).unwrap();
+        assert!(storage.get_funding_record(&op1).unwrap().unwrap().spent);
+        assert!(
+            !storage
+                .get_funding_record(&OutPoint::new(shared, 1))
+                .unwrap()
+                .unwrap()
+                .spent,
+            "sibling vout must be untouched"
+        );
+        FundingStorage::set_spent(&storage, op1, false).unwrap();
+        assert!(!storage.get_funding_record(&op1).unwrap().unwrap().spent);
 
-        // set_spent toggles SpeedupContext.spent on a stored Speedup.
+        // set_spent resolves a live speedup (no funding record for its outpoint) to SpeedupContext.spent.
         let s_id = random_txid();
         let mut s = dummy_tx(s_id, TransactionState::InMempool);
         s.kind = TxKind::Speedup(SpeedupKind::CPFP {
@@ -1714,62 +1745,47 @@ mod tests {
             },
         });
         storage.insert_tx(s).unwrap();
-        FundingStorage::set_spent(&storage, s_id, true).unwrap();
-        assert!(
-            storage
-                .get_tx_by_id(s_id)
-                .unwrap()
-                .unwrap()
-                .speedup_kind()
-                .unwrap()
-                .context()
-                .spent
-        );
-        FundingStorage::set_spent(&storage, s_id, false).unwrap();
-        assert!(
-            !storage
-                .get_tx_by_id(s_id)
-                .unwrap()
-                .unwrap()
-                .speedup_kind()
-                .unwrap()
-                .context()
-                .spent
-        );
+        FundingStorage::set_spent(&storage, OutPoint::new(s_id, 0), true).unwrap();
+        assert!(speedup_ctx_spent(&storage, s_id));
+        FundingStorage::set_spent(&storage, OutPoint::new(s_id, 0), false).unwrap();
+        assert!(!speedup_ctx_spent(&storage, s_id));
 
-        // Wrong-kind (Normal) and missing txids → silent no-op.
+        // Wrong-kind (Normal) and missing outpoints → silent no-op.
         let normal_id = random_txid();
         storage
             .insert_tx(dummy_tx(normal_id, TransactionState::Finalized))
             .unwrap();
-        FundingStorage::set_spent(&storage, normal_id, true).unwrap();
-        FundingStorage::set_spent(&storage, random_txid(), true).unwrap();
+        FundingStorage::set_spent(&storage, OutPoint::new(normal_id, 0), true).unwrap();
+        FundingStorage::set_spent(&storage, OutPoint::new(random_txid(), 0), true).unwrap();
 
-        // clear wipes list AND underlying tx records.
+        // clear wipes the list AND the funding records.
         FundingStorage::clear_funding_records(&storage).unwrap();
         assert!(FundingStorage::read_funding_records(&storage)
             .unwrap()
             .is_empty());
-        assert!(storage.get_tx_by_id(u1.txid).unwrap().is_none());
-        assert!(storage.get_tx_by_id(u2.txid).unwrap().is_none());
+        assert!(storage.get_funding_record(&op1).unwrap().is_none());
+        assert!(storage
+            .get_funding_record(&OutPoint::new(shared, 1))
+            .unwrap()
+            .is_none());
 
         drop(storage);
         storage_backend.remove().unwrap();
     }
 
     /// End-to-end exercise of `replace_funding_on_finalize` along a real chain. Verifies:
-    ///   1. A Funding-kind entry is replaced by the finalized speedup
+    ///   1. A user funding entry is replaced by the finalized speedup's materialized change.
     ///   2. The finalizing speedup is removed from SpeedupList.
-    ///   3. A second finalize matches a Speedup-kind queue entry via its `last_output`.
-    ///   4. Multi-match (Speedup + Funding) removes both stale entries and inserts the new speedup.
-    ///   5. The tx records of removed entries are dropped from storage.
+    ///   3. A second finalize matches the earlier materialized change by its OutPoint.
+    ///   4. Multi-match removes both stale entries and inserts the new change.
+    ///   5. Removed funding records are dropped.
     #[test]
     fn test_replace_funding_on_finalize_lifecycle() {
         let storage_backend = StorageTestConfig::new();
         let storage = new_storage(&storage_backend);
         let pub_key = dummy_pubkey();
 
-        // Seed FundingList with U1 (Funding kind).
+        // Seed the funding queue with U1 (user funding).
         let u1 = Utxo::new(random_txid(), 0, 100_000, &pub_key);
         FundingStorage::append_funding(&storage, u1.clone()).unwrap();
 
@@ -1781,20 +1797,23 @@ mod tests {
             .unwrap();
         FundingStorage::replace_funding_on_finalize(&storage, s1.txid).unwrap();
 
-        // FundingList = [S1] (Speedup, preserved). U1 tx record gone. S1 removed from SpeedupList.
+        // Queue = [S1's change] (from_speedup). U1 funding record gone. S1 removed from SpeedupList.
         let records = FundingStorage::read_funding_records(&storage).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].txid, s1.txid);
-        assert!(matches!(records[0].kind, TxKind::Speedup(_)));
-        assert_eq!(records[0].state, TransactionState::Finalized);
-        assert!(storage.get_tx_by_id(u1.txid).unwrap().is_none());
+        assert_eq!(records[0].utxo.txid, s1.txid);
+        assert_eq!(records[0].utxo.amount, 90_000);
+        assert!(records[0].from_speedup);
+        assert!(storage
+            .get_funding_record(&OutPoint::new(u1.txid, u1.vout))
+            .unwrap()
+            .is_none());
         assert!(!storage
             .get_speedups_ordered()
             .unwrap()
             .iter()
             .any(|t| t.txid == s1.txid));
 
-        // Append U2 after S1's entry. FundingList = [S1, U2].
+        // Append U2 after S1's change. Queue = [S1's change, U2].
         let u2 = Utxo::new(random_txid(), 0, 50_000, &pub_key);
         FundingStorage::append_funding(&storage, u2.clone()).unwrap();
         assert_eq!(
@@ -1804,7 +1823,7 @@ mod tests {
             2
         );
 
-        // S2 consumes S1's change AND U2. S1's change is matched by the Speedup record's last_output (txid=S1, vout=0).
+        // S2 consumes S1's change AND U2. S1's change is matched by its OutPoint (txid=S1, vout=0).
         let s1_change = Utxo::new(s1.txid, 0, 90_000, &pub_key);
         let s2 = cpfp_with_change(
             vec![s1_change, u2.clone()],
@@ -1817,13 +1836,19 @@ mod tests {
             .unwrap();
         FundingStorage::replace_funding_on_finalize(&storage, s2.txid).unwrap();
 
-        // Both S1 entry and U2 entry removed; S2 inserted at smallest matched pos.
+        // Both prior entries removed; S2's change inserted at smallest matched pos.
         let records = FundingStorage::read_funding_records(&storage).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].txid, s2.txid);
-        assert!(matches!(records[0].kind, TxKind::Speedup(_)));
-        assert!(storage.get_tx_by_id(s1.txid).unwrap().is_none());
-        assert!(storage.get_tx_by_id(u2.txid).unwrap().is_none());
+        assert_eq!(records[0].utxo.txid, s2.txid);
+        assert!(records[0].from_speedup);
+        assert!(storage
+            .get_funding_record(&OutPoint::new(s1.txid, 0))
+            .unwrap()
+            .is_none());
+        assert!(storage
+            .get_funding_record(&OutPoint::new(u2.txid, u2.vout))
+            .unwrap()
+            .is_none());
         let sl = storage.get_speedups_ordered().unwrap();
         assert!(!sl.iter().any(|t| t.txid == s1.txid));
         assert!(!sl.iter().any(|t| t.txid == s2.txid));
@@ -1835,7 +1860,7 @@ mod tests {
     /// Defensive paths of `replace_funding_on_finalize`. None are fatal:
     ///   1. Missing txid.
     ///   2. Speedup whose funding_inputs match no queue entry.
-    ///   3. Non-Speedup tx (Normal / Funding / NeedsSpeedup).
+    ///   3. Non-Speedup tx (Normal).
     #[test]
     fn test_replace_funding_on_finalize_defensive_paths() {
         let storage_backend = StorageTestConfig::new();
@@ -1861,7 +1886,7 @@ mod tests {
         storage.insert_speedup(orphan.clone()).unwrap();
         FundingStorage::replace_funding_on_finalize(&storage, orphan.txid).unwrap();
         assert_eq!(snapshot().len(), 1);
-        // Orphan speedup tx record left intact (not moved into FundingList).
+        // Orphan speedup tx record left intact (no change materialized into the queue).
         assert!(storage.get_tx_by_id(orphan.txid).unwrap().is_some());
 
         // 3. Wrong-kind tx (Normal).
@@ -1871,7 +1896,7 @@ mod tests {
             .unwrap();
         FundingStorage::replace_funding_on_finalize(&storage, normal_id).unwrap();
         assert_eq!(snapshot().len(), 1);
-        assert_eq!(snapshot()[0].txid, untouched.txid);
+        assert_eq!(snapshot()[0].utxo, untouched);
 
         drop(storage);
         storage_backend.remove().unwrap();

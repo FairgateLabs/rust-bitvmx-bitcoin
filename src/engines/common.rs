@@ -3,7 +3,7 @@ use bitvmx_bitcoin_rpc::types::BlockHeight;
 use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor};
 use std::rc::Rc;
 use std::{cell::Cell, collections::HashSet};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     config::config::CoordinatorSettings,
@@ -211,7 +211,7 @@ impl EngineContext {
             TypesToMonitor::Transactions(vec![txid], tx.context.clone(), tx.confirmation_trigger),
             true,
         )?;
-        debug!("Transaction({}) already confirmed on-chain", txid);
+        info!("Transaction({}) already confirmed on-chain", txid);
         Ok(())
     }
 
@@ -232,7 +232,7 @@ impl EngineContext {
         // Step 1. Does the node already have this tx, in the mempool or on chain?
         match self.monitor.get_tx_confirmations(&txid)? {
             Some(0) => {
-                debug!(
+                info!(
                     "Transaction({}) already in node mempool; treating as dispatched: {}",
                     txid, raw
                 );
@@ -267,7 +267,7 @@ impl EngineContext {
                     txid, raw
                 );
             } else {
-                warn!(
+                error!(
                     "Transaction({}) external input missing/spent; settling Failed: {}",
                     txid, raw
                 );

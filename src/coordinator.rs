@@ -246,7 +246,7 @@ impl BitcoinCoordinator {
     /// Cancels monitoring and removes the targeted transactions from coordinator storage.
     ///
     /// Only client-registered txs (`Normal` / `NeedsSpeedup`) still in `ToDispatch` state are cancellable.
-    /// Already-dispatched, Speedup-kind, Funding-kind, or missing txids are refused and a news item is
+    /// Already-dispatched, Speedup-kind, fundings or missing txids are refused and a news item is
     /// emitted per rejected txid. Non-`Transactions` variants (`OutputPattern`, `SpendingUTXOTransaction`,
     /// `NewBlock`) pass through to monitor cancellation as-is.
     ///

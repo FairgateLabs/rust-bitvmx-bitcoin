@@ -60,8 +60,8 @@ impl TransactionEngine {
 
         let mut to_dispatch: Vec<CoordinatedTx> = Vec::new();
         for tx in active_txs {
-            // Speedups are handled by the speedup engine; Funding records are not broadcastable.
-            if matches!(tx.kind, TxKind::Speedup(_) | TxKind::Funding(_)) {
+            // Speedups are handled by the speedup engine. Funding UTXOs are not in the Tx store.
+            if matches!(tx.kind, TxKind::Speedup(_)) {
                 continue;
             }
             if tx.state == TransactionState::ToDispatch && tx.is_ready_to_dispatch(current_height) {
@@ -113,10 +113,8 @@ impl TransactionEngine {
                         warn!(
                             "Transaction({}) stuck in mempool for {} blocks (threshold: {}). \
                             This news will repeat once per block until the transaction is mined. \
-                            Options: (1) cancel() to stop tracking: the transaction remains in the \
-                            mempool but will no longer be monitored; (2) dispatch a CPFP via \
-                            dispatch_without_speedup() spending one of its outputs to raise the \
-                            effective fee rate: the coordinator will track both and mine them together.",
+                            Dispatch a CPFP via dispatch_without_speedup() spending one of its outputs to raise the \
+                            effective fee rate: the coordinator will track both and mine them together. It can also be sped up via RBF if it corresponds.",
                             tx.txid,
                             tx.broadcast_block_height
                                 .map(|h| current_height.saturating_sub(h))
@@ -129,7 +127,7 @@ impl TransactionEngine {
             }
 
             if status.is_not_found() {
-                debug!(
+                info!(
                     "Transaction({}) not found, re-queuing for dispatch this tick",
                     tx.txid
                 );

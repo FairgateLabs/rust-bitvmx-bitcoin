@@ -1,4 +1,4 @@
-use bitcoin::Txid;
+use bitcoin::{OutPoint, Txid};
 use protocol_builder::types::Utxo;
 use std::rc::Rc;
 use tracing::warn;
@@ -6,24 +6,25 @@ use tracing::warn;
 use crate::{
     config::config::FundingSettings,
     errors::BitcoinCoordinatorError,
-    types::{CoordinatedTx, CoordinatorNews, TransactionState, TxKind},
+    types::{CoordinatedTx, CoordinatorNews, FundingData, TransactionState},
 };
 
 /// Storage operations the funding manager needs.
 pub trait FundingStorage {
-    /// Read every `TxKind::Funding` record in insertion order.
-    fn read_funding_records(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError>;
+    /// Read every funding-queue record in insertion order.
+    fn read_funding_records(&self) -> Result<Vec<FundingData>, BitcoinCoordinatorError>;
 
-    /// Append a new funding record with `spent = false`.
+    /// Append a new funding record with `spent = false`, keyed by the UTXO's `OutPoint`.
     fn append_funding(&self, utxo: Utxo) -> Result<(), BitcoinCoordinatorError>;
 
-    /// Toggle the spent flag on a stored record.
-    fn set_spent(&self, txid: Txid, spent: bool) -> Result<(), BitcoinCoordinatorError>;
+    /// Toggle the spent flag. Resolves `outpoint` to a funding-queue record, or failing that to a live
+    /// chain-tip speedup's `SpeedupContext.spent`.
+    fn set_spent(&self, outpoint: OutPoint, spent: bool) -> Result<(), BitcoinCoordinatorError>;
 
     /// Remove every funding record.
     fn clear_funding_records(&self) -> Result<(), BitcoinCoordinatorError>;
 
-    /// On finalization of the speedup, replace every funding record whose utxo matches one of the speedup's
+    /// On finalization of the speedup, replace every funding record whose outpoint matches one of the speedup's
     /// `funding_inputs` with a single new funding record holding the speedup's change output.
     fn replace_funding_on_finalize(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError>;
 }
@@ -68,7 +69,7 @@ impl FundingManager {
     ///  when the primary is Speedup-kind.
     ///
     /// - Pass 1: latest live speedup in SpeedupList that is not being replaced and not already spent.
-    /// - Pass 2: first unspent record in FundingList (Funding or Speedup kind).
+    /// - Pass 2: first unspent record in the funding queue. `is_speedup` reflects `from_speedup`.
     /// - `None`: no funding available.
     pub fn get_funding(
         &self,
@@ -88,40 +89,38 @@ impl FundingManager {
             if tx.has_live_replacement(speedups) || ctx.spent {
                 continue;
             }
-            let (utxo, _spent) = tx.get_funding_info()?;
-            self.storage.set_spent(tx.txid, true)?;
+            let utxo = tx.speedup_change_utxo()?;
+            self.storage
+                .set_spent(OutPoint::new(utxo.txid, utxo.vout), true)?;
             return Ok(Some((utxo, true)));
         }
 
-        // Pass 2: first unspent record in FundingList. May be a plain Funding entry (user-provided) or
-        // a Speedup entry (finalized chain tip moved into the queue by `replace_funding_on_finalize`).
+        // Pass 2: first unspent record in the funding queue. A user-provided UTXO (`from_speedup =
+        // false`) or a finalized speedup's change moved in by `replace_funding_on_finalize` (`true`).
         for record in self.storage.read_funding_records()? {
-            let (utxo, spent) = record.get_funding_info()?;
-            if spent {
+            if record.spent {
                 continue;
             }
-            self.storage.set_spent(record.txid, true)?;
-            let is_speedup = matches!(record.kind, TxKind::Speedup(_));
-            return Ok(Some((utxo, is_speedup)));
+            let utxo = record.utxo;
+            self.storage
+                .set_spent(OutPoint::new(utxo.txid, utxo.vout), true)?;
+            return Ok(Some((utxo, record.from_speedup)));
         }
 
         // No funding available.
         Ok(None)
     }
 
-    /// Second-call when the primary alone cannot cover fee + dust. Returns the
-    /// next unspent Funding-kind record from the FundingList and marks it spent.
-    /// Does NOT auto-release on `None`.
+    /// Second-call when the primary alone cannot cover fee + dust. Returns the next unspent user-provided
+    /// funding record (never a speedup-derived one) and marks it spent. Does not auto-release on `None`.
     pub fn get_combine_funding(&self) -> Result<Option<Utxo>, BitcoinCoordinatorError> {
         for record in self.storage.read_funding_records()? {
-            if !matches!(record.kind, TxKind::Funding(_)) {
+            if record.from_speedup || record.spent {
                 continue;
             }
-            let (utxo, spent) = record.get_funding_info()?;
-            if spent {
-                continue;
-            }
-            self.storage.set_spent(record.txid, true)?;
+            let utxo = record.utxo;
+            self.storage
+                .set_spent(OutPoint::new(utxo.txid, utxo.vout), true)?;
             return Ok(Some(utxo));
         }
         Ok(None)
@@ -131,7 +130,8 @@ impl FundingManager {
     pub fn release_marks(&self, utxos: &[Utxo]) -> Result<(), BitcoinCoordinatorError> {
         for u in utxos {
             // Mark as unspent
-            self.storage.set_spent(u.txid, false)?;
+            self.storage
+                .set_spent(OutPoint::new(u.txid, u.vout), false)?;
         }
         Ok(())
     }
@@ -171,7 +171,7 @@ mod tests {
         config::config::{CoordinatorStorageSettings, FundingSettings},
         core::storage::CoordinatorStorage,
         test_utils::{utxo, StorageTestConfig},
-        types::{FeeInfo, SpeedupContext, SpeedupKind},
+        types::{FeeInfo, SpeedupContext, SpeedupKind, TxKind},
     };
     use bitcoin::{
         absolute::LockTime,
@@ -251,17 +251,21 @@ mod tests {
             fee_info: FeeInfo {
                 fee: 0,
                 fee_rate: 1,
+                package_fee_rate: 1,
                 weight: 100,
             },
             context: "test".to_string(),
         }
     }
 
+    // Funding records live in their own OutPoint-keyed store. The test UTXOs and single-output speedups
+    // all use vout 0, so the record is looked up at (txid, 0).
     fn funding_spent(storage: &CoordinatorStorage, txid: Txid) -> bool {
-        match storage.get_tx_by_id(txid).unwrap().unwrap().kind {
-            TxKind::Funding(d) => d.spent,
-            _ => panic!("expected Funding"),
-        }
+        storage
+            .get_funding_record(&OutPoint::new(txid, 0))
+            .unwrap()
+            .expect("funding record must exist")
+            .spent
     }
 
     fn speedup_spent(storage: &CoordinatorStorage, txid: Txid) -> bool {
@@ -334,7 +338,9 @@ mod tests {
             "ToDispatch speedup must not count as chain tip"
         );
         assert_eq!(got.txid, q.txid);
-        storage.set_spent(q.txid, false).unwrap(); // reset for next sub-scenario
+        storage
+            .set_spent(OutPoint::new(q.txid, q.vout), false)
+            .unwrap(); // reset for next sub-scenario
 
         // An InMempool speedup is the chain tip and takes priority over the queue.
         let s1 = speedup_tx(1, TransactionState::InMempool, q.clone(), MIN * 8);
@@ -432,7 +438,7 @@ mod tests {
         // Funding queue now holds S2's change as the single entry.
         let records = storage.read_funding_records().unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].txid, s2.txid);
+        assert_eq!(records[0].utxo.txid, s2.txid);
 
         // replace_on_finalize on a tx whose funding_inputs don't match any queue entry
         // is treated defensively: warn + Ok(()), queue untouched.
@@ -441,7 +447,7 @@ mod tests {
         mgr.replace_on_finalize(unrelated.txid).unwrap();
         let records_after = storage.read_funding_records().unwrap();
         assert_eq!(records_after.len(), 1);
-        assert_eq!(records_after[0].txid, s2.txid);
+        assert_eq!(records_after[0].utxo.txid, s2.txid);
     }
 
     // A sub-minimum leftover sits at the front of the queue. A second UTXO is added by the user. get_funding
@@ -544,7 +550,9 @@ mod tests {
         // already consumed it when S1 was originally built.
         let s_prev_change = utxo(MIN * 50);
         storage.append_funding(s_prev_change.clone()).unwrap();
-        storage.set_spent(s_prev_change.txid, true).unwrap();
+        storage
+            .set_spent(OutPoint::new(s_prev_change.txid, s_prev_change.vout), true)
+            .unwrap();
 
         // S1: InMempool, consumes s_prev_change, tiny change output.
         let s1_change_sats = MIN / 3;
@@ -597,8 +605,9 @@ mod tests {
 
         let mid = storage.read_funding_records().unwrap();
         assert_eq!(mid.len(), 2, "S1's change + Q2 must both be in the queue");
-        assert_eq!(mid[0].txid, s1.txid);
-        assert_eq!(mid[1].txid, q2.txid);
+        assert_eq!(mid[0].utxo.txid, s1.txid);
+        assert!(mid[0].from_speedup, "S1's change is speedup-derived");
+        assert_eq!(mid[1].utxo.txid, q2.txid);
 
         // S2 finalizes: both S1.txid and Q2.txid funding records are matched by
         // S2.funding_inputs and replaced by a single record for S2's change output.
@@ -613,17 +622,15 @@ mod tests {
             1,
             "both old records must be replaced by one"
         );
-        assert_eq!(final_records[0].txid, s2.txid);
-        match &final_records[0].kind {
-            TxKind::Speedup(k) => {
-                assert!(
-                    !k.context().spent,
-                    "S2 was never claimed; context.spent stays false"
-                );
-            }
-            _ => panic!("expected TxKind::Speedup (kind preserved on finalize)"),
-        }
-        let (change_out, _) = final_records[0].last_output().unwrap();
-        assert_eq!(change_out.value.to_sat(), s2_change_sats);
+        assert_eq!(final_records[0].utxo.txid, s2.txid);
+        assert!(
+            final_records[0].from_speedup,
+            "materialized from the finalized speedup's change"
+        );
+        assert!(
+            !final_records[0].spent,
+            "S2 was never claimed; spent stays false"
+        );
+        assert_eq!(final_records[0].utxo.amount, s2_change_sats);
     }
 }

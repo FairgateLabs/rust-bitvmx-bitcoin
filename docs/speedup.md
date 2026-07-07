@@ -58,6 +58,25 @@ Rules that keep the chain pointing at reality:
 - When a funding UTXO is too small for the next fee, the coordinator advances the
   funding queue, and emits `InsufficientFunds` once the queue is empty.
 
+## The funding queue
+
+The queue is persisted as an ordered list of `OutPoint`s (txid + vout), each resolving to a
+`FundingData` record stored under its own outpoint key. Funding records are not `CoordinatedTx` and do
+not live in the transaction store.
+
+- Keying by `OutPoint` means several UTXOs from the same funding transaction (same txid, different
+  vouts) coexist. Registering two same-txid UTXOs stores both and both are handed out independently.
+- `get_funding` first tries the live speedup chain tip (pass 1), then the queue in insertion order
+  (pass 2). Each record carries `from_speedup`: `false` for a user UTXO, `true` for a finalized
+  speedup's change materialized into the queue by `replace_funding_on_finalize`.
+- `combine` (sweeping a second input when the primary alone cannot cover fee + dust) only pulls
+  user-provided funding, never a speedup-derived record.
+- A `spent` flag reserves a record for an in-flight build; it is reset on build failure so the next
+  tick can reuse it.
+- When a speedup finalizes, `replace_funding_on_finalize` silently removes the funding inputs it
+  consumed and inserts its change. These queue mutations emit no news: `TransactionEvicted` is reserved
+  for settled `CoordinatedTx` records removed after `max_tracking_confirmations`, not funding UTXOs.
+
 ## CPFP versus RBF
 
 Each boost is either a new CPFP or an RBF. The choice depends only on how many
@@ -77,8 +96,8 @@ flowchart TD
 | RBF | Unconfirmed count has reached `max_unconfirmed_speedups`. | Replaces the chain tip in place, reusing its inputs and paying more. |
 
 A boost is considered only when the live tip has aged at least
-`min_blocks_before_resend_speedup` blocks and its effective fee rate is still
-below `max_feerate_sat_vb`.
+`min_blocks_before_resend_speedup` blocks and its package fee rate
+(`package_fee_rate`) is still below `max_feerate_sat_vb`.
 
 When an RBF is dispatched, its predecessor gets `replaced_by` set so the funding
 walk and the staleness check skip it. The replaced chain is settled `Failed`
@@ -106,23 +125,24 @@ The rate itself is bounded on both ends:
 - Lower bound: `min_safe_fee_rate`. Used as the floor and as the fallback when the
   node has no fee estimate. Every boost must also out-pay its predecessor, so the
   rate is floored at `max(network_rate, predecessor_rate + 1)`.
-- Upper bound: `max_feerate_sat_vb`. `compute_speedup_fee` clamps the final fee at
-  `max_feerate_sat_vb * child_vsize` and flags the result as capped.
+- Upper bound: `max_feerate_sat_vb`. This is a cap on the package effective fee rate. 
+  A CPFP/RBF child pays the parents' shortfall too, so `compute_speedup_fee` clamps the
+  child fee at `max_feerate_sat_vb * (parent_vbytes + child_vsize) - parent_credit`, which
+  keeps the parents-plus-child package at `max_feerate_sat_vb` sat/vB and flags the result
+  as capped.
 
-The stored `FeeInfo.fee_rate` is the actual effective rate (`fee_paid / vsize`),
-not the input network rate.
+Each speedup stores two rates in its `FeeInfo`:
+
+- `fee_rate` is the child transaction's own standalone rate (`fee_paid / child_vsize`).
+- `package_fee_rate` is the effective rate of the whole package the child funds,
+  `(parent_credit + fee_paid) / (parent_vbytes + child_vsize)`. 
 
 ## Reaching the cap
 
-Escalation stops at `max_feerate_sat_vb`:
+Escalation stops once the package rate reaches `max_feerate_sat_vb`:
 
-- A boost that would exceed the cap is saved at the cap, and `MaxFeeRateReached`
-  is emitted against it. The tip is then treated as at-cap, so later staleness
-  ticks build nothing new.
-- For an RBF specifically, if the BIP-125 bandwidth floor (`predecessor_rate * 2`)
-  would already exceed the cap, the build is skipped entirely and
-  `MaxFeeRateReached` is emitted against the predecessor. This avoids a doomed
-  RBF that the node would reject for paying below the floor.
+- A boost whose package rate would exceed the cap is saved at the cap, and
+  `MaxFeeRateReached` is emitted against it carrying the capped `package_fee_rate`.
 
 ## One pre-built speedup at a time
 
@@ -130,4 +150,4 @@ Building and broadcasting are split across ticks: a boost or CPFP is built and
 saved `ToDispatch` in one tick (steps 5 and 6) and broadcast in the next (step
 4). At most one pre-built speedup is in flight at a time, and `create_cpfp_batch`
 short-circuits if any speedup is already `ToDispatch`. The reasons are covered by
-invariants I1, I2, and I4 in [design.md](design.md).
+invariants I1, I2, and I3 in [design.md](design.md).
