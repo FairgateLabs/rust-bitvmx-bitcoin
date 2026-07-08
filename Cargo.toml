@@ -1,6 +1,6 @@
 [package]
 name = "bitcoin-coordinator"
-version = "0.7.5"
+version = "0.8.0"
 edition = "2021"
 
 [dependencies]
@@ -17,12 +17,12 @@ ctrlc = "3.4"
 hex = "0.4.3"
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
 
-rust-bitvmx-storage-backend = { git = "https://github.com/FairgateLabs/rust-bitvmx-storage-backend.git", tag = "v0.7.5" }
-bitvmx-transaction-monitor = { git = "https://github.com/FairgateLabs/rust-bitvmx-transaction-monitor.git", tag = "v0.7.5" }
-bitvmx-key-manager = { git = "https://github.com/FairgateLabs/rust-bitvmx-key-manager.git", tag = "v0.7.5" }
-bitvmx-settings = { git = "https://github.com/FairgateLabs/rust-bitvmx-settings.git", tag = "v0.7.5" }
-bitvmx-bitcoin-rpc = { git = "https://github.com/FairgateLabs/rust-bitvmx-bitcoin-rpc.git", tag = "v0.7.5" }
-bitvmx-protocol-builder = { git = "https://github.com/FairgateLabs/rust-bitvmx-protocol-builder.git", tag = "v0.7.5" }
+rust-bitvmx-storage-backend = { git = "https://github.com/FairgateLabs/rust-bitvmx-storage-backend.git", tag = "v0.8.0" }
+bitvmx-transaction-monitor = { git = "https://github.com/FairgateLabs/rust-bitvmx-transaction-monitor.git", tag = "v0.8.0" }
+bitvmx-key-manager = { git = "https://github.com/FairgateLabs/rust-bitvmx-key-manager.git", tag = "v0.8.0" }
+bitvmx-settings = { git = "https://github.com/FairgateLabs/rust-bitvmx-settings.git", tag = "v0.8.0" }
+bitvmx-bitcoin-rpc = { git = "https://github.com/FairgateLabs/rust-bitvmx-bitcoin-rpc.git", tag = "v0.8.0" }
+bitvmx-protocol-builder = { git = "https://github.com/FairgateLabs/rust-bitvmx-protocol-builder.git", tag = "v0.8.0" }
 
 
 [dependencies.bitcoin]
@@ -38,8 +38,8 @@ version = "0.9.2"
 features = ["std", "std_rng"]
 
 [dev-dependencies]
-bitcoind = { git = "https://github.com/FairgateLabs/rust-bitcoind.git", tag = "v0.7.5" }
-bitcoin-indexer = { git = "https://github.com/FairgateLabs/rust-bitcoin-indexer.git", tag = "v0.7.5" }
-bitvmx-bitcoin-rpc = { git = "https://github.com/FairgateLabs/rust-bitvmx-bitcoin-rpc.git", tag = "v0.7.5", features = [
+bitcoind = { git = "https://github.com/FairgateLabs/rust-bitcoind.git", tag = "v0.8.0" }
+bitcoin-indexer = { git = "https://github.com/FairgateLabs/rust-bitcoin-indexer.git", tag = "v0.8.0" }
+bitvmx-bitcoin-rpc = { git = "https://github.com/FairgateLabs/rust-bitvmx-bitcoin-rpc.git", tag = "v0.8.0", features = [
     "testing",
 ] }
