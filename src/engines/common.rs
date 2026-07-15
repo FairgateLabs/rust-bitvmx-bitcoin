@@ -1,8 +1,8 @@
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor};
+use std::cell::Cell;
 use std::rc::Rc;
-use std::{cell::Cell, collections::HashSet};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -142,6 +142,16 @@ impl EngineContext {
                 warn!("Transaction({}) fatal dispatch error: {}", txid, msg);
                 self.fail_and_cascade(tx, current_height, false)?;
             }
+            DispatchOutcome::ParentFailed(parent) => {
+                // A tracked parent this tx spends from has settled Failed, so the tx is doomed. A first CPFP
+                // rebuilds a fresh CPFP for the parents whose output is still live. For an RBF this clears
+                // the predecessor's `replaced_by`, un-masking the root so it fails the same way next tick.
+                warn!(
+                    "Transaction({}) parent {} has Failed; settling Failed and re-queuing survivors",
+                    txid, parent
+                );
+                self.settle_failed_child(tx, current_height)?;
+            }
             DispatchOutcome::DispatchError(raw) => {
                 self.classify_dispatch_error(tx, txid, &raw, current_height, fee_info)?;
             }
@@ -266,13 +276,16 @@ impl EngineContext {
                     "Transaction({}) funding input missing/spent; settling Failed to recreate: {}",
                     txid, raw
                 );
-            } else {
-                error!(
-                    "Transaction({}) external input missing/spent; settling Failed: {}",
-                    txid, raw
-                );
+                return self.fail_and_cascade(tx, current_height, true);
             }
-            return self.fail_and_cascade(tx, current_height, funding_missing);
+            // External (non-funding) input gone. A first (batched) CPFP spends protocol-parent outputs
+            // directly, so it rebuilds a fresh CPFP for the parents whose output is still live (one dead
+            // parent must not sink the batch); anything else just fails and cascades.
+            error!(
+                "Transaction({}) external input missing/spent; settling Failed: {}",
+                txid, raw
+            );
+            return self.settle_failed_child(tx, current_height);
         }
 
         // Step 3. Inputs intact, cause unknown. Retry until the budget is spent, then fail.
@@ -342,6 +355,76 @@ impl EngineContext {
         Ok(())
     }
 
+    /// Settle a transaction that can never be valid because an input it spends is gone (an external/parent
+    /// output that was spent, or a tracked parent that settled Failed). A first (batched) CPFP rebuilds a
+    /// fresh CPFP for the parents whose output is still live; anything else just fails and cascades.
+    fn settle_failed_child(
+        &self,
+        tx: &CoordinatedTx,
+        current_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        // A first CPFP is the only speedup that spends protocol-parent outputs directly and so can rebuild survivors.
+        let is_first_cpfp = tx.speedup_kind().map(|k| !k.is_boost()).unwrap_or(false);
+        if is_first_cpfp {
+            self.rebuild_survivors(tx, current_height)
+        } else {
+            self.fail_and_cascade(tx, current_height, false)
+        }
+    }
+
+    /// A batched CPFP failed because a protocol-parent output is gone (spent externally). Settle the CPFP
+    /// Failed (cascading to its descendants and releasing its funding), then re-queue only the parents whose
+    /// output is still live.
+    fn rebuild_survivors(
+        &self,
+        tx: &CoordinatedTx,
+        current_height: BlockHeight,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        // Probe each: still unspent -> live survivor, gone -> dead parent to drop.
+        let mut survivors: Vec<Txid> = Vec::new();
+        let mut dead: Vec<Txid> = Vec::new();
+        for op in tx.non_funding_inputs() {
+            if self.monitor.is_utxo_unspent_rpc(&op.txid, op.vout, true)? {
+                survivors.push(op.txid);
+            } else {
+                dead.push(op.txid);
+            }
+        }
+
+        // Settle the CPFP Failed: emits SpeedupDispatchError, cascades ToDispatch descendants, releases its funding.
+        self.fail_and_cascade(tx, current_height, false)?;
+
+        // Re-queue only still-live parents that are still NeedsSpeedup.
+        let mut to_requeue: Vec<Txid> = Vec::new();
+        for p in &survivors {
+            if to_requeue.contains(p) {
+                continue;
+            }
+            if let Some(parent) = self.storage.get_tx_by_id(*p)? {
+                if matches!(parent.kind, TxKind::NeedsSpeedup(_)) {
+                    to_requeue.push(*p);
+                }
+            }
+        }
+        self.storage.prepend_pending_speedup_parents(&to_requeue)?;
+
+        if to_requeue.is_empty() {
+            warn!(
+                "CPFP({}) failed: all parent output(s) dead {:?}; nothing to rebuild",
+                tx.txid, dead
+            );
+        } else {
+            info!(
+                "CPFP({}) failed: dead parent(s) {:?} dropped, re-queuing {} live parent(s) {:?} for a fresh CPFP",
+                tx.txid,
+                dead,
+                to_requeue.len(),
+                to_requeue
+            );
+        }
+        Ok(())
+    }
+
     /// Settle Failed, emit news, reset spent flags on parents (CPFP only. RBF skips), reset `replaced_by` on
     /// an RBF predecessor, and on funding-missing re-add NeedsSpeedup parents to PendingSpeedupParents.
     fn settle_failed_dispatch(
@@ -392,30 +475,16 @@ impl EngineContext {
         &self,
         tx: &CoordinatedTx,
     ) -> Result<Option<bool>, BitcoinCoordinatorError> {
-        let funding: HashSet<(Txid, u32)> = match tx.speedup_kind() {
-            Ok(k) => k
-                .context()
-                .funding_inputs
-                .iter()
-                .map(|u| (u.txid, u.vout))
-                .collect(),
-            Err(_) => HashSet::new(),
-        };
-
         // Funding inputs first, since a gone funding UTXO is recoverable.
-        for (txid, vout) in &funding {
-            if !self.monitor.is_utxo_unspent_rpc(txid, *vout, true)? {
+        for op in tx.funding_outpoints() {
+            if !self.monitor.is_utxo_unspent_rpc(&op.txid, op.vout, true)? {
                 return Ok(Some(true));
             }
         }
 
         // Remaining external or parent inputs, where a gone one is fatal for this tx.
-        for input in &tx.tx.input {
-            let op = (input.previous_output.txid, input.previous_output.vout);
-            if funding.contains(&op) {
-                continue;
-            }
-            if !self.monitor.is_utxo_unspent_rpc(&op.0, op.1, true)? {
+        for op in tx.non_funding_inputs() {
+            if !self.monitor.is_utxo_unspent_rpc(&op.txid, op.vout, true)? {
                 return Ok(Some(false));
             }
         }

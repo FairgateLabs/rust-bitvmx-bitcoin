@@ -9,6 +9,8 @@ use tracing::debug;
 
 pub trait DispatcherStorage {
     fn is_tx_known(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError>;
+    /// True when the tracked transaction has settled `Failed`. A child spending its output is doomed.
+    fn is_tx_failed(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError>;
 }
 
 /// Raw per-transaction outcome returned by [`Dispatcher::dispatch`].
@@ -22,6 +24,9 @@ pub enum DispatchOutcome {
     Success,
     /// Pre-send validation failure (e.g. transaction weight exceeds the configured max).
     Fatal(String),
+    /// Pre-send: a tracked parent whose output this tx spends has settled `Failed`, so the tx can never be valid.
+    /// Carries that parent's txid.
+    ParentFailed(Txid),
     /// Broadcast returned an error. The raw node message is carried unparsed.
     DispatchError(String),
 }
@@ -88,6 +93,16 @@ impl Dispatcher {
         let (valid, mut results) = self.validate(txs);
         for tx in valid {
             let txid = tx.txid;
+            // A tracked parent that already settled `Failed` will never come live, so its child can never be valid.
+            if let Some(failed_parent) = self.failed_parent(&tx)? {
+                debug!(
+                    txid = %txid,
+                    parent = %failed_parent,
+                    "dispatcher: a tracked parent has Failed; failing child pre-send",
+                );
+                results.push((txid, DispatchOutcome::ParentFailed(failed_parent)));
+                continue;
+            }
             if !self.parents_ready(&tx, monitor)? {
                 debug!(
                     txid = %txid,
@@ -102,6 +117,17 @@ impl Dispatcher {
             results.push((txid, outcome));
         }
         Ok(results)
+    }
+
+    /// The first tracked parent (an input's source tx) that has settled `Failed`, if any.
+    fn failed_parent(&self, tx: &CoordinatedTx) -> Result<Option<Txid>, BitcoinCoordinatorError> {
+        for input in &tx.tx.input {
+            let parent_txid = input.previous_output.txid;
+            if self.storage.is_tx_known(&parent_txid)? && self.storage.is_tx_failed(&parent_txid)? {
+                return Ok(Some(parent_txid));
+            }
+        }
+        Ok(None)
     }
 
     /// For each input of `tx`: if the parent txid is coordinator-tracked, require it to be
@@ -240,11 +266,17 @@ mod tests {
         fn is_tx_known(&self, _txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
             Ok(false)
         }
+        fn is_tx_failed(&self, _txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
+            Ok(false)
+        }
     }
     struct AllKnown;
     impl DispatcherStorage for AllKnown {
         fn is_tx_known(&self, _txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
             Ok(true)
+        }
+        fn is_tx_failed(&self, _txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
+            Ok(false)
         }
     }
 

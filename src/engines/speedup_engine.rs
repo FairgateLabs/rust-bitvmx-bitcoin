@@ -133,7 +133,9 @@ impl SpeedupEngine {
     }
 
     /// Step 4 of `tick`: broadcast `ToDispatch` speedups built in a prior tick (or re-queued this tick).
-    pub fn dispatch_pending_speedups(&self) -> Result<(), BitcoinCoordinatorError> {
+    /// Returns `true` when a dispatched boost (a speedup produced by `boost_if_stale`, not a first CPFP)
+    /// settled `Failed` this call, so `boost_if_stale` can skip building another boost in the same tick.
+    pub fn dispatch_pending_speedups(&self) -> Result<bool, BitcoinCoordinatorError> {
         let current_height = self.ctx.monitor.get_monitor_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
@@ -142,13 +144,20 @@ impl SpeedupEngine {
             .filter(|tx| tx.state == TransactionState::ToDispatch)
             .collect();
         if pending.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
 
         let dispatchable = self.ctx.apply_retry_rate_limit(pending);
         if dispatchable.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
+
+        // Track which dispatched txs are boosts, so we can report a boost that ends up Failed.
+        let boost_txids: Vec<Txid> = dispatchable
+            .iter()
+            .filter(|t| t.speedup_kind().map(|k| k.is_boost()).unwrap_or(false))
+            .map(|t| t.txid)
+            .collect();
 
         let results = self
             .ctx
@@ -166,13 +175,31 @@ impl SpeedupEngine {
                 )?;
             }
         }
-        Ok(())
+
+        // We only report a boost that actually settled `Failed`.
+        let boost_failed = boost_txids.iter().any(|id| {
+            self.ctx
+                .storage
+                .get_tx_by_id(*id)
+                .ok()
+                .flatten()
+                .map(|t| t.state == TransactionState::Failed)
+                .unwrap_or(false)
+        });
+        Ok(boost_failed)
     }
 
     /// Step 5 of `tick`: if the latest live speedup is stale, build a boost (new CPFP when slots are
     /// available, otherwise RBF) and save it as `ToDispatch`. Short-circuits if any speedup is already
     /// `ToDispatch` or if the live tip is already at cap.
-    pub fn boost_if_stale(&self) -> Result<(), BitcoinCoordinatorError> {
+    pub fn boost_if_stale(&self, skip_boost: bool) -> Result<(), BitcoinCoordinatorError> {
+        // A boost just settled Failed this tick: do not build another boost now. Re-boosting a dead tip
+        // is pointless (nothing on-chain changed) and would re-mask the tx it replaced, so the review
+        // loop never gets to re-queue and rebuild it next tick.
+        if skip_boost {
+            return Ok(());
+        }
+
         let current_height = self.ctx.monitor.get_monitor_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
