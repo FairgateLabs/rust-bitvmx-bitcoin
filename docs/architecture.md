@@ -139,7 +139,7 @@ only build and save; the broadcast happens on the next tick.
 
 ## Dispatch classification
 
-When the dispatcher broadcasts a transaction it returns one of three outcomes.
+When the dispatcher broadcasts a transaction it returns one of four outcomes.
 The engine, not the error string, decides what the outcome means by probing live
 node state. This requires the node to run with `-txindex=1`, which the
 coordinator asserts at construction.
@@ -148,6 +148,7 @@ coordinator asserts at construction.
 flowchart TD
     O{DispatchOutcome} -->|Success| Acc[mark_accepted: InMempool]
     O -->|Fatal| Fail0[fail_and_cascade: Failed]
+    O -->|ParentFailed| PF[settle_failed_child: rebuild survivors or cascade]
     O -->|DispatchError raw| S1{getrawtransaction}
     S1 -->|Some 0| Acc
     S1 -->|Some n>=1| Conf[mark_already_confirmed: Confirmed]
@@ -163,6 +164,7 @@ flowchart TD
 |---|---|---|
 | `Success` | Node accepted the broadcast. | `InMempool`. |
 | `Fatal(msg)` | Deterministic pre-send rejection (oversize, zero inputs). | `Failed` immediately, no node probe. |
+| `ParentFailed(parent)` | A tracked parent whose output this child spends has already settled `Failed`. | Fail the child pre-send; a batch CPFP rebuilds a fresh CPFP over its surviving parents. See [speedup.md](speedup.md). |
 | `DispatchError(raw)` | Node rejected for some other reason. | Classify against live node state, see below. |
 
 Classification of a `DispatchError`:

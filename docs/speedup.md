@@ -103,6 +103,24 @@ When an RBF is dispatched, its predecessor gets `replaced_by` set so the funding
 walk and the staleness check skip it. The replaced chain is settled `Failed`
 later, when the RBF finalizes.
 
+## Batch coverage and a dead parent
+
+`create_cpfp_batch` builds one CPFP whose anchor inputs spend an output from each
+pending `NeedsSpeedup` parent, so a single child accelerates the whole batch and
+`parents()` lists everyone it covers. If one covered parent disappears (an opponent
+double-spends its input, so the parent settles `Failed` and its output never
+exists), the batch CPFP is invalid, but the healthy parents must not be dropped
+with it.
+
+- The dispatcher fails the child pre-send when a tracked parent is already `Failed`
+  (the `ParentFailed` outcome).
+- For a first CPFP the engine rebuilds: probe each covered parent output, drop the
+  dead ones, and re-queue the live ones so the next tick builds a fresh CPFP over
+  the survivors. A boost or RBF cascades instead, letting the first CPFP underneath
+  do the rebuild.
+
+This holds for a CPFP-of-CPFP chain and for an RBF over the batch.
+
 ## Fee model
 
 Speedup fees use a plain package-rate model. The fee covers the combined virtual
