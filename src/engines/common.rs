@@ -355,9 +355,7 @@ impl EngineContext {
         Ok(())
     }
 
-    /// Settle a transaction that can never be valid because an input it spends is gone (an external/parent
-    /// output that was spent, or a tracked parent that settled Failed). A first (batched) CPFP rebuilds a
-    /// fresh CPFP for the parents whose output is still live; anything else just fails and cascades.
+    /// Settle a transaction that can never be valid because a tracked parent it spends has settled Failed.
     fn settle_failed_child(
         &self,
         tx: &CoordinatedTx,
@@ -372,22 +370,27 @@ impl EngineContext {
         }
     }
 
-    /// A batched CPFP failed because a protocol-parent output is gone (spent externally). Settle the CPFP
-    /// Failed (cascading to its descendants and releasing its funding), then re-queue only the parents whose
-    /// output is still live.
+    /// A batched CPFP failed because a covered parent settled Failed. Settle the CPFP Failed (cascading to
+    /// its descendants and releasing its funding), then re-queue every covered parent except the ones that
+    /// have themselves settled Failed, so a parent that is only transiently absent keeps its acceleration.
     fn rebuild_survivors(
         &self,
         tx: &CoordinatedTx,
         current_height: BlockHeight,
     ) -> Result<(), BitcoinCoordinatorError> {
-        // Probe each: still unspent -> live survivor, gone -> dead parent to drop.
+        // Classify each covered parent by its own settled state, not by an instantaneous UTXO probe. A parent
+        // counts as dead only once it has settled Failed, which already waited out its own reorg-flap guard window.
         let mut survivors: Vec<Txid> = Vec::new();
         let mut dead: Vec<Txid> = Vec::new();
         for op in tx.non_funding_inputs() {
-            if self.monitor.is_utxo_unspent_rpc(&op.txid, op.vout, true)? {
-                survivors.push(op.txid);
-            } else {
+            let failed = self
+                .storage
+                .get_tx_by_id(op.txid)?
+                .map_or(false, |p| p.state == TransactionState::Failed);
+            if failed {
                 dead.push(op.txid);
+            } else {
+                survivors.push(op.txid);
             }
         }
 

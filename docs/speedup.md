@@ -114,12 +114,16 @@ with it.
 
 - The dispatcher fails the child pre-send when a tracked parent is already `Failed`
   (the `ParentFailed` outcome).
-- For a first CPFP the engine rebuilds: probe each covered parent output, drop the
-  dead ones, and re-queue the live ones so the next tick builds a fresh CPFP over
-  the survivors. A boost or RBF cascades instead, letting the first CPFP underneath
-  do the rebuild.
+- For a first CPFP the engine rebuilds: drop only the parents that have themselves
+  settled `Failed`, and re-queue the rest for a fresh CPFP. A parent that is merely
+  transiently absent (evicted but still inside its own guard window) is kept, so it
+  is not built into the fresh CPFP yet but is picked up on a later pass once it
+  returns; if it never returns it fails on its own window. A boost or RBF cascades
+  instead, letting the first CPFP underneath do the rebuild.
 
-This holds for a CPFP-of-CPFP chain and for an RBF over the batch.
+This holds for a CPFP-of-CPFP chain and for an RBF over the batch, and it keeps each
+disappeared parent's guard window independent so one absent parent never delays the
+acceleration of the healthy ones.
 
 ## Fee model
 

@@ -3066,7 +3066,7 @@ fn test_cpfp_chain_survivor_after_parent_replaced() {
         boost_txid.expect("a CPFP-of-CPFP boost must be built and dispatched on top of the root");
 
     // Opponent replaces parent1 by double-spending its input; parent1 settles Failed, its output never exists.
-    replace_parent_by_opponent(&setup.bitcoin_client, &setup.regtest_wallet, &p1_clone).unwrap();
+    replace_parent_by_opponent(&setup.bitcoin_client, &setup.regtest_wallet, &p1_clone, 0).unwrap();
 
     let survivor_cpfp = drive_dead_parent_recovery(
         &coordinator,
@@ -3184,7 +3184,7 @@ fn test_rbf_of_root_survivor_after_parent_replaced() {
     let rbf_txid = rbf_txid.expect("an RBF-of-root must replace the root and reach InMempool");
 
     // Scenario B kill: opponent replaces the parent by double-spending its input; the parent settles Failed.
-    replace_parent_by_opponent(&setup.bitcoin_client, &setup.regtest_wallet, &p1_clone).unwrap();
+    replace_parent_by_opponent(&setup.bitcoin_client, &setup.regtest_wallet, &p1_clone, 0).unwrap();
 
     let survivor_cpfp = drive_dead_parent_recovery(
         &coordinator,
@@ -3218,6 +3218,267 @@ fn test_rbf_of_root_survivor_after_parent_replaced() {
         parents.contains(&p2_txid) && !parents.contains(&p1_txid),
         "survivor CPFP must cover only parent2; got {:?}",
         parents
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// A parent that is only transiently absent must keep its acceleration and must not drag the healthy ones.
+/// Batch of three parents p1, p2, p3 under one root CPFP. p1 is killed permanently. p2 is evicted a couple
+/// blocks later, so when p1's guard window elapses and the root fails, p2 is absent-but-not-yet-Failed (its
+/// own window still open). The rescue must: drop p1, build a fresh CPFP over the live p3 immediately without
+/// waiting on p2, and leave p2 pending. When p2's disappearance is then reverted by a reorg, p2 comes back
+/// and gets its own CPFP on a later pass. This is the state-based survivor test: classifying a survivor by a
+/// momentary output probe would wrongly drop p2 here.
+#[test]
+fn test_batch_transiently_missing_parent_kept_then_recovered() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    // Guard window of 3 blocks gives slack to place p2's window a couple blocks behind p1's.
+    let mut settings = rebuild_settings(5);
+    settings.monitor.max_monitoring_confirmations = Some(3);
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings.clone());
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        1_000_000,
+    )
+    .unwrap();
+    let (p1, sd1) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+    let (p2, sd2) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+    let (p3, sd3) = create_coordinator_parent_tx(
+        &setup.bitcoin_client,
+        &*key_manager,
+        Network::Regtest,
+        200_000,
+    )
+    .unwrap();
+    let p1_txid = p1.compute_txid();
+    let p2_txid = p2.compute_txid();
+    let p3_txid = p3.compute_txid();
+    let p1_clone = p1.clone();
+    let p2_clone = p2.clone();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding).unwrap();
+    coordinator
+        .dispatch_with_speedup(p1, sd1, ctx("dead"), None, None)
+        .unwrap();
+    coordinator
+        .dispatch_with_speedup(p2, sd2, ctx("flap"), None, None)
+        .unwrap();
+    coordinator
+        .dispatch_with_speedup(p3, sd3, ctx("live"), None, None)
+        .unwrap();
+
+    // One root CPFP over all three parents.
+    let root_cpfp = build_and_dispatch_cpfp(&coordinator, &coord_storage, 5);
+    let root_parents = coord_storage
+        .get_tx_by_id(root_cpfp)
+        .unwrap()
+        .unwrap()
+        .speedup_kind()
+        .unwrap()
+        .parents()
+        .to_vec();
+    assert!(
+        root_parents.contains(&p1_txid)
+            && root_parents.contains(&p2_txid)
+            && root_parents.contains(&p3_txid),
+        "root CPFP must cover all three parents; got {:?}",
+        root_parents
+    );
+
+    let max_confs = settings.monitor.max_monitoring_confirmations.unwrap() as usize;
+    let retry_ms = settings.coordinator.retry_interval_seconds * 1000;
+    let sleep = std::time::Duration::from_millis(retry_ms + 300);
+
+    // Kill p1 permanently in its own block, then let review see it not_found and arm its guard.
+    replace_parent_by_opponent(&setup.bitcoin_client, &setup.regtest_wallet, &p1_clone, 0).unwrap();
+    std::thread::sleep(sleep);
+    coordinator.tick().unwrap();
+    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+    // Advance one block so p2's guard will start behind p1's.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    std::thread::sleep(sleep);
+    coordinator.tick().unwrap();
+    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+    // Kill p2 in its own block (its guard now trails p1's). The conflict pays a low fee (reclaims 99_000 of
+    // the parent's 100_000 fee) so that, once we invalidate this block, the higher-fee p2 can RBF-replace the
+    // resurrected conflict and recover. Keep the block hash so we can revert just this one.
+    let p2_kill_block = replace_parent_by_opponent(
+        &setup.bitcoin_client,
+        &setup.regtest_wallet,
+        &p2_clone,
+        99_000,
+    )
+    .unwrap();
+    std::thread::sleep(sleep);
+    coordinator.tick().unwrap();
+    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+    // Drive until p1's window elapses: the root fails (ParentFailed) and rebuild_survivors runs. p2 must
+    // still be inside its own (later) window, so a fresh CPFP is built over the live p3 only, not p2.
+    let mut p3_cpfp = None;
+    for _ in 0..(max_confs + 4) * 3 {
+        std::thread::sleep(sleep);
+        coordinator.tick().unwrap();
+        ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+        let root_failed = coord_storage
+            .get_tx_by_id(root_cpfp)
+            .unwrap()
+            .map_or(false, |t| t.state == TransactionState::Failed);
+        if root_failed {
+            let p2_state = coord_storage
+                .get_tx_by_id(p2_txid)
+                .unwrap()
+                .map(|t| t.state);
+            assert!(
+                !matches!(p2_state, Some(TransactionState::Failed)),
+                "p2 must NOT be Failed at the rebuild moment (its own window has not elapsed); got {:?}",
+                p2_state
+            );
+            for s in coord_storage.get_speedups_ordered().unwrap() {
+                if s.txid == root_cpfp {
+                    continue;
+                }
+                if let Ok(k) = s.speedup_kind() {
+                    let ps = k.parents();
+                    if ps.contains(&p3_txid) {
+                        assert!(
+                            !ps.contains(&p1_txid) && !ps.contains(&p2_txid),
+                            "fresh CPFP must cover only live p3 (p1 dead, p2 transiently absent); got {:?}",
+                            ps
+                        );
+                        p3_cpfp = Some(s.txid);
+                    }
+                }
+            }
+            if p3_cpfp.is_some() {
+                break;
+            }
+        }
+        mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    }
+    let p3_cpfp = p3_cpfp.expect("root must fail on dead p1 and rebuild a fresh CPFP over live p3");
+    assert_ne!(p3_cpfp, root_cpfp);
+
+    // No live speedup may cover p2 yet: it is still transiently absent.
+    let p2_covered = coord_storage
+        .get_speedups_ordered()
+        .unwrap()
+        .iter()
+        .any(|s| {
+            s.txid != root_cpfp
+                && s.state != TransactionState::Failed
+                && s.speedup_kind()
+                    .map(|k| k.parents().contains(&p2_txid))
+                    .unwrap_or(false)
+        });
+    assert!(
+        !p2_covered,
+        "no live speedup should cover p2 while it is transiently absent"
+    );
+
+    // Broadcast the fresh p3 CPFP so no ToDispatch speedup blocks a later p2 CPFP.
+    assert!(
+        tick_until_state(
+            &coordinator,
+            &coord_storage,
+            p3_cpfp,
+            TransactionState::InMempool,
+            6
+        )
+        .unwrap(),
+        "the fresh CPFP over p3 must reach the mempool"
+    );
+    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+
+    // Revert p2's disappearance: invalidate its kill block. p1's kill block is older and survives, so p1
+    // stays dead, but p2's input is free again.
+    setup
+        .bitcoin_client
+        .client
+        .invalidate_block(&p2_kill_block)
+        .unwrap();
+
+    // p2 must come back (re-dispatched and accepted) and then get its OWN CPFP on a later pass.
+    let mut p2_cpfp = None;
+    for i in 0..((max_confs + 4) * 3) {
+        std::thread::sleep(sleep);
+        coordinator.tick().unwrap();
+        ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+        let p2_state = coord_storage
+            .get_tx_by_id(p2_txid)
+            .unwrap()
+            .map(|t| t.state);
+        let p2_in_livepsp = coord_storage
+            .get_pending_speedup_parents()
+            .unwrap()
+            .iter()
+            .any(|t| t.txid == p2_txid);
+        eprintln!(
+            "DBG iter={i} p2_state={:?} p2_in_livepsp={}",
+            p2_state, p2_in_livepsp
+        );
+        for s in coord_storage.get_speedups_ordered().unwrap() {
+            if s.txid == root_cpfp || s.state == TransactionState::Failed {
+                continue;
+            }
+            if let Ok(k) = s.speedup_kind() {
+                if k.parents().contains(&p2_txid) {
+                    p2_cpfp = Some(s.txid);
+                }
+            }
+        }
+        if p2_cpfp.is_some() {
+            break;
+        }
+        mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    }
+    let p2_cpfp =
+        p2_cpfp.expect("once p2 reappears after the reorg revert, it must get its own CPFP");
+    let p2_cpfp_parents = coord_storage
+        .get_tx_by_id(p2_cpfp)
+        .unwrap()
+        .unwrap()
+        .speedup_kind()
+        .unwrap()
+        .parents()
+        .to_vec();
+    assert!(
+        p2_cpfp_parents.contains(&p2_txid) && !p2_cpfp_parents.contains(&p1_txid),
+        "the recovered CPFP must cover p2 and never the permanently-dead p1; got {:?}",
+        p2_cpfp_parents
+    );
+
+    // p1 stayed permanently dead throughout.
+    assert_eq!(
+        coord_storage.get_tx_by_id(p1_txid).unwrap().unwrap().state,
+        TransactionState::Failed,
+        "p1 must remain Failed after the reorg revert"
     );
 
     drop(coordinator);

@@ -420,14 +420,17 @@ pub fn create_parent_and_child_signed_txs(
 
 /// Replace a coordinator parent the way a dispute opponent would: mine a block that double-spends the
 /// parent's own input with a competing transaction. The parent is evicted and can never confirm, so it
-/// settles `Failed` and its speedup output never exists.
+/// settles `Failed` and its speedup output never exists. Returns the hash of the mined conflict block so a
+/// caller can invalidate it later to simulate the reorg reverting the double-spend.
 pub fn replace_parent_by_opponent(
     bitcoin_client: &BitcoinClient,
     miner: &Address,
     parent_tx: &Transaction,
-) -> anyhow::Result<()> {
+    fee_reclaimed: u64,
+) -> anyhow::Result<bitcoin::BlockHash> {
     let w = parent_tx.input[0].previous_output;
-    let total_out: Amount = parent_tx.output.iter().map(|o| o.value).sum();
+    let total_out: Amount =
+        parent_tx.output.iter().map(|o| o.value).sum::<Amount>() + Amount::from_sat(fee_reclaimed);
     let dest = fresh_wallet_address(bitcoin_client)?;
     let mut outputs = HashMap::new();
     outputs.insert(format!("{}", dest), total_out);
@@ -441,8 +444,8 @@ pub fn replace_parent_by_opponent(
         &outputs,
         None,
     )?;
-    generate_block_with(bitcoin_client, miner, &[&conflict])?;
-    Ok(())
+    let block_hash = generate_block_with(bitcoin_client, miner, &[&conflict])?;
+    Ok(block_hash)
 }
 
 /// Mines `n` blocks to `address` using `bitcoin_client`.
