@@ -22,7 +22,7 @@ use crate::{
         settings::{CPFP_TRANSACTION_CONTEXT, RBF_TRANSACTION_CONTEXT},
     },
     core::{
-        dispatcher::Dispatcher, fee::FeeManager, funding::FundingManager,
+        dispatcher::{BroadcastStats, Dispatcher}, fee::FeeManager, funding::FundingManager,
         storage::CoordinatorStorage,
     },
     engines::{
@@ -102,6 +102,12 @@ impl BitcoinCoordinator {
     /// Returns `true` when the monitor is fully synced with the chain.
     pub fn is_ready(&self) -> Result<bool, BitcoinCoordinatorError> {
         Ok(self.tx_engine.ctx.monitor.is_ready()?)
+    }
+
+    /// Per-label tally of every transaction this coordinator has broadcast, protocol txs and speedups alike.
+    /// Reports vbytes and gross dust so an operator's on-chain footprint can be measured deterministically.
+    pub fn broadcast_stats(&self) -> BroadcastStats {
+        self.tx_engine.ctx.dispatcher.broadcast_stats()
     }
 
     /// Advances the monitor and runs one tick of the coordinator. No-op while

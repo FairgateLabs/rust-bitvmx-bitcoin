@@ -1,14 +1,76 @@
 use crate::{
-    config::config::DispatcherSettings, errors::BitcoinCoordinatorError, types::CoordinatedTx,
+    config::config::DispatcherSettings,
+    errors::BitcoinCoordinatorError,
+    types::{CoordinatedTx, TxKind},
 };
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
 use bitvmx_transaction_monitor::monitor::Monitor;
+use protocol_builder::types::output::MAX_DUST_LIMIT;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use tracing::debug;
 
 pub trait DispatcherStorage {
     fn is_tx_known(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError>;
+}
+
+/// Per-label counters for everything a single coordinator (one operator) actually broadcasts, protocol
+/// transactions and speedups alike. Vbytes are tracked instead of fees because vbytes are feerate independent
+#[derive(Debug, Clone, Default)]
+pub struct BroadcastStats {
+    /// Keyed by label. Label is `<kind>|<context>`, where kind is normal, needs_speedup, or speedup.
+    pub by_label: BTreeMap<String, BroadcastEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct BroadcastEntry {
+    /// Number of successful broadcasts (an RBF replacement counts once, so does the tx it replaces).
+    pub count: u64,
+    pub vbytes: u64,
+    pub dust_sats: u64,
+}
+
+impl BroadcastStats {
+    fn record(&mut self, label: String, vbytes: u64, dust_sats: u64) {
+        let entry = self.by_label.entry(label).or_default();
+        entry.count += 1;
+        entry.vbytes += vbytes;
+        entry.dust_sats += dust_sats;
+    }
+
+    /// Sum across every label.
+    pub fn totals(&self) -> BroadcastEntry {
+        let mut total = BroadcastEntry::default();
+        for entry in self.by_label.values() {
+            total.count += entry.count;
+            total.vbytes += entry.vbytes;
+            total.dust_sats += entry.dust_sats;
+        }
+        total
+    }
+}
+
+/// Label a broadcast tx by its kind and its client-supplied context, so protocol dust and speedup dust stay
+/// distinguishable in the tally. Speedups may carry an empty context, which is fine, the kind still separates them.
+fn stats_label(tx: &CoordinatedTx) -> String {
+    let kind = match &tx.kind {
+        TxKind::Normal => "normal",
+        TxKind::NeedsSpeedup(_) => "needs_speedup",
+        TxKind::Speedup(_) => "speedup",
+    };
+    format!("{kind}|{}", tx.context)
+}
+
+/// Gross dust of a broadcast tx: the sats in every output valued at or below the coordinator dust limit.
+fn dust_sats(tx: &CoordinatedTx) -> u64 {
+    tx.tx
+        .output
+        .iter()
+        .map(|o| o.value.to_sat())
+        .filter(|sats| *sats <= MAX_DUST_LIMIT)
+        .sum()
 }
 
 /// Raw per-transaction outcome returned by [`Dispatcher::dispatch`].
@@ -30,6 +92,7 @@ pub struct Dispatcher {
     settings: DispatcherSettings,
     bitcoin_client: Rc<BitcoinClient>,
     storage: Rc<dyn DispatcherStorage>,
+    stats: RefCell<BroadcastStats>,
 }
 
 impl Dispatcher {
@@ -42,7 +105,13 @@ impl Dispatcher {
             settings,
             bitcoin_client,
             storage,
+            stats: RefCell::new(BroadcastStats::default()),
         }
+    }
+
+    /// Snapshot of everything this dispatcher has broadcast so far, per label. Cheap clone, safe to call anytime.
+    pub fn broadcast_stats(&self) -> BroadcastStats {
+        self.stats.borrow().clone()
     }
 
     /// Group `parents` into batches whose cumulative weight stays within
@@ -96,7 +165,15 @@ impl Dispatcher {
                 continue;
             }
             let outcome = match self.bitcoin_client.send_transaction(&tx.tx) {
-                Ok(_) => DispatchOutcome::Success,
+                Ok(_) => {
+                    // Count only accepted broadcasts, so the tally reflects what actually reached the node.
+                    self.stats.borrow_mut().record(
+                        stats_label(&tx),
+                        tx.tx.vsize() as u64,
+                        dust_sats(&tx),
+                    );
+                    DispatchOutcome::Success
+                }
                 Err(e) => DispatchOutcome::DispatchError(e.to_string()),
             };
             results.push((txid, outcome));
