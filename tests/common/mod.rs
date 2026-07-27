@@ -107,7 +107,7 @@ impl TestSetup {
         let bitcoin_client = Rc::new(BitcoinClient::new_from_config(&bitcoind.rpc_config)?);
         let (_public_key, _funding_wallet, regtest_wallet) = Self::setup_wallet_and_mine_blocks(
             &bitcoin_client,
-            bitcoind.rpc_config.network,
+            bitcoind.rpc_config.bitcoin_network(),
             config.blocks_mined,
         )?;
         let key_manager = TestKeyManager::new();
