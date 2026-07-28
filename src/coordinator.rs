@@ -307,9 +307,9 @@ impl BitcoinCoordinator {
         let monitor_news: Vec<MonitorNews> = monitor_news
             .into_iter()
             .filter(|news| {
-                if let MonitorNews::Transaction(_, _, context) = news {
-                    !context.contains(CPFP_TRANSACTION_CONTEXT)
-                        && !context.contains(RBF_TRANSACTION_CONTEXT)
+                if let MonitorNews::Transaction(n) = news {
+                    !n.context.contains(CPFP_TRANSACTION_CONTEXT)
+                        && !n.context.contains(RBF_TRANSACTION_CONTEXT)
                 } else {
                     true
                 }
