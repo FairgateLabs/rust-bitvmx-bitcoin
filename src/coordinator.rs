@@ -132,8 +132,8 @@ impl BitcoinCoordinator {
         self.tx_engine.review_active()?;
         self.speedup_engine.review_speedups()?;
         self.tx_engine.dispatch_pending()?;
-        self.speedup_engine.dispatch_pending_speedups()?;
-        self.speedup_engine.boost_if_stale()?;
+        let boost_failed = self.speedup_engine.dispatch_pending_speedups()?;
+        self.speedup_engine.boost_if_stale(boost_failed)?;
         self.speedup_engine.create_cpfp_batch()?;
 
         Ok(())

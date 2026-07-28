@@ -7,9 +7,10 @@ use crate::{
         TxKind,
     },
 };
-use bitcoin::Txid;
+use bitcoin::{OutPoint, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use protocol_builder::types::Utxo;
+use std::collections::HashSet;
 
 impl SpeedupKind {
     pub fn context(&self) -> &SpeedupContext {
@@ -26,6 +27,16 @@ impl SpeedupKind {
 
     pub fn is_rbf(&self) -> bool {
         matches!(self, SpeedupKind::RBF { .. })
+    }
+
+    /// True when this speedup was produced by `boost_if_stale`, as opposed to a first CPFP built by
+    /// `create_cpfp_batch`. An RBF is always a boost. A boost CPFP carries no `parent_data`, while a
+    /// first CPFP always carries its protocol parents' data.
+    pub fn is_boost(&self) -> bool {
+        match self {
+            SpeedupKind::RBF { .. } => true,
+            SpeedupKind::CPFP { context, .. } => context.parent_data.is_empty(),
+        }
     }
 
     pub fn parents(&self) -> &[Txid] {
@@ -78,6 +89,31 @@ impl CoordinatedTx {
         let (out, vout) = self.last_output()?;
         let pub_key = &k.context().funding_inputs[0].pub_key;
         Ok(Utxo::new(self.txid, vout, out.value.to_sat(), pub_key))
+    }
+
+    /// Outpoints of this speedup's funding inputs (coordinator UTXOs, or a prior speedup's change output).
+    /// Empty when this tx is not a speedup.
+    pub fn funding_outpoints(&self) -> HashSet<OutPoint> {
+        match self.speedup_kind() {
+            Ok(k) => k
+                .context()
+                .funding_inputs
+                .iter()
+                .map(|u| OutPoint::new(u.txid, u.vout))
+                .collect(),
+            Err(_) => HashSet::new(),
+        }
+    }
+
+    /// The transaction inputs that are not funding inputs.
+    pub fn non_funding_inputs(&self) -> Vec<OutPoint> {
+        let funding = self.funding_outpoints();
+        self.tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .filter(|op| !funding.contains(op))
+            .collect()
     }
 
     pub fn verify_tx_id(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
@@ -220,7 +256,9 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_utils::dummy_pubkey;
     use crate::types::FeeInfo;
+    use crate::types::{SpeedupContext, SpeedupKind};
     use crate::{
         core::dispatcher::DispatchOutcome,
         test_utils::{cpfp_coordinated_tx, normal_coordinated_tx},
@@ -231,6 +269,7 @@ mod tests {
         transaction::Version,
         Amount, ScriptBuf, Transaction, TxOut,
     };
+    use protocol_builder::types::{output::SpeedupData, Utxo};
 
     #[test]
     fn test_is_ready_to_dispatch() {
@@ -338,6 +377,44 @@ mod tests {
         assert!(k.is_rbf());
         assert!(k.parents().is_empty());
         k.context_mut().replaced_by = Some(replaced_txid);
+    }
+
+    #[test]
+    fn test_is_boost() {
+        let txid = Txid::from_raw_hash(sha256d::Hash::hash(&[7u8; 32]));
+        let utxo = Utxo::new(txid, 0, 100_000, &dummy_pubkey());
+        let base_ctx = SpeedupContext {
+            funding_inputs: vec![utxo.clone()],
+            replaced_by: None,
+            bump_fee_used: 1.0,
+            parent_data: vec![],
+            spent: false,
+        };
+
+        // First CPFP carries its protocol parents' data -> NOT a boost.
+        let first_cpfp = SpeedupKind::CPFP {
+            parents: vec![txid],
+            context: SpeedupContext {
+                parent_data: vec![(SpeedupData::new(utxo.clone()), 100_000, 100)],
+                ..base_ctx.clone()
+            },
+        };
+        assert!(!first_cpfp.is_boost());
+
+        // CPFP boost has empty parent_data -> boost.
+        let cpfp_boost = SpeedupKind::CPFP {
+            parents: vec![txid],
+            context: base_ctx.clone(),
+        };
+        assert!(cpfp_boost.is_boost());
+
+        // RBF is always a boost.
+        let rbf = SpeedupKind::RBF {
+            replaces: txid,
+            new_funding_inputs: vec![],
+            context: base_ctx,
+        };
+        assert!(rbf.is_boost());
     }
 
     #[test]

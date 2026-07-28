@@ -775,6 +775,12 @@ impl DispatcherStorage for CoordinatorStorage {
     fn is_tx_known(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
         Ok(self.get_tx_by_id(*txid)?.is_some())
     }
+
+    fn is_tx_failed(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
+        Ok(self
+            .get_tx_by_id(*txid)?
+            .map_or(false, |t| t.state == TransactionState::Failed))
+    }
 }
 
 #[cfg(test)]

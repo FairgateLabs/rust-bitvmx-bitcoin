@@ -71,6 +71,13 @@ A structural problem decidable from the transaction alone (weight over
 `max_tx_weight`, or zero inputs) is settled `Failed` immediately with no node
 round-trip.
 
+A child whose tracked parent has already settled `Failed` is also failed
+pre-send (the `ParentFailed` outcome), carrying no fail guard of its own: the
+parent's `Failed` is itself the output of the parent's guard, so the reorg window
+is already spent. For a batch CPFP the engine then rebuilds a fresh CPFP over the
+surviving parents, so one dead parent never sinks the batch (see
+[speedup.md](speedup.md)).
+
 ## The reorg-flap fail guard
 
 An "input consumed" verdict is reversible while a reorg is still unsettled, so it

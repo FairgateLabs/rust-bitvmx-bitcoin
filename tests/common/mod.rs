@@ -418,6 +418,36 @@ pub fn create_parent_and_child_signed_txs(
     (parent, child)
 }
 
+/// Replace a coordinator parent the way a dispute opponent would: mine a block that double-spends the
+/// parent's own input with a competing transaction. The parent is evicted and can never confirm, so it
+/// settles `Failed` and its speedup output never exists. Returns the hash of the mined conflict block so a
+/// caller can invalidate it later to simulate the reorg reverting the double-spend.
+pub fn replace_parent_by_opponent(
+    bitcoin_client: &BitcoinClient,
+    miner: &Address,
+    parent_tx: &Transaction,
+    fee_reclaimed: u64,
+) -> anyhow::Result<bitcoin::BlockHash> {
+    let w = parent_tx.input[0].previous_output;
+    let total_out: Amount =
+        parent_tx.output.iter().map(|o| o.value).sum::<Amount>() + Amount::from_sat(fee_reclaimed);
+    let dest = fresh_wallet_address(bitcoin_client)?;
+    let mut outputs = HashMap::new();
+    outputs.insert(format!("{}", dest), total_out);
+    let conflict = sign_spend(
+        bitcoin_client,
+        &[CreateRawTransactionInput {
+            txid: w.txid,
+            vout: w.vout,
+            sequence: None,
+        }],
+        &outputs,
+        None,
+    )?;
+    let block_hash = generate_block_with(bitcoin_client, miner, &[&conflict])?;
+    Ok(block_hash)
+}
+
 /// Mines `n` blocks to `address` using `bitcoin_client`.
 pub fn mine_blocks(
     bitcoin_client: &BitcoinClient,
@@ -476,16 +506,19 @@ pub fn create_two_funding_utxos_same_txid(
         .next_keypair(BitcoinKeyType::P2wpkh)
         .map_err(|e| anyhow::anyhow!("next_keypair: {:?}", e))?;
     let addr0 = Address::p2wpkh(
-        &CompressedPublicKey::try_from(pk0).map_err(|e| anyhow::anyhow!("compress pk0: {:?}", e))?,
+        &CompressedPublicKey::try_from(pk0)
+            .map_err(|e| anyhow::anyhow!("compress pk0: {:?}", e))?,
         network,
     );
     let addr1 = Address::p2wpkh(
-        &CompressedPublicKey::try_from(pk1).map_err(|e| anyhow::anyhow!("compress pk1: {:?}", e))?,
+        &CompressedPublicKey::try_from(pk1)
+            .map_err(|e| anyhow::anyhow!("compress pk1: {:?}", e))?,
         network,
     );
 
     // Spend a confirmed wallet UTXO into both coordinator outputs (fee = 100 000 sats).
-    let (funding_txid, funding_vout) = fund_and_lock_utxo(bitcoin_client, amount_each * 2 + 100_000)?;
+    let (funding_txid, funding_vout) =
+        fund_and_lock_utxo(bitcoin_client, amount_each * 2 + 100_000)?;
     let inputs = vec![CreateRawTransactionInput {
         txid: funding_txid,
         vout: funding_vout,
@@ -523,12 +556,30 @@ pub fn create_two_funding_utxos_same_txid(
     Ok((u0, u1))
 }
 
-/// Create an unbroadcast parent transaction plus a `SpeedupData`.
+/// Create an unbroadcast parent transaction plus a `SpeedupData`. Pays a fixed 100 000-sat fee.
 pub fn create_coordinator_parent_tx(
     bitcoin_client: &BitcoinClient,
     key_manager: &KeyManager,
     network: Network,
     output_sats: u64,
+) -> anyhow::Result<(Transaction, SpeedupData)> {
+    create_coordinator_parent_tx_with_fee(
+        bitcoin_client,
+        key_manager,
+        network,
+        output_sats,
+        100_000,
+    )
+}
+
+/// Like `create_coordinator_parent_tx` but with a caller-chosen `fee_sats`. A low fee leaves the
+/// parent+child package rate low, so the CPFP (and any RBF replacing it) must carry a real, escalating fee.
+pub fn create_coordinator_parent_tx_with_fee(
+    bitcoin_client: &BitcoinClient,
+    key_manager: &KeyManager,
+    network: Network,
+    output_sats: u64,
+    fee_sats: u64,
 ) -> anyhow::Result<(Transaction, SpeedupData)> {
     // Derive a coordinator-owned key for the parent output.
     let out_pub_key = key_manager
@@ -538,8 +589,8 @@ pub fn create_coordinator_parent_tx(
         .map_err(|e| anyhow::anyhow!("compress pubkey: {:?}", e))?;
     let coordinator_addr = Address::p2wpkh(&compressed, network);
 
-    // Fund + lock a confirmed wallet UTXO to spend (fee = 100 000 sats).
-    let (funding_txid, funding_vout) = fund_and_lock_utxo(bitcoin_client, output_sats + 100_000)?;
+    // Fund + lock a confirmed wallet UTXO to spend (fee = fee_sats).
+    let (funding_txid, funding_vout) = fund_and_lock_utxo(bitcoin_client, output_sats + fee_sats)?;
 
     // Build, sign, decode: wallet UTXO → coordinator address.
     let inputs = vec![CreateRawTransactionInput {
