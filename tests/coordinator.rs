@@ -150,7 +150,7 @@ fn test_full_lifecycle() {
     let news = coordinator.get_news().unwrap();
     assert!(
         news.monitor_news.iter().any(|n| {
-            matches!(n, MonitorNews::Transaction(id, status, _) if *id == txid && status.is_confirmed())
+            matches!(n, MonitorNews::Transaction(t) if t.tx_id == txid && t.status.is_confirmed())
         }),
         "expected Confirmed monitor news for {txid}; got {:?}",
         news.monitor_news

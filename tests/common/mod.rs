@@ -740,7 +740,7 @@ pub fn ctx(label: &str) -> String {
 pub fn ack_all_news(coordinator: &BitcoinCoordinator, news: &News) {
     for n in &news.monitor_news {
         let ack = match n {
-            MonitorNews::Transaction(t, _, ctx) => AckMonitorNews::Transaction(*t, ctx.clone()),
+            MonitorNews::Transaction(t) => AckMonitorNews::Transaction(t.tx_id, t.context.clone()),
             MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
             MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
                 AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
