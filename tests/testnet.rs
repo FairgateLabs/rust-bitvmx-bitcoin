@@ -286,7 +286,7 @@ fn test_coordinator_full_lifecycle() {
 
     let news = drain_news(&coordinator);
     let has_confirmed_news = news.monitor_news.iter().any(|n| {
-        matches!(n, MonitorNews::Transaction(id, status, _) if *id == txid && status.is_confirmed())
+        matches!(n, MonitorNews::Transaction(t) if t.tx_id == txid && t.status.is_confirmed())
     });
     assert!(
         has_confirmed_news,
@@ -654,7 +654,7 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
         let saw = news.monitor_news.iter().any(|n| {
             matches!(
                 n,
-                MonitorNews::Transaction(id, status, _) if id == txid && status.is_confirmed()
+                MonitorNews::Transaction(t) if t.tx_id == *txid && t.status.is_confirmed()
             )
         });
         assert!(saw, "no Confirmed monitor news for {txid}");
@@ -804,7 +804,7 @@ fn drain_news(coordinator: &BitcoinCoordinator) -> News {
     );
     for n in &news.monitor_news {
         let ack = match n {
-            MonitorNews::Transaction(t, _, ctx) => AckMonitorNews::Transaction(*t, ctx.clone()),
+            MonitorNews::Transaction(t) => AckMonitorNews::Transaction(t.tx_id, t.context.clone()),
             MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
             MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
                 AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
@@ -841,8 +841,8 @@ fn poll_until_evicted(
             // Ack everything accumulated.
             for n in &news.monitor_news {
                 let ack = match n {
-                    MonitorNews::Transaction(t, _, ctx) => {
-                        AckMonitorNews::Transaction(*t, ctx.clone())
+                    MonitorNews::Transaction(t) => {
+                        AckMonitorNews::Transaction(t.tx_id, t.context.clone())
                     }
                     MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
                     MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
