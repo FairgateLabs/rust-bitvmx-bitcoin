@@ -12,7 +12,6 @@ serde = "1.0.204"
 serde_json = "1.0.96"
 thiserror = "2.0.12"
 tracing = "0.1.40"
-tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
 ctrlc = "3.4"
 hex = "0.4.3"
 uuid = { version = "1.11.0", features = ["v4", "serde"] }
@@ -43,3 +42,4 @@ bitcoin-indexer = { git = "https://github.com/FairgateLabs/rust-bitcoin-indexer.
 bitvmx-bitcoin-rpc = { git = "https://github.com/FairgateLabs/rust-bitvmx-bitcoin-rpc.git", tag = "v0.8.1", features = [
     "testing",
 ] }
+tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
