@@ -40,6 +40,8 @@ pub fn init_trace() {
     let _ = tracing_subscriber::fmt()
         .with_target(true)
         .with_env_filter(filter)
+        .with_ansi_sanitization(false) //optout from ansi santization in tests
+        .with_ansi(true)
         .try_init();
 }
 
