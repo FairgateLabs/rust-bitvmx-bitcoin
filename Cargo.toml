@@ -42,4 +42,4 @@ bitcoin-indexer = { git = "https://github.com/FairgateLabs/rust-bitcoin-indexer.
 bitvmx-bitcoin-rpc = { git = "https://github.com/FairgateLabs/rust-bitvmx-bitcoin-rpc.git", tag = "v0.8.1", features = [
     "testing",
 ] }
-tracing-subscriber = { version = "=0.3.19", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
