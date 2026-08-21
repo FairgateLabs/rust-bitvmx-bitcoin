@@ -12,8 +12,6 @@ test_output
 # vscode
 .vscode
 
-# cargo
-Cargo.lock
 
 # local testnet credentials (never commit)
 tests/testnet_local.yaml
