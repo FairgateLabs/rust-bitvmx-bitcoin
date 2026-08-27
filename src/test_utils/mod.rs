@@ -14,7 +14,7 @@ use bitvmx_bitcoin_rpc::rpc_config::RpcConfig;
 use bitvmx_transaction_monitor::monitor::Monitor;
 use key_manager::key_manager::KeyManager;
 use protocol_builder::types::Utxo;
-use rand::Rng;
+use rand::RngExt;
 use std::{default, fs, path, rc::Rc, sync::Mutex};
 use storage_backend::{storage::Storage, storage_config::StorageConfig};
 use tracing::info;
