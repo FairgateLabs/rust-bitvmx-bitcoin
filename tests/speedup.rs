@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use bitcoin::{Network, OutPoint};
 use bitcoin_coordinator::{
-    config::config::{
+    config::configs::{
         BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings, FeeSettings,
         FundingSettings, SpeedupSettings,
     },
@@ -207,7 +207,7 @@ fn drive_dead_parent_recovery(
         let root_failed = coord_storage
             .get_tx_by_id(root_cpfp_txid)
             .unwrap()
-            .map_or(false, |t| t.state == TransactionState::Failed);
+            .is_some_and(|t| t.state == TransactionState::Failed);
         if survivor_cpfp.is_some() && root_failed {
             break;
         }
@@ -274,7 +274,7 @@ fn test_cpfp_lifecycle() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         500_000,
     )
@@ -282,7 +282,7 @@ fn test_cpfp_lifecycle() {
     let funding_txid = funding_utxo.txid;
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -414,7 +414,7 @@ fn test_two_funding_utxos_same_txid_both_consumed() {
     // One real on-chain tx, two coordinator-owned outputs: same txid, different vouts.
     let (u0, u1) = create_two_funding_utxos_same_txid(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         500_000,
     )
@@ -482,7 +482,7 @@ fn test_two_funding_utxos_same_txid_both_consumed() {
     // End-to-end: a real parent + CPFP consumes one of the same-txid UTXOs on-chain.
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -554,21 +554,21 @@ fn test_cpfp_two_parents() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
     let (parent_tx1, speedup_data1) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
     .unwrap();
     let (parent_tx2, speedup_data2) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -647,7 +647,7 @@ fn test_cpfp_no_funding() {
 
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -722,18 +722,14 @@ fn test_cpfp_capped_then_insufficient_funding_emit_news() {
     // Funding sized above the package cap so the build succeeds but `capped == true`.
     let funding_a = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         40_000,
     )
     .unwrap();
-    let (parent1_tx, speedup_data1) = create_coordinator_parent_tx(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        1_000,
-    )
-    .unwrap();
+    let (parent1_tx, speedup_data1) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
     let parent1_txid = parent1_tx.compute_txid();
 
     // Sync the indexer past the fund_address-mined blocks so the first tick after dispatch can actually build the CPFP.
@@ -802,13 +798,9 @@ fn test_cpfp_capped_then_insufficient_funding_emit_news() {
 
     // ─── Phase B: Speedup-derived primary, combine returns None → InsufficientFunds ─
     // CPFP1's leftover change is now the Speedup-derived chain tip. Its amount cannot cover another capped CPFP fee.
-    let (parent2_tx, speedup_data2) = create_coordinator_parent_tx(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        1_000,
-    )
-    .unwrap();
+    let (parent2_tx, speedup_data2) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
     let parent2_txid = parent2_tx.compute_txid();
     coordinator
         .dispatch_with_speedup(
@@ -875,14 +867,14 @@ fn test_cpfp_reorg() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         500_000,
     )
     .unwrap();
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -965,14 +957,14 @@ fn test_cpfp_boost() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -1043,7 +1035,7 @@ fn test_cpfp_boost() {
 /// * Every boost CPFP's `parents = [previous_cpfp.txid]`
 /// * Each boost CPFP's tx spends the previous CPFP's last output
 /// * Initial CPFP has 2 inputs (parent anchor + funding); boost CPFPs have only the
-/// funding-chain input.
+///   funding-chain input.
 /// * A single confirming block carries the entire package (parent + all N
 ///   boosts) into `Confirmed` together.
 fn test_cpfp_fee_escalates_across_boosts() {
@@ -1057,14 +1049,14 @@ fn test_cpfp_fee_escalates_across_boosts() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         2_000_000,
     )
     .unwrap();
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -1239,19 +1231,15 @@ fn test_boost_cap_reached() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         2_000_000,
     )
     .unwrap();
     // Small parent output so `parent_amount_outputs` doesn't dominate the fee.
-    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        1_000,
-    )
-    .unwrap();
+    let (parent_tx, speedup_data) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
 
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
@@ -1381,18 +1369,14 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         2_000_000,
     )
     .unwrap();
-    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        1_000,
-    )
-    .unwrap();
+    let (parent_tx, speedup_data) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
 
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_utxo).unwrap();
@@ -1486,14 +1470,14 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         2_000_000,
     )
     .unwrap();
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -1642,14 +1626,14 @@ fn test_rbf_already_confirmed_marks_predecessor() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         2_000_000,
     )
     .unwrap();
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -1766,14 +1750,14 @@ fn test_cpfp_orphan_requeue() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         500_000,
     )
     .unwrap();
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -1851,7 +1835,7 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         500_000,
     )
@@ -1859,7 +1843,7 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
     let funding_txid = funding_utxo.txid;
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -2060,14 +2044,14 @@ fn test_retry_rate_limit_shared_across_engines() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         500_000,
     )
     .unwrap();
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -2165,14 +2149,14 @@ fn test_cpfp_funding_restored_after_finalization() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
     let (parent_tx1, speedup_data1) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -2219,7 +2203,7 @@ fn test_cpfp_funding_restored_after_finalization() {
     // Dispatch a second parent.
     let (parent_tx2, speedup_data2) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -2278,12 +2262,12 @@ fn test_cpfp_funding_restored_after_finalization() {
     setup.end_all().unwrap();
 }
 
-/// Speedup-primary combine + chain continuation. ///
+/// Speedup-primary combine + chain continuation.
 /// 1. A modest `funding_initial` and a plentiful `funding_extra` are queued. P1 dispatches; CPFP1 builds from
-///   `funding_initial` alone. The inflated fee from `multi_funding_settings` makes CPFP1's change tight.
+///    `funding_initial` alone. The inflated fee from `multi_funding_settings` makes CPFP1's change tight.
 /// 2. CPFP1 confirms and finalizes. `replace_funding_on_finalize` collapses `funding_initial` into a single entry.
 /// 3. P2 dispatches. The chain tip CPFP1_change is now Speedup-derived primary but its amount is below the next
-///     CPFP fee + dust, so the unified build path pulls in `funding_extra` as the combine partner.
+///    CPFP fee + dust, so the unified build path pulls in `funding_extra` as the combine partner.
 #[test]
 fn test_chain_tip_combine_after_finalize() {
     init_trace();
@@ -2296,26 +2280,22 @@ fn test_chain_tip_combine_after_finalize() {
 
     let funding_initial = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         25_000,
     )
     .unwrap();
     let funding_extra = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
 
-    let (parent1, sd1) = create_coordinator_parent_tx(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        1_000,
-    )
-    .unwrap();
+    let (parent1, sd1) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
     let parent1_txid = parent1.compute_txid();
 
     tick_until_ready(&coordinator).unwrap();
@@ -2383,13 +2363,9 @@ fn test_chain_tip_combine_after_finalize() {
         .any(|r| r.utxo.txid == funding_extra.txid));
 
     // Phase 3: dispatch P2. CPFP2 combines chain tip + extra Fi.
-    let (parent2, sd2) = create_coordinator_parent_tx(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        1_000,
-    )
-    .unwrap();
+    let (parent2, sd2) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
     let parent2_txid = parent2.compute_txid();
     coordinator
         .dispatch_with_speedup(parent2, sd2, ctx("chain_combine_p2"), None, None)
@@ -2466,7 +2442,7 @@ fn test_cpfp_built_for_parent_confirmed_before_funding() {
 
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -2530,7 +2506,7 @@ fn test_cpfp_built_for_parent_confirmed_before_funding() {
     // Provide funding. create_cpfp_batch must build a CPFP for the Confirmed parent on the next tick.
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         500_000,
     )
@@ -2593,14 +2569,14 @@ fn test_chain_tip_spent_flag_progresses_with_boosts() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
     let (parent_tx, speedup_data) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -2670,7 +2646,8 @@ fn test_chain_tip_spent_flag_progresses_with_boosts() {
 ///   2. Boost (1 unconfirmed < 2) → CPFP2 with a single Speedup-derived input (CPFP1's change).
 ///   3. Boost again (2 unconfirmed = max) → CPFP3 is an RBF replacing CPFP2. RBF inherits CPFP2's
 ///      funding_inputs = [CPFP1_change]. Because the single input is Speedup-derived, the unified
-///       build path is allowed to combine. A queued Fi is pulled in as the second input.
+///      build path is allowed to combine. A queued Fi is pulled in as the second input.
+///
 /// Settings are tuned so that CPFP1_change is just enough for CPFP2 but not for the RBF's bumped fee.
 #[test]
 fn test_rbf_combines_when_inherited_funding_insufficient() {
@@ -2699,7 +2676,7 @@ fn test_rbf_combines_when_inherited_funding_insufficient() {
     // after CPFP2 is consumed by the RBF cannot cover the bumped RBF fee alone.
     let funding_initial = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         60_000,
     )
@@ -2707,18 +2684,14 @@ fn test_rbf_combines_when_inherited_funding_insufficient() {
     // Extra funding stays unspent in the queue, ready for combine.
     let funding_extra = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
-    let (parent_tx, speedup_data) = create_coordinator_parent_tx(
-        &setup.bitcoin_client,
-        &*key_manager,
-        Network::Regtest,
-        1_000,
-    )
-    .unwrap();
+    let (parent_tx, speedup_data) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
 
     tick_until_ready(&coordinator).unwrap();
     coordinator.add_funding(funding_initial.clone()).unwrap();
@@ -2830,7 +2803,7 @@ fn test_cancel_parent_edge_cases() {
 
     let funding_utxo = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         500_000,
     )
@@ -2845,7 +2818,7 @@ fn test_cancel_parent_edge_cases() {
     // ---------------------------------------------------------------
     let (parent_a, sd_a) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -2887,7 +2860,7 @@ fn test_cancel_parent_edge_cases() {
     // ---------------------------------------------------------------
     let (parent_b, sd_b) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -2966,7 +2939,7 @@ fn test_cancel_parent_edge_cases() {
     // ---------------------------------------------------------------
     let (parent_c, sd_c) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -3012,21 +2985,21 @@ fn test_cpfp_chain_survivor_after_parent_replaced() {
 
     let funding = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
     let (p1, sd1) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
     .unwrap();
     let (p2, sd2) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -3128,14 +3101,14 @@ fn test_rbf_of_root_survivor_after_parent_replaced() {
 
     let funding = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
     let (p1, sd1) = create_coordinator_parent_tx_with_fee(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
         500,
@@ -3143,7 +3116,7 @@ fn test_rbf_of_root_survivor_after_parent_replaced() {
     .unwrap();
     let (p2, sd2) = create_coordinator_parent_tx_with_fee(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
         500,
@@ -3246,28 +3219,28 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
 
     let funding = create_funded_speedup_utxo(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         1_000_000,
     )
     .unwrap();
     let (p1, sd1) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
     .unwrap();
     let (p2, sd2) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
     .unwrap();
     let (p3, sd3) = create_coordinator_parent_tx(
         &setup.bitcoin_client,
-        &*key_manager,
+        &key_manager,
         Network::Regtest,
         200_000,
     )
@@ -3349,7 +3322,7 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
         let root_failed = coord_storage
             .get_tx_by_id(root_cpfp)
             .unwrap()
-            .map_or(false, |t| t.state == TransactionState::Failed);
+            .is_some_and(|t| t.state == TransactionState::Failed);
         if root_failed {
             let p2_state = coord_storage
                 .get_tx_by_id(p2_txid)

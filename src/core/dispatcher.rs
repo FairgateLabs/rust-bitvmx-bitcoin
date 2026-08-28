@@ -1,5 +1,5 @@
 use crate::{
-    config::config::DispatcherSettings, errors::BitcoinCoordinatorError, types::CoordinatedTx,
+    config::configs::DispatcherSettings, errors::BitcoinCoordinatorError, types::CoordinatedTx,
 };
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::bitcoin_client::{BitcoinClient, BitcoinClientApi};
@@ -199,7 +199,7 @@ impl Dispatcher {
 mod tests {
     use super::*;
     use crate::{
-        config::config::DispatcherSettings,
+        config::configs::DispatcherSettings,
         test_utils::{normal_coordinated_tx, StorageTestConfig, TestBitcoind},
     };
     use bitcoin::{

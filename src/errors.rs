@@ -19,8 +19,9 @@ pub enum BitcoinCoordinatorError {
     #[error("Bitcoin Client Error: {0}")]
     BitcoinClientError(#[from] BitcoinClientError),
 
+    // Boxed because ProtocolBuilderError large.
     #[error("Protocol Builder Error: {0}")]
-    ProtocolBuilderError(#[from] ProtocolBuilderError),
+    ProtocolBuilderError(Box<ProtocolBuilderError>),
 
     #[error("Key Manager Error: {0}")]
     KeyManagerError(#[from] KeyManagerError),
@@ -30,4 +31,11 @@ pub enum BitcoinCoordinatorError {
 
     #[error("Invariant violation: {0}")]
     InvariantViolation(String),
+}
+
+// Manual From so `?` on a ProtocolBuilderError can convert.
+impl From<ProtocolBuilderError> for BitcoinCoordinatorError {
+    fn from(e: ProtocolBuilderError) -> Self {
+        BitcoinCoordinatorError::ProtocolBuilderError(Box::new(e))
+    }
 }

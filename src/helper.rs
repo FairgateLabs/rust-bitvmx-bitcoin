@@ -155,10 +155,10 @@ pub fn verify_single_dispatch_result(
 }
 
 /// Finds a tx by txid in a dispatch batch, or returns `InvariantViolation`.
-pub fn find_tx_in_batch<'a>(
-    txs: &'a [CoordinatedTx],
+pub fn find_tx_in_batch(
+    txs: &[CoordinatedTx],
     txid: Txid,
-) -> Result<&'a CoordinatedTx, BitcoinCoordinatorError> {
+) -> Result<&CoordinatedTx, BitcoinCoordinatorError> {
     txs.iter().find(|t| t.txid == txid).ok_or_else(|| {
         BitcoinCoordinatorError::InvariantViolation(format!(
             "dispatcher returned txid {} not present in dispatch batch",

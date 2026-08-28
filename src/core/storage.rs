@@ -1,5 +1,5 @@
 use crate::{
-    config::config::CoordinatorStorageSettings,
+    config::configs::CoordinatorStorageSettings,
     core::{dispatcher::DispatcherStorage, funding::FundingStorage},
     errors::BitcoinCoordinatorError,
     types::{CoordinatedTx, CoordinatorNews, FundingData, SpeedupKind, TransactionState, TxKind},
@@ -277,6 +277,7 @@ impl CoordinatorStorage {
     ///   1. The parent is currently listed in `PendingSpeedupParents`, or
     ///   2. Any non-Failed-and-non-Finalized speedup references the parent
     ///      in `SpeedupKind::CPFP.parents` (live coverage).
+    ///
     /// Funding-queue records live in their own keyspace (not the Tx store), so they are never eviction
     /// candidates here; a finalized speedup's spendable change survives as an independent `FundingData`.
     pub fn evict_stale_txs(
@@ -428,7 +429,7 @@ impl CoordinatorStorage {
     /// Pruning rules:
     ///   - `Failed`     → remove. The parent will never confirm; no CPFP can help.
     ///   - missing      → remove. Missing parents will re-dispatch as new `ToDispatch`,
-    ///                    and will be re-added to PendingSpeedupParents.
+    ///     and will be re-added to PendingSpeedupParents.
     ///   - `ToDispatch` → keep in PendingSpeedupParents but exclude from this call's result.
     ///   - `InMempool`, `Confirmed`, `Finalized` → keep in PendingSpeedupParents and return.
     pub fn get_pending_speedup_parents(
@@ -484,9 +485,9 @@ impl CoordinatorStorage {
         Ok(())
     }
 
-    /// ================================
-    /// Funding queue
-    /// ================================
+    // ================================
+    // Funding queue
+    // ================================
 
     pub fn get_funding_record(
         &self,
@@ -583,7 +584,7 @@ impl CoordinatorStorage {
     pub fn cleanup_news(&self, current_height: BlockHeight) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News);
         let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
-        all.retain(|item| item.acked_at_block.map_or(true, |h| h >= current_height));
+        all.retain(|item| item.acked_at_block.is_none_or(|h| h >= current_height));
         self.storage.set(&key, &all, None)?;
         Ok(())
     }
@@ -615,7 +616,7 @@ impl CoordinatorStorage {
 
     fn set_funding_list(&self, list: &[OutPoint]) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::FundingList);
-        self.storage.set(&key, &list.to_vec(), None)?;
+        self.storage.set(&key, list.to_vec(), None)?;
         Ok(())
     }
 
@@ -728,7 +729,7 @@ impl FundingStorage for CoordinatorStorage {
         for (idx, op) in list.iter().enumerate() {
             if consumed.contains(op) {
                 to_remove_idx.push(idx);
-                if insert_pos.map_or(true, |p| idx < p) {
+                if insert_pos.is_none_or(|p| idx < p) {
                     insert_pos = Some(idx);
                 }
             }
@@ -779,7 +780,7 @@ impl DispatcherStorage for CoordinatorStorage {
     fn is_tx_failed(&self, txid: &Txid) -> Result<bool, BitcoinCoordinatorError> {
         Ok(self
             .get_tx_by_id(*txid)?
-            .map_or(false, |t| t.state == TransactionState::Failed))
+            .is_some_and(|t| t.state == TransactionState::Failed))
     }
 }
 
@@ -789,7 +790,7 @@ mod tests {
     use crate::test_utils::dummy_pubkey;
     use crate::types::{SpeedupContext, SpeedupKind};
     use crate::{
-        config::config::CoordinatorStorageSettings,
+        config::configs::CoordinatorStorageSettings,
         test_utils::StorageTestConfig,
         types::{FeeInfo, TxKind},
     };
@@ -976,7 +977,7 @@ mod tests {
 
         let news = storage.get_and_mark_news(1).unwrap();
         assert_eq!(news.len(), 1);
-        assert_eq!(news[0], CoordinatorNews::TxNotFound { txid: txid });
+        assert_eq!(news[0], CoordinatorNews::TxNotFound { txid });
 
         drop(storage);
         storage_backend.remove().unwrap();

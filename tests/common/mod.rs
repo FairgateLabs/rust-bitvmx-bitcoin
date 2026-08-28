@@ -7,7 +7,7 @@ use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
 
 use bitcoin::{Address, Amount, CompressedPublicKey, OutPoint};
 use bitcoin_coordinator::{
-    config::config::{BitcoinSettings, CoordinatorStorageSettings},
+    config::configs::{BitcoinSettings, CoordinatorStorageSettings},
     coordinator::BitcoinCoordinator,
     core::storage::CoordinatorStorage,
     errors::BitcoinCoordinatorError,
@@ -672,7 +672,7 @@ pub fn tick_until_all_states(
                 .get_tx_by_id(*txid)
                 .ok()
                 .flatten()
-                .map_or(false, |tx| tx.state == expected_state)
+                .is_some_and(|tx| tx.state == expected_state)
         });
         if all_reached {
             info!(

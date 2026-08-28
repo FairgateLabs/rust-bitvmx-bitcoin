@@ -4,7 +4,7 @@ use std::rc::Rc;
 use tracing::warn;
 
 use crate::{
-    config::config::FundingSettings,
+    config::configs::FundingSettings,
     errors::BitcoinCoordinatorError,
     types::{CoordinatedTx, CoordinatorNews, FundingData, TransactionState},
 };
@@ -168,7 +168,7 @@ impl FundingManager {
 mod tests {
     use super::*;
     use crate::{
-        config::config::{CoordinatorStorageSettings, FundingSettings},
+        config::configs::{CoordinatorStorageSettings, FundingSettings},
         core::storage::CoordinatorStorage,
         test_utils::{utxo, StorageTestConfig},
         types::{FeeInfo, SpeedupContext, SpeedupKind, TxKind},
@@ -498,7 +498,7 @@ mod tests {
             "primary stays spent on combine None — caller owns the release"
         );
         // Caller releases explicitly.
-        mgr.release_marks(&[sole.clone()]).unwrap();
+        mgr.release_marks(std::slice::from_ref(&sole)).unwrap();
         assert!(!funding_spent(&storage, sole.txid));
     }
 

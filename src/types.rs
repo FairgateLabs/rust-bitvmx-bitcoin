@@ -64,6 +64,7 @@ pub struct FeeInfo {
     pub weight: u64,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub enum TxKind {
     Normal,

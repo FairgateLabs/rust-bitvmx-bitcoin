@@ -3,7 +3,7 @@ use common::*;
 
 use bitcoin::hashes::{sha256d, Hash as _};
 use bitcoin_coordinator::{
-    config::config::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
+    config::configs::{BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings},
     core::funding::FundingStorage,
     types::{AckNews, CoordinatorNews, TransactionState},
 };
@@ -284,7 +284,7 @@ fn test_multiple_txs_dispatched_in_single_tick() {
 
     for tx in [tx1, tx2, tx3] {
         coordinator
-            .dispatch_without_speedup(tx, ctx(&format!("batch")), None, None, None)
+            .dispatch_without_speedup(tx, ctx("batch"), None, None, None)
             .unwrap();
     }
 
@@ -1297,7 +1297,6 @@ fn test_retry_failure() {
         coordinator: CoordinatorSettings {
             retry_interval_seconds,
             retry_attempts_sending_tx: 3,
-            ..CoordinatorSettings::default()
         },
         ..Default::default()
     };
@@ -1396,7 +1395,6 @@ fn test_double_reorg_input_consumed() {
         coordinator: CoordinatorSettings {
             retry_interval_seconds: 1,
             retry_attempts_sending_tx: 2, // tiny budget: would fail fast if guard were budget-based
-            ..CoordinatorSettings::default()
         },
         ..Default::default()
     };
