@@ -1,6 +1,6 @@
 use crate::types::CoordinatorNews;
 use crate::{
-    config::config::FeeSettings,
+    config::configs::FeeSettings,
     errors::BitcoinCoordinatorError,
     types::{CoordinatedTx, FeeInfo},
 };
@@ -31,7 +31,7 @@ impl FeeManager {
             fee,
             fee_rate,
             package_fee_rate: fee_rate, // A standalone tx is its own package, so the two rates coincide.
-            weight: tx.weight().to_wu() as u64,
+            weight: tx.weight().to_wu(),
         }
     }
 
@@ -51,17 +51,11 @@ impl FeeManager {
         let package_vsize = parent_vbytes as u64 + child_vsize;
         FeeInfo {
             fee: fee_paid,
-            fee_rate: if child_vsize == 0 {
-                0
-            } else {
-                fee_paid / child_vsize
-            },
-            package_fee_rate: if package_vsize == 0 {
-                0
-            } else {
-                (parent_credit + fee_paid) / package_vsize
-            },
-            weight: tx.weight().to_wu() as u64,
+            fee_rate: fee_paid.checked_div(child_vsize).unwrap_or(0),
+            package_fee_rate: (parent_credit + fee_paid)
+                .checked_div(package_vsize)
+                .unwrap_or(0),
+            weight: tx.weight().to_wu(),
         }
     }
 
@@ -182,7 +176,7 @@ impl FeeManager {
 mod tests {
     use super::*;
     use crate::{
-        config::config::FeeSettings,
+        config::configs::FeeSettings,
         test_utils::{cpfp_coordinated_tx, dummy_tx, StorageTestConfig, TestBitcoind},
     };
 
@@ -202,7 +196,7 @@ mod tests {
         let fee_info = manager.compute_fee_for_tx(&tx, 10);
         assert_eq!(fee_info.fee, vsize * 10);
         assert_eq!(fee_info.fee_rate, 10);
-        assert_eq!(fee_info.weight, tx.weight().to_wu() as u64);
+        assert_eq!(fee_info.weight, tx.weight().to_wu());
     }
 
     #[test]
@@ -304,7 +298,7 @@ mod tests {
         let tx_vsize = tx.tx.vsize();
 
         // Same rate: 0 fee diff, correct chain vsize.
-        let (diff, vsize) = manager.chain_fee_diff(10, &[tx.clone()]);
+        let (diff, vsize) = manager.chain_fee_diff(10, std::slice::from_ref(&tx));
         assert_eq!(diff, 0);
         assert_eq!(vsize, tx_vsize);
 

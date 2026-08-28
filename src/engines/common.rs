@@ -6,7 +6,7 @@ use std::rc::Rc;
 use tracing::{debug, error, info, warn};
 
 use crate::{
-    config::config::CoordinatorSettings,
+    config::configs::CoordinatorSettings,
     core::{
         dispatcher::{DispatchOutcome, Dispatcher},
         fee::FeeManager,
@@ -227,8 +227,8 @@ impl EngineContext {
 
     /// Classify a raw broadcast failure by querying node state over RPC. Order:
     ///   1. Node already has the tx:
-    ///        Some(0)    → in mempool        → accept (InMempool).
-    ///        Some(n>=1) → confirmed         → Confirmed (review finalizes by depth).
+    ///      Some(0)    → in mempool        → accept (InMempool).
+    ///      Some(n>=1) → confirmed         → Confirmed (review finalizes by depth).
     ///   2. None (absent): inspect inputs. A funding input gone → recreate; an external/parent input gone → fail.
     ///   3. Inputs intact, cause unknown (fee/policy/transient): retry until the budget is spent.
     fn classify_dispatch_error(
@@ -336,7 +336,7 @@ impl EngineContext {
                     k.context()
                         .funding_inputs
                         .first()
-                        .map_or(false, |fi| fi.txid == tx.txid)
+                        .is_some_and(|fi| fi.txid == tx.txid)
                         || k.parents().contains(&tx.txid)
                 }
                 Err(_) => false,
@@ -386,7 +386,7 @@ impl EngineContext {
             let failed = self
                 .storage
                 .get_tx_by_id(op.txid)?
-                .map_or(false, |p| p.state == TransactionState::Failed);
+                .is_some_and(|p| p.state == TransactionState::Failed);
             if failed {
                 dead.push(op.txid);
             } else {

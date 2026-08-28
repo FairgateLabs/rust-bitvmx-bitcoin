@@ -18,7 +18,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::{
-        config::BitcoinSettings,
+        configs::BitcoinSettings,
         settings::{CPFP_TRANSACTION_CONTEXT, RBF_TRANSACTION_CONTEXT},
     },
     core::{

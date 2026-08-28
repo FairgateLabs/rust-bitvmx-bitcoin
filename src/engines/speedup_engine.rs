@@ -15,7 +15,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     config::{
-        config::SpeedupSettings,
+        configs::SpeedupSettings,
         settings::{CPFP_TRANSACTION_CONTEXT, RBF_TRANSACTION_CONTEXT},
     },
     core::fee::FeeManager,
@@ -510,7 +510,7 @@ impl SpeedupEngine {
     /// Unified CPFP / RBF builder.
     /// - `rbf_initial_inputs == None` → CPFP path. Calls `get_funding` to acquire the primary.
     /// - `rbf_initial_inputs == Some` → RBF path. Reuses the predecessor's funding inputs. On failure,
-    ///    only the funding added by this call (if any) is released; the inherited inputs stay marked.
+    ///   only the funding added by this call (if any) is released; the inherited inputs stay marked.
     fn build_speedup(
         &self,
         parent_entries: &[(SpeedupData, usize)],

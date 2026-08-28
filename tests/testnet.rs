@@ -4,21 +4,22 @@
 /// # Workflow
 ///
 /// 0. [Optional] Check if testnet3 node is accessible via `testnet_rpc_config()`:
-///     cargo test --test testnet test_rpc_connection -- --ignored
+///    cargo test --test testnet test_rpc_connection -- --ignored
 ///
 /// 1. Generate a fresh key and funding address:
-///      cargo test --test testnet test_generate_wallet -- --ignored
+///    cargo test --test testnet test_generate_wallet -- --ignored
 ///
 /// 2. Fund the printed address via a testnet faucet.
 ///
 /// 3. Fill in `tests/testnet_local.yaml` with the secret and UTXO details.
 ///
 /// 4. Dispatch through the coordinator:
-///     cargo test --test testnet test_dispatch_transaction -- --ignored
+///    cargo test --test testnet test_dispatch_transaction -- --ignored
 ///    or
-///     cargo test --test testnet test_coordinator_full_lifecycle -- --ignored
+///    cargo test --test testnet test_coordinator_full_lifecycle -- --ignored
 ///    or
-///     cargo test --test testnet test_full_lifecycle_multi_tx_with_speedup -- --ignored
+///    cargo test --test testnet test_full_lifecycle_multi_tx_with_speedup -- --ignored
+///
 /// because P2P propagation between the upstream nodes takes seconds.
 mod common;
 use common::*;
@@ -34,7 +35,7 @@ use bitcoin::{
     TxIn, TxOut, Txid, Witness,
 };
 use bitcoin_coordinator::{
-    config::config::{BitcoinSettings, CoordinatorStorageSettings},
+    config::configs::{BitcoinSettings, CoordinatorStorageSettings},
     coordinator::BitcoinCoordinator,
     core::storage::CoordinatorStorage,
     errors::BitcoinCoordinatorError,
@@ -624,7 +625,7 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
     let reached_cpfp = poll_until_all_states_sleep(
         &coordinator,
         &coord_storage,
-        &vec![cpfp_txid],
+        &[cpfp_txid],
         TransactionState::InMempool,
         Duration::from_secs(3 * 60),
         Duration::from_secs(5),
@@ -1084,7 +1085,7 @@ fn poll_until_all_states_sleep(
                 .get_tx_by_id(*t)
                 .ok()
                 .flatten()
-                .map_or(false, |tx| higher.contains(&tx.state))
+                .is_some_and(|tx| higher.contains(&tx.state))
         });
         if all_reached {
             return Ok(true);

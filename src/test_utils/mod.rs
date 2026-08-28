@@ -164,8 +164,8 @@ impl TestBitcoind {
         })
     }
     pub fn create_monitor(&self, storage: Rc<Storage>) -> Monitor {
-        let monitor = Monitor::new_with_paths(&self.rpc_config, storage, None).unwrap();
-        monitor
+        
+        Monitor::new_with_paths(&self.rpc_config, storage, None).unwrap()
     }
     fn default_rpc_config() -> RpcConfig {
         RpcConfig::new(
@@ -216,6 +216,12 @@ pub struct StorageTestConfig {
     storage: Rc<Storage>,
 }
 
+impl Default for StorageTestConfig {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StorageTestConfig {
     pub fn new() -> Self {
         let path = Self::get_storage_path();
@@ -252,7 +258,7 @@ impl StorageTestConfig {
     fn remove_storage_path(storage_path: &str) -> Result<(), anyhow::Error> {
         info!("Cleaning up storage file: {}", storage_path);
         let result = if path::Path::new(&storage_path).exists() {
-            fs::remove_dir_all(&storage_path).map_err(|e| {
+            fs::remove_dir_all(storage_path).map_err(|e| {
                 anyhow::anyhow!("Failed to remove storage path {}: {}", storage_path, e)
             })
         } else {
