@@ -286,9 +286,9 @@ fn test_coordinator_full_lifecycle() {
     assert!(reached, "tx {txid} never reached Confirmed within 30 min");
 
     let news = drain_news(&coordinator);
-    let has_confirmed_news = news.monitor_news.iter().any(|n| {
-        matches!(n, MonitorNews::Transaction(t) if t.tx_id == txid && t.status.is_confirmed())
-    });
+    let has_confirmed_news = news.monitor_news.iter().any(
+        |n| matches!(n, MonitorNews::Transaction(t) if t.tx_id == txid && t.status.is_confirmed()),
+    );
     assert!(
         has_confirmed_news,
         "no Confirmed monitor news seen for {txid}"
