@@ -409,6 +409,9 @@ fn test_add_funding_validation() {
         "unexpected news payload: {:?}",
         news.coordinator_news[0]
     );
+    // `get_news` is non-consuming, so acknowledge the expected invalid-funding
+    // notification before checking whether the next operation emits new news.
+    ack_all_news(&coordinator, &news);
 
     // 3. Valid UTXO after invalid one is still accepted with no news.
     let third_utxo = utxo(50_000);
@@ -434,7 +437,6 @@ fn test_add_funding_validation() {
         "second valid UTXO must be in storage"
     );
 
-    ack_all_news(&coordinator, &news);
     drop(coordinator);
     drop(coord_storage);
     setup.end_all().unwrap();
