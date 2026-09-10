@@ -144,7 +144,7 @@ still in `ToDispatch`.
 
 | Rule | Reason |
 |---|---|
-| News is deduplicated by value within a block. | Acknowledge only after acting; acking early drops a same-block repeat. |
+| `get_news()` returns all unacknowledged items every call. Identical news is stored once. | Items repeat until acked.|
 | Internal CPFP/RBF transactions are filtered from client transaction news. | The client's context does not distinguish speedup variants. |
 | A settled record emits `TransactionEvicted` when removed. | The client gets the full lifecycle, including teardown. |
 
@@ -154,7 +154,7 @@ still in `ToDispatch`.
 |---|---|
 | Register transaction B only after transaction A it depends on is `Finalized`. | An in-flight A can disappear and be re-dispatched; the coordinator preserves no ordering between independently registered transactions. |
 | External (untracked) parents must already be confirmed. | The dispatcher gates only on tracked parents; an untracked, unconfirmed parent makes the node reject the child. |
-| Acknowledge news only after acting on it. | See the news deduplication rule above. |
+| Acknowledge news only after acting on it. | Acking is the only way to clear an item. Act first or drop an unprocessed event. |
 
 ## Glossary
 
