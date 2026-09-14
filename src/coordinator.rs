@@ -294,13 +294,8 @@ impl BitcoinCoordinator {
     /// Returns all unacknowledged monitor and coordinator news. Internal
     /// CPFP/RBF speedup news entries are filtered out.
     pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
-        let current_height = self.tx_engine.ctx.monitor.get_monitor_height()?;
         let monitor_news = self.tx_engine.ctx.monitor.get_news()?;
-        let coordinator_news = self
-            .tx_engine
-            .ctx
-            .storage
-            .get_and_mark_news(current_height)?;
+        let coordinator_news = self.tx_engine.ctx.storage.get_news()?;
 
         // Filter out internal coordinator transactions (CPFP/RBF speedups),
         // since the client's Context does not distinguish speedup variants.

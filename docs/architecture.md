@@ -186,9 +186,10 @@ The `Failed` paths route through `fail_and_cascade`, which also settles every
 
 Every meaningful event is published as news. The application pulls news with
 `get_news()` and must acknowledge each item with `ack_news()` after acting on it.
-News is deduplicated by value within a block, so acking early can drop a repeat.
-Internal CPFP/RBF speedup transactions are filtered out of the transaction news
-the client sees.
+`get_news()` is a pure read: it returns every unacknowledged item on each call, so
+an item keeps reappearing until it is acknowledged. Identical news is stored only
+once (deduplicated by value). Internal CPFP/RBF speedup transactions are filtered
+out of the transaction news the client sees.
 
 | News | Fired when |
 |---|---|
