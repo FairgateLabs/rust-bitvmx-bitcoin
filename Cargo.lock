@@ -389,7 +389,7 @@ dependencies = [
 [[package]]
 name = "bitcoin-indexer"
 version = "0.8.5"
-source = "git+https://github.com/FairgateLabs/rust-bitcoin-indexer.git?tag=v0.8.5#3e666cc3c1d99c09b208aebd6b55333d974aa331"
+source = "git+https://github.com/FairgateLabs/rust-bitcoin-indexer.git?tag=v0.8.5#a2acae3e60eb0bca3a4aec128fa700377f8e885f"
 dependencies = [
  "anyhow",
  "bitcoin 0.32.102",
@@ -542,7 +542,7 @@ dependencies = [
 [[package]]
 name = "bitcoind"
 version = "0.8.5"
-source = "git+https://github.com/FairgateLabs/rust-bitcoind.git?tag=v0.8.5#1a0661cb7a35f47c5eca116b107601bd5fd6c6fd"
+source = "git+https://github.com/FairgateLabs/rust-bitcoind.git?tag=v0.8.5#2f86355516f539c242caec5545361c061ded78d7"
 dependencies = [
  "bitvmx-bitcoin-rpc",
  "bollard",
@@ -565,7 +565,7 @@ dependencies = [
 [[package]]
 name = "bitvmx-bitcoin-rpc"
 version = "0.8.5"
-source = "git+https://github.com/FairgateLabs/rust-bitvmx-bitcoin-rpc.git?tag=v0.8.5#b2debc2a316f1789802ba3382169e751cdcde4dc"
+source = "git+https://github.com/FairgateLabs/rust-bitvmx-bitcoin-rpc.git?tag=v0.8.5#2b45ad1861a8348f02fe26721df812dc45ca6370"
 dependencies = [
  "bitcoin 0.32.102",
  "bitcoincore-rpc",
@@ -581,7 +581,7 @@ dependencies = [
 [[package]]
 name = "bitvmx-key-manager"
 version = "0.8.5"
-source = "git+https://github.com/FairgateLabs/rust-bitvmx-key-manager.git?tag=v0.8.5#f81d566d063177d37f4aee38ca3e79781facfa0c"
+source = "git+https://github.com/FairgateLabs/rust-bitvmx-key-manager.git?tag=v0.8.5#7152c6fb76e905a6c3d35ed475aca451d05b00df"
 dependencies = [
  "anyhow",
  "base64 0.23.1",
@@ -613,7 +613,7 @@ dependencies = [
 [[package]]
 name = "bitvmx-protocol-builder"
 version = "0.8.5"
-source = "git+https://github.com/FairgateLabs/rust-bitvmx-protocol-builder.git?tag=v0.8.5#f2116df9f44e53f65897ae41e2b33b4eb670f0fe"
+source = "git+https://github.com/FairgateLabs/rust-bitvmx-protocol-builder.git?tag=v0.8.5#2a8adb4f89bbcf8f7607ebf361ad06f2b4402757"
 dependencies = [
  "anyhow",
  "bitcoin 0.32.102",
@@ -643,7 +643,7 @@ dependencies = [
 [[package]]
 name = "bitvmx-settings"
 version = "0.8.5"
-source = "git+https://github.com/FairgateLabs/rust-bitvmx-settings.git?tag=v0.8.5#b42d1237355e1a3924c63f6f22783676cd7a0c60"
+source = "git+https://github.com/FairgateLabs/rust-bitvmx-settings.git?tag=v0.8.5#67ff0344aec591222599d901ea3b85be45f97949"
 dependencies = [
  "age",
  "clap",
@@ -659,7 +659,7 @@ dependencies = [
 [[package]]
 name = "bitvmx-transaction-monitor"
 version = "0.8.5"
-source = "git+https://github.com/FairgateLabs/rust-bitvmx-transaction-monitor.git?tag=v0.8.5#df585aa66bc0dd4bd634c4958a0465aeb662c4c8"
+source = "git+https://github.com/FairgateLabs/rust-bitvmx-transaction-monitor.git?tag=v0.8.5#c38dfc62cd70e3897f100bcffbb740843fb614ef"
 dependencies = [
  "anyhow",
  "bitcoin 0.32.102",
@@ -687,7 +687,7 @@ dependencies = [
  "cc",
  "cfg-if",
  "constant_time_eq",
- "cpufeatures 0.3.0",
+ "cpufeatures 0.3.1",
  "serde",
 ]
 
@@ -843,7 +843,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65c35e4b699c7e15ccbe7ee35c005e4fc0a278d22238a2857e6ce2dadeda1b06"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.3.0",
+ "cpufeatures 0.3.1",
  "rand_core 0.10.1",
 ]
 
@@ -1117,9 +1117,9 @@ dependencies = [
 
 [[package]]
 name = "cpufeatures"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b2a41393f66f16b0823bb79094d54ac5fbd34ab292ddafb9a0456ac9f87d201"
+checksum = "5ca28b0ae3115b884660db4118d803791fd6756b6e88f39c0f3f7859060d7566"
 dependencies = [
  "libc",
 ]
@@ -1886,9 +1886,9 @@ dependencies = [
 
 [[package]]
 name = "hyper"
-version = "1.11.0"
+version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d22053281f852e11534f5198498373cbb59295120a20771d90f7ed1897490a72"
+checksum = "27b501faa50e7a26c3d3560ca625132f4078a17771f4810baf70475ae48cbe43"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -2171,9 +2171,9 @@ dependencies = [
 
 [[package]]
 name = "indexmap"
-version = "2.14.0"
+version = "2.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
+checksum = "07aa2048142242915a31d35844fb311e0e53fcca590c3a0a40dcf1b841fa09eb"
 dependencies = [
  "equivalent",
  "hashbrown 0.17.1",
@@ -2987,9 +2987,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro-error-attr3"
-version = "3.1.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b0084e6206a967a2dad822180626b2f6b07a3b379325e8f1ec0438e33a469ba7"
+checksum = "9e564d14133360e1ae169ffde5da25881b5fa47261665b8e5713c212c27799da"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2997,9 +2997,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro-error3"
-version = "3.1.0"
+version = "3.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0cf066225f2373bc711684792b69bdeac0356019b007e721090c24d92d5d5a50"
+checksum = "8f0d4471b3436c22106b21913b1dda531558918ae9b7ec55d58aa84b43552233"
 dependencies = [
  "proc-macro-error-attr3",
  "proc-macro2",
@@ -3331,7 +3331,7 @@ dependencies = [
 [[package]]
 name = "rust-bitvmx-storage-backend"
 version = "0.8.5"
-source = "git+https://github.com/FairgateLabs/rust-bitvmx-storage-backend.git?tag=v0.8.5#36bbd5187d812037e7474074aaf093b2344cabd3"
+source = "git+https://github.com/FairgateLabs/rust-bitvmx-storage-backend.git?tag=v0.8.5#9e2ec0a9eb5b03224fc5447dddb8b02b0ab03ecb"
 dependencies = [
  "age",
  "clap",
@@ -3408,9 +3408,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
@@ -3832,7 +3832,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
 dependencies = [
  "cfg-if",
- "cpufeatures 0.3.0",
+ "cpufeatures 0.3.1",
  "digest 0.11.3",
 ]
 
@@ -4456,9 +4456,9 @@ checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
 
 [[package]]
 name = "uuid"
-version = "1.25.0"
+version = "1.26.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
+checksum = "b5772d71c9be8a8a6ac2117d949c5b224c1b72241bb611d9a3012edcf8af7812"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
