@@ -9,6 +9,7 @@ use bitvmx_bitcoin_rpc::types::BlockHeight;
 use protocol_builder::types::Utxo;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
+use storage_backend::key::StorageKey;
 use storage_backend::storage::{KeyValueStore, Storage};
 use tracing::warn;
 
@@ -50,8 +51,8 @@ impl CoordinatorStorage {
     }
 
     pub fn insert_tx(&self, tx: CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::Tx(tx.txid));
-        self.storage.set(&key, &tx, None)?;
+        let key = self.get_key(StoreKey::Tx(tx.txid))?;
+        self.storage.set(key, &tx, None)?;
         Ok(())
     }
 
@@ -63,14 +64,14 @@ impl CoordinatorStorage {
     }
 
     pub fn update_tx(&self, tx: &CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::Tx(tx.txid));
-        self.storage.set(&key, tx, None)?;
+        let key = self.get_key(StoreKey::Tx(tx.txid))?;
+        self.storage.set(key, tx, None)?;
         Ok(())
     }
 
     pub fn remove_tx(&self, tx_id: Txid) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::Tx(tx_id));
-        self.storage.remove(&key, None)?;
+        let key = self.get_key(StoreKey::Tx(tx_id))?;
+        self.storage.remove(key, None)?;
         self.remove_speedup_from_list(tx_id)?;
         Ok(())
     }
@@ -79,13 +80,13 @@ impl CoordinatorStorage {
         &self,
         tx_id: Txid,
     ) -> Result<Option<CoordinatedTx>, BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::Tx(tx_id));
-        Ok(self.storage.get(&key, None)?)
+        let key = self.get_key(StoreKey::Tx(tx_id))?;
+        Ok(self.storage.get(key, None)?)
     }
 
     /// Get all the txs, but not in insertion order
     pub fn get_all_txs(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
-        let prefix = self.tx_prefix();
+        let prefix = Self::coordinator_key(&["txs"], [])?.to_scan_prefix();
         Ok(self.storage.partial_get(&prefix, None)?)
     }
 
@@ -285,8 +286,8 @@ impl CoordinatorStorage {
     ) -> Result<(), BitcoinCoordinatorError> {
         let settled = self.get_settled_txs()?;
         let psp: Vec<Txid> = {
-            let key = self.get_key(StoreKey::PendingSpeedupParents);
-            self.storage.get(&key, None)?.unwrap_or_default()
+            let key = self.get_key(StoreKey::PendingSpeedupParents)?;
+            self.storage.get(key, None)?.unwrap_or_default()
         };
         // Build the set of NeedsSpeedup parent txids that are referenced by a non-Failed/non-Finalized speedup ("live coverage").
         let mut live_covered: std::collections::HashSet<Txid> = std::collections::HashSet::new();
@@ -335,11 +336,11 @@ impl CoordinatorStorage {
     pub fn insert_speedup(&self, tx: CoordinatedTx) -> Result<(), BitcoinCoordinatorError> {
         let txid = tx.txid;
         self.insert_tx(tx)?;
-        let key = self.get_key(StoreKey::SpeedupList);
-        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::SpeedupList)?;
+        let mut list: Vec<Txid> = self.storage.get(key.clone(), None)?.unwrap_or_default();
         if !list.contains(&txid) {
             list.push(txid);
-            self.storage.set(&key, &list, None)?;
+            self.storage.set(key, &list, None)?;
         }
         Ok(())
     }
@@ -348,8 +349,8 @@ impl CoordinatorStorage {
     /// Txids that no longer exist in storage are skipped as a safety net against
     /// any inconsistency between the list and the tx store.
     pub fn get_speedups_ordered(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::SpeedupList);
-        let list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::SpeedupList)?;
+        let list: Vec<Txid> = self.storage.get(key, None)?.unwrap_or_default();
         let mut result = Vec::new();
         for txid in list {
             if let Some(tx) = self.get_tx_by_id(txid)? {
@@ -360,12 +361,15 @@ impl CoordinatorStorage {
     }
 
     fn remove_speedup_from_list(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
-        let list_key = self.get_key(StoreKey::SpeedupList);
-        let mut list: Vec<Txid> = self.storage.get(&list_key, None)?.unwrap_or_default();
+        let list_key = self.get_key(StoreKey::SpeedupList)?;
+        let mut list: Vec<Txid> = self
+            .storage
+            .get(list_key.clone(), None)?
+            .unwrap_or_default();
         let before = list.len();
         list.retain(|id| id != &txid);
         if list.len() != before {
-            self.storage.set(&list_key, &list, None)?;
+            self.storage.set(list_key, &list, None)?;
         }
         Ok(())
     }
@@ -376,11 +380,11 @@ impl CoordinatorStorage {
 
     /// Record that `txid` (a `NeedsSpeedup` parent) is waiting for a CPFP.
     pub fn add_pending_speedup_parent(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::PendingSpeedupParents);
-        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::PendingSpeedupParents)?;
+        let mut list: Vec<Txid> = self.storage.get(key.clone(), None)?.unwrap_or_default();
         if !list.contains(&txid) {
             list.push(txid);
-            self.storage.set(&key, &list, None)?;
+            self.storage.set(key, &list, None)?;
         }
         Ok(())
     }
@@ -394,8 +398,8 @@ impl CoordinatorStorage {
         if txids.is_empty() {
             return Ok(());
         }
-        let key = self.get_key(StoreKey::PendingSpeedupParents);
-        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::PendingSpeedupParents)?;
+        let mut list: Vec<Txid> = self.storage.get(key.clone(), None)?.unwrap_or_default();
         let existing: std::collections::HashSet<Txid> = list.iter().copied().collect();
         let to_prepend: Vec<Txid> = txids
             .iter()
@@ -407,18 +411,18 @@ impl CoordinatorStorage {
         }
         let mut new_list = to_prepend;
         new_list.append(&mut list);
-        self.storage.set(&key, &new_list, None)?;
+        self.storage.set(key, &new_list, None)?;
         Ok(())
     }
 
     /// Remove `txid` from the pending set (CPFP dispatched or parent no longer active).
     pub fn remove_pending_speedup_parent(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::PendingSpeedupParents);
-        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::PendingSpeedupParents)?;
+        let mut list: Vec<Txid> = self.storage.get(key.clone(), None)?.unwrap_or_default();
         let before = list.len();
         list.retain(|id| id != &txid);
         if list.len() != before {
-            self.storage.set(&key, &list, None)?;
+            self.storage.set(key, &list, None)?;
         }
         Ok(())
     }
@@ -435,8 +439,8 @@ impl CoordinatorStorage {
         &self,
     ) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
         let list: Vec<Txid> = {
-            let key = self.get_key(StoreKey::PendingSpeedupParents);
-            self.storage.get(&key, None)?.unwrap_or_default()
+            let key = self.get_key(StoreKey::PendingSpeedupParents)?;
+            self.storage.get(key, None)?.unwrap_or_default()
         };
         let mut live = Vec::new();
         for txid in list {
@@ -492,8 +496,8 @@ impl CoordinatorStorage {
         &self,
         outpoint: &OutPoint,
     ) -> Result<Option<FundingData>, BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::Funding(*outpoint));
-        Ok(self.storage.get(&key, None)?)
+        let key = self.get_key(StoreKey::Funding(*outpoint))?;
+        Ok(self.storage.get(key, None)?)
     }
 
     /// True when `outpoint` is speedup-derived: either a materialized finalized-speedup change in the
@@ -516,8 +520,8 @@ impl CoordinatorStorage {
     /// waiting for its next-block cleanup.
     /// Returns `true` if the item was inserted, `false` if it was a duplicate.
     pub fn add_news(&self, news: CoordinatorNews) -> Result<bool, BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::News);
-        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::News)?;
+        let mut all: Vec<StoredNewsItem> = self.storage.get(key.clone(), None)?.unwrap_or_default();
         if all.iter().any(|item| item.news == news) {
             return Ok(false);
         }
@@ -525,14 +529,14 @@ impl CoordinatorStorage {
             news,
             acked_at_block: None,
         });
-        self.storage.set(&key, &all, None)?;
+        self.storage.set(key, &all, None)?;
         Ok(true)
     }
 
     /// Return all unacknowledged news.
     pub fn get_news(&self) -> Result<Vec<CoordinatorNews>, BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::News);
-        let all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::News)?;
+        let all: Vec<StoredNewsItem> = self.storage.get(key, None)?.unwrap_or_default();
         Ok(all
             .into_iter()
             .filter(|item| item.acked_at_block.is_none())
@@ -548,25 +552,25 @@ impl CoordinatorStorage {
         news: CoordinatorNews,
         current_height: BlockHeight,
     ) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::News);
-        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::News)?;
+        let mut all: Vec<StoredNewsItem> = self.storage.get(key.clone(), None)?.unwrap_or_default();
         for item in &mut all {
             if item.acked_at_block.is_none() && item.news == news {
                 item.acked_at_block = Some(current_height);
                 break;
             }
         }
-        self.storage.set(&key, &all, None)?;
+        self.storage.set(key, &all, None)?;
         Ok(())
     }
 
     /// Remove items that were acknowledged in a strictly earlier block
     /// (`acked_at_block < current_height`). Called at the start of each tick.
     pub fn cleanup_news(&self, current_height: BlockHeight) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::News);
-        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
+        let key = self.get_key(StoreKey::News)?;
+        let mut all: Vec<StoredNewsItem> = self.storage.get(key.clone(), None)?.unwrap_or_default();
         all.retain(|item| item.acked_at_block.is_none_or(|h| h >= current_height));
-        self.storage.set(&key, &all, None)?;
+        self.storage.set(key, &all, None)?;
         Ok(())
     }
 
@@ -574,30 +578,49 @@ impl CoordinatorStorage {
     // INTERNAL HELPERS
     // ================================
 
-    fn tx_prefix(&self) -> String {
-        format!("{TX_PREFIX}/txs/")
+    fn coordinator_key<'a>(
+        namespace: &[&str],
+        tail: impl IntoIterator<Item = &'a str>,
+    ) -> Result<StorageKey, BitcoinCoordinatorError> {
+        Ok(StorageKey::new(
+            std::iter::once(TX_PREFIX)
+                .chain(namespace.iter().copied())
+                .map(str::to_string)
+                .chain(tail.into_iter().map(str::to_string)),
+        )?)
     }
 
-    fn get_key(&self, key: StoreKey) -> String {
-        let prefix = TX_PREFIX;
+    fn speedup_key<'a>(
+        tail: impl IntoIterator<Item = &'a str>,
+    ) -> Result<StorageKey, BitcoinCoordinatorError> {
+        Self::coordinator_key(&["speedup"], tail)
+    }
+
+    fn funding_key<'a>(
+        tail: impl IntoIterator<Item = &'a str>,
+    ) -> Result<StorageKey, BitcoinCoordinatorError> {
+        Self::coordinator_key(&["funding"], tail)
+    }
+
+    fn get_key(&self, key: StoreKey) -> Result<StorageKey, BitcoinCoordinatorError> {
         match key {
-            StoreKey::Tx(tx_id) => format!("{prefix}/txs/{tx_id}"),
-            StoreKey::News => format!("{prefix}/news"),
-            StoreKey::SpeedupList => format!("{prefix}/speedup/list"),
-            StoreKey::PendingSpeedupParents => format!("{prefix}/speedup/pending_parents"),
-            StoreKey::FundingList => format!("{prefix}/funding/list"),
-            StoreKey::Funding(op) => format!("{prefix}/funding/record/{op}"),
+            StoreKey::Tx(tx_id) => Self::coordinator_key(&["txs"], [tx_id.to_string().as_str()]),
+            StoreKey::News => Self::coordinator_key(&["news"], []),
+            StoreKey::SpeedupList => Self::speedup_key(["list"]),
+            StoreKey::PendingSpeedupParents => Self::speedup_key(["pending_parents"]),
+            StoreKey::FundingList => Self::funding_key(["list"]),
+            StoreKey::Funding(op) => Self::funding_key(["record", op.to_string().as_str()]),
         }
     }
 
     fn funding_list(&self) -> Result<Vec<OutPoint>, BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::FundingList);
-        Ok(self.storage.get(&key, None)?.unwrap_or_default())
+        let key = self.get_key(StoreKey::FundingList)?;
+        Ok(self.storage.get(key, None)?.unwrap_or_default())
     }
 
     fn set_funding_list(&self, list: &[OutPoint]) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::FundingList);
-        self.storage.set(&key, list.to_vec(), None)?;
+        let key = self.get_key(StoreKey::FundingList)?;
+        self.storage.set(key, list.to_vec(), None)?;
         Ok(())
     }
 
@@ -606,8 +629,8 @@ impl CoordinatorStorage {
         outpoint: &OutPoint,
         record: &FundingData,
     ) -> Result<(), BitcoinCoordinatorError> {
-        let key = self.get_key(StoreKey::Funding(*outpoint));
-        self.storage.set(&key, record, None)?;
+        let key = self.get_key(StoreKey::Funding(*outpoint))?;
+        self.storage.set(key, record, None)?;
         Ok(())
     }
 }
@@ -667,11 +690,11 @@ impl FundingStorage for CoordinatorStorage {
 
     fn clear_funding_records(&self) -> Result<(), BitcoinCoordinatorError> {
         for op in self.funding_list()? {
-            let key = self.get_key(StoreKey::Funding(op));
-            self.storage.remove(&key, None)?;
+            let key = self.get_key(StoreKey::Funding(op))?;
+            self.storage.remove(key, None)?;
         }
-        let list_key = self.get_key(StoreKey::FundingList);
-        self.storage.remove(&list_key, None)?;
+        let list_key = self.get_key(StoreKey::FundingList)?;
+        self.storage.remove(list_key, None)?;
         Ok(())
     }
 
@@ -727,8 +750,8 @@ impl FundingStorage for CoordinatorStorage {
         // Remove matched records (record + list entry) from highest to lowest index.
         for idx in to_remove_idx.iter().rev() {
             let removed = list.remove(*idx);
-            let key = self.get_key(StoreKey::Funding(removed));
-            self.storage.remove(&key, None)?;
+            let key = self.get_key(StoreKey::Funding(removed))?;
+            self.storage.remove(key, None)?;
         }
 
         // Materialize the finalized speedup's change as a plain funding record at the smallest removed
@@ -1457,9 +1480,14 @@ mod tests {
         let storage_backend = StorageTestConfig::new();
         let storage = new_storage(&storage_backend);
         let pub_key = crate::test_utils::dummy_pubkey();
-        let key = storage.get_key(StoreKey::PendingSpeedupParents);
-        let read_list =
-            || -> Vec<Txid> { storage.storage.get(&key, None).unwrap().unwrap_or_default() };
+        let key = storage.get_key(StoreKey::PendingSpeedupParents).unwrap();
+        let read_list = || -> Vec<Txid> {
+            storage
+                .storage
+                .get(key.clone(), None)
+                .unwrap()
+                .unwrap_or_default()
+        };
 
         let p1 = random_txid();
         let p2 = random_txid();
