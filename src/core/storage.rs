@@ -337,7 +337,7 @@ impl CoordinatorStorage {
         let txid = tx.txid;
         self.insert_tx(tx)?;
         let key = self.get_key(StoreKey::SpeedupList)?;
-        let mut list: Vec<Txid> = self.storage.get(key.clone(), None)?.unwrap_or_default();
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
         if !list.contains(&txid) {
             list.push(txid);
             self.storage.set(key, &list, None)?;
@@ -362,10 +362,7 @@ impl CoordinatorStorage {
 
     fn remove_speedup_from_list(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         let list_key = self.get_key(StoreKey::SpeedupList)?;
-        let mut list: Vec<Txid> = self
-            .storage
-            .get(list_key.clone(), None)?
-            .unwrap_or_default();
+        let mut list: Vec<Txid> = self.storage.get(&list_key, None)?.unwrap_or_default();
         let before = list.len();
         list.retain(|id| id != &txid);
         if list.len() != before {
@@ -381,7 +378,7 @@ impl CoordinatorStorage {
     /// Record that `txid` (a `NeedsSpeedup` parent) is waiting for a CPFP.
     pub fn add_pending_speedup_parent(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::PendingSpeedupParents)?;
-        let mut list: Vec<Txid> = self.storage.get(key.clone(), None)?.unwrap_or_default();
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
         if !list.contains(&txid) {
             list.push(txid);
             self.storage.set(key, &list, None)?;
@@ -399,7 +396,7 @@ impl CoordinatorStorage {
             return Ok(());
         }
         let key = self.get_key(StoreKey::PendingSpeedupParents)?;
-        let mut list: Vec<Txid> = self.storage.get(key.clone(), None)?.unwrap_or_default();
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
         let existing: std::collections::HashSet<Txid> = list.iter().copied().collect();
         let to_prepend: Vec<Txid> = txids
             .iter()
@@ -418,7 +415,7 @@ impl CoordinatorStorage {
     /// Remove `txid` from the pending set (CPFP dispatched or parent no longer active).
     pub fn remove_pending_speedup_parent(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::PendingSpeedupParents)?;
-        let mut list: Vec<Txid> = self.storage.get(key.clone(), None)?.unwrap_or_default();
+        let mut list: Vec<Txid> = self.storage.get(&key, None)?.unwrap_or_default();
         let before = list.len();
         list.retain(|id| id != &txid);
         if list.len() != before {
@@ -521,7 +518,7 @@ impl CoordinatorStorage {
     /// Returns `true` if the item was inserted, `false` if it was a duplicate.
     pub fn add_news(&self, news: CoordinatorNews) -> Result<bool, BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News)?;
-        let mut all: Vec<StoredNewsItem> = self.storage.get(key.clone(), None)?.unwrap_or_default();
+        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
         if all.iter().any(|item| item.news == news) {
             return Ok(false);
         }
@@ -553,7 +550,7 @@ impl CoordinatorStorage {
         current_height: BlockHeight,
     ) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News)?;
-        let mut all: Vec<StoredNewsItem> = self.storage.get(key.clone(), None)?.unwrap_or_default();
+        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
         for item in &mut all {
             if item.acked_at_block.is_none() && item.news == news {
                 item.acked_at_block = Some(current_height);
@@ -568,7 +565,7 @@ impl CoordinatorStorage {
     /// (`acked_at_block < current_height`). Called at the start of each tick.
     pub fn cleanup_news(&self, current_height: BlockHeight) -> Result<(), BitcoinCoordinatorError> {
         let key = self.get_key(StoreKey::News)?;
-        let mut all: Vec<StoredNewsItem> = self.storage.get(key.clone(), None)?.unwrap_or_default();
+        let mut all: Vec<StoredNewsItem> = self.storage.get(&key, None)?.unwrap_or_default();
         all.retain(|item| item.acked_at_block.is_none_or(|h| h >= current_height));
         self.storage.set(key, &all, None)?;
         Ok(())
@@ -1481,13 +1478,8 @@ mod tests {
         let storage = new_storage(&storage_backend);
         let pub_key = crate::test_utils::dummy_pubkey();
         let key = storage.get_key(StoreKey::PendingSpeedupParents).unwrap();
-        let read_list = || -> Vec<Txid> {
-            storage
-                .storage
-                .get(key.clone(), None)
-                .unwrap()
-                .unwrap_or_default()
-        };
+        let read_list =
+            || -> Vec<Txid> { storage.storage.get(&key, None).unwrap().unwrap_or_default() };
 
         let p1 = random_txid();
         let p2 = random_txid();
