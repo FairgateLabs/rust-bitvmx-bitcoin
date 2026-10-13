@@ -438,6 +438,11 @@ impl EngineContext {
         self.storage
             .add_news(Self::dispatch_error_news(tx, tx.txid))?;
 
+        // A Failed tx is never mined, so its subscription would never end on its own and its mempool watch would cost
+        // a node call on every tick. Cancel it under the context it was registered with.
+        self.monitor
+            .cancel(&[MonitorTarget::Transaction(tx.txid)], &tx.context)?;
+
         // Only CPFPs reset spent flags and re-add parents. RBFs skip both since they don't reserve their parents' UTXOs.
         if let TxKind::Speedup(SpeedupKind::CPFP { .. }) = &tx.kind {
             self.funding_manager.mark_parents_unspent(tx)?;

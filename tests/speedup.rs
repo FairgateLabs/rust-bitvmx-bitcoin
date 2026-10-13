@@ -1982,6 +1982,19 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
         "parent, CPFP, boost CPFP, and RBF must all settle Failed after the parent double-spend is mined"
     );
 
+    // Settling Failed cancels the monitor subscription, which releases the mempool watch each one got when it was accepted.
+    let watch_list = bitcoin_indexer::store::IndexerStore::new(setup.storage.get_raw_storage())
+        .unwrap()
+        .get_mempool_watch_list()
+        .unwrap();
+    for failed in [parent_txid, cpfp_txid, rbf_txid] {
+        assert!(
+            !watch_list.iter().any(|(txid, _)| *txid == failed),
+            "Failed tx {failed} must no longer be on the mempool watch list; got {:?}",
+            watch_list
+        );
+    }
+
     // CPFP's funding UTXO must have been released by `mark_parents_unspent`.
     let funding_records = coord_storage.read_funding_records().unwrap();
     let funding_record = funding_records
