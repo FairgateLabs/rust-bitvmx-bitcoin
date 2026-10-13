@@ -1,12 +1,12 @@
 use std::rc::Rc;
 
-use bitcoin::{Transaction, Txid};
+use bitcoin::{BlockHash, Transaction, Txid};
 use bitvmx_bitcoin_rpc::{
     bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
 };
 use bitvmx_transaction_monitor::{
     monitor::Monitor,
-    types::{MonitorNews, MonitorTarget},
+    types::{FullBlock, MonitorNews, MonitorTarget},
     TransactionStatus,
 };
 use key_manager::key_manager::KeyManager;
@@ -292,6 +292,19 @@ impl BitcoinCoordinator {
         txid: Txid,
     ) -> Result<TransactionStatus, BitcoinCoordinatorError> {
         Ok(self.tx_engine.ctx.monitor.get_tx_status(&txid, true)?)
+    }
+
+    /// Returns the block at this height and hash. `None` when the block
+    /// is above the indexed height or was replaced by a reorg.
+    ///
+    /// * `height` - Height of the block.
+    /// * `hash` - Which block at that height.
+    pub fn get_block(
+        &self,
+        height: BlockHeight,
+        hash: &BlockHash,
+    ) -> Result<Option<FullBlock>, BitcoinCoordinatorError> {
+        Ok(self.tx_engine.ctx.monitor.get_block(height, hash)?)
     }
 
     /// Returns unacknowledged monitor and coordinator news. Internal

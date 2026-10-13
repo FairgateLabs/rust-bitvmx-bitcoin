@@ -144,8 +144,8 @@ still in `ToDispatch`.
 
 | Rule | Reason |
 |---|---|
-| `get_news()` returns all unacknowledged items every call. Identical news is stored once. | Items repeat until acked.|
-| Internal CPFP/RBF transactions are filtered from client transaction news. | The client's context does not distinguish speedup variants. |
+| `get_news(max_keys)` returns unacknowledged items every call, the monitor news limited to the first `max_keys` transactions and block heights (`None` for all). Identical coordinator news is stored once. | Items repeat until acked. The limit bounds one call's size. |
+| Internal CPFP/RBF monitor news is filtered from the client's news and acknowledged by `get_news` itself. | The client's context does not distinguish speedup variants, and unacknowledged monitor news is never dropped. |
 | A settled record emits `TransactionEvicted` when removed. | The client gets the full lifecycle, including teardown. |
 
 ## Application obligations

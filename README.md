@@ -114,7 +114,8 @@ The `BitcoinCoordinator` struct exposes the following methods:
 | `cancel` | Cancel monitoring + storage for txs still in `ToDispatch` (refused once dispatched). |
 | `add_funding` | Register a funding UTXO available for future speedups. |
 | `get_transaction` | Query the on-chain / mempool status of a tx. |
-| `get_news` | Retrieve all unacknowledged monitor and coordinator news. |
+| `get_block` | Fetch a block by height and hash. `None` when the block is above the indexed height or was replaced by a reorg. |
+| `get_news` | Retrieve unacknowledged monitor and coordinator news. `max_keys` limits the monitor news to the first `max_keys` transactions and block heights (`None` for all). |
 | `ack_news` | Acknowledge a news item so it is not returned again. |
 | `monitor` | Register data to be monitored without scheduling a dispatch. |
 

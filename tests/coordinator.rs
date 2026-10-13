@@ -12,6 +12,7 @@ use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
     types::{MonitorTarget, NewsKind},
+    TransactionStatus,
 };
 use tracing::info;
 
@@ -518,6 +519,24 @@ fn test_get_transaction_old_tx() {
         status.confirmations() > 0,
         "funded tx must have at least 1 confirmation; got {}",
         status.confirmations()
+    );
+
+    // The block the status points at can be fetched through the coordinator, and it holds the tx.
+    let TransactionStatus::Confirmed {
+        block_height,
+        block_hash,
+        ..
+    } = status
+    else {
+        panic!("funded tx must be Confirmed; got {status:?}");
+    };
+    let block = coordinator
+        .get_block(block_height, &block_hash)
+        .unwrap()
+        .expect("get_block must return the block the tx was confirmed in");
+    assert!(
+        block.txs.iter().any(|tx| tx.compute_txid() == funded_txid),
+        "the returned block must contain the funded tx"
     );
 
     drop(coordinator);

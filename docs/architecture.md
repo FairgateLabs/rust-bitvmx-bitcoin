@@ -185,11 +185,16 @@ The `Failed` paths route through `fail_and_cascade`, which also settles every
 ## News
 
 Every meaningful event is published as news. The application pulls news with
-`get_news()` and must acknowledge each item with `ack_news()` after acting on it.
-`get_news()` is a pure read: it returns every unacknowledged item on each call, so
-an item keeps reappearing until it is acknowledged. Identical news is stored only
-once (deduplicated by value). Internal CPFP/RBF speedup transactions are filtered
-out of the transaction news the client sees.
+`get_news(max_keys)` and must acknowledge each item with `ack_news()` after acting on it.
+`get_news` returns every unacknowledged client item on each call, so an item keeps
+reappearing until it is acknowledged. `max_keys` limits the monitor news to what is
+pending about the first `max_keys` transactions and block heights (`None` for all);
+coordinator news is always returned in full. Identical coordinator news is stored only
+once (deduplicated by value). Monitor news about internal CPFP/RBF speedup transactions
+is filtered out of what the client sees and acknowledged inside `get_news`, since nothing
+reads it and the monitor keeps every item until it is acknowledged. That speedup news
+counts toward `max_keys`, so a limited call can return fewer client items, and the next
+call moves on.
 
 | News | Fired when |
 |---|---|
