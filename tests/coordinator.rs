@@ -32,7 +32,7 @@ fn test_tick_until_ready() {
     tick_until_ready(&coordinator).unwrap();
     assert!(coordinator.is_ready().unwrap());
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    assert!(coordinator.get_news(None).unwrap().is_empty());
 
     drop(coordinator);
     setup.end_all().unwrap();
@@ -87,7 +87,7 @@ fn test_tx_dispatch_to_mempool() {
         "broadcast_block_height must be set after dispatch"
     );
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    assert!(coordinator.get_news(None).unwrap().is_empty());
 
     drop(coordinator);
     drop(coord_storage);
@@ -148,7 +148,7 @@ fn test_full_lifecycle() {
     .unwrap();
     assert!(reached, "tx must reach Confirmed after 1 block");
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert!(
         news.monitor_news.iter().any(|n| {
             matches!(&n.kind, NewsKind::Transaction { txid: id, status, .. } if *id == txid && status.is_confirmed())
@@ -179,7 +179,7 @@ fn test_full_lifecycle() {
     let mut evicted = false;
     for _ in 0..10 {
         coordinator.tick().unwrap();
-        let news = coordinator.get_news().unwrap();
+        let news = coordinator.get_news(None).unwrap();
         if news.coordinator_news.iter().any(
             |n| matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == txid),
         ) {
@@ -259,7 +259,7 @@ fn test_height_delays_dispatch() {
         }
     }
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    assert!(coordinator.get_news(None).unwrap().is_empty());
 
     drop(coordinator);
     drop(coord_storage);
@@ -303,7 +303,7 @@ fn test_multiple_txs_dispatched_in_single_tick() {
         );
     }
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    assert!(coordinator.get_news(None).unwrap().is_empty());
 
     drop(coordinator);
     drop(coord_storage);
@@ -364,7 +364,7 @@ fn test_dispatch_parent_then_child_across_ticks() {
         "child {child_id} must reach InMempool after the parent becomes observable"
     );
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    assert!(coordinator.get_news(None).unwrap().is_empty());
 
     drop(coordinator);
     drop(coord_storage);
@@ -388,13 +388,13 @@ fn test_add_funding_validation() {
     let first_utxo = utxo(20_000);
     coordinator.add_funding(first_utxo.clone()).unwrap();
     assert!(
-        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        coordinator.get_news(None).unwrap().coordinator_news.is_empty(),
         "no news must fire when a valid funding UTXO is added"
     );
 
     // 2. Below-minimum UTXO rejected, news emitted.
     coordinator.add_funding(utxo(9_999)).unwrap();
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert_eq!(
         news.coordinator_news.len(),
         1,
@@ -418,7 +418,7 @@ fn test_add_funding_validation() {
     let third_utxo = utxo(50_000);
     coordinator.add_funding(third_utxo.clone()).unwrap();
     assert!(
-        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        coordinator.get_news(None).unwrap().coordinator_news.is_empty(),
         "no news must fire when a valid funding UTXO is added, even after a previous invalid one"
     );
 
@@ -478,7 +478,7 @@ fn test_cancel_pending_tx_before_dispatch() {
     // Ticking must not produce any dispatch errors for this tx.
     coordinator.tick().unwrap();
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    assert!(coordinator.get_news(None).unwrap().is_empty());
 
     drop(coordinator);
     drop(coord_storage);
@@ -537,7 +537,7 @@ fn test_news_ack() {
     // Add a UTXO below the minimum to generate InvalidFundingUtxo news.
     coordinator.add_funding(utxo(500)).unwrap(); // min is 10 000
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert_eq!(
         news.coordinator_news.len(),
         1,
@@ -558,7 +558,7 @@ fn test_news_ack() {
         .unwrap();
 
     // After ack the coordinator news list must be empty.
-    let news_after_ack = coordinator.get_news().unwrap();
+    let news_after_ack = coordinator.get_news(None).unwrap();
     assert!(
         news_after_ack.coordinator_news.is_empty(),
         "Coordinator news must be empty after ack; got {:?}",
@@ -603,7 +603,7 @@ fn test_dispatch_already_in_mempool() {
         "AlreadyKnown must be treated as a successful dispatch"
     );
 
-    assert!(coordinator.get_news().unwrap().is_empty());
+    assert!(coordinator.get_news(None).unwrap().is_empty());
 
     drop(coordinator);
     drop(coord_storage);
@@ -653,7 +653,7 @@ fn test_dispatch_invalid_empty_tx() {
         stored.state
     );
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert_eq!(
         news.coordinator_news.len(),
         1,
@@ -727,7 +727,7 @@ fn test_valid_and_invalid_tx() {
         "invalid tx should be Failed"
     );
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert_eq!(
         news.coordinator_news.len(),
         1,
@@ -809,7 +809,7 @@ fn test_cancel_dispatched_tx_refused() {
     );
 
     // One InvalidCancel news per refused entry.
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     let rejected: Vec<bitcoin::Txid> = news
         .coordinator_news
         .iter()
@@ -853,13 +853,13 @@ fn test_cancel_passthrough_non_transactions() {
 
     // No coordinator news (no InvalidCancel): the pass-through arm never classifies or rejects.
     assert!(
-        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        coordinator.get_news(None).unwrap().coordinator_news.is_empty(),
         "pass-through cancel must not emit any coordinator news"
     );
 
     // A second tick must stay clean; cancelling an unknown spending-UTXO entry is a no-op.
     coordinator.tick().unwrap();
-    assert!(coordinator.get_news().unwrap().coordinator_news.is_empty());
+    assert!(coordinator.get_news(None).unwrap().coordinator_news.is_empty());
 
     drop(coordinator);
     setup.end_all().unwrap();
@@ -890,7 +890,7 @@ fn test_selective_ack() {
         .unwrap();
     coordinator.tick().unwrap();
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert_eq!(
         news.coordinator_news.len(),
         2,
@@ -916,7 +916,7 @@ fn test_selective_ack() {
     coordinator.tick().unwrap();
 
     // Only the InvalidFundingUtxo must remain.
-    let remaining = coordinator.get_news().unwrap().coordinator_news;
+    let remaining = coordinator.get_news(None).unwrap().coordinator_news;
     assert_eq!(
         remaining.len(),
         1,
@@ -1079,7 +1079,7 @@ fn test_stuck_in_mempool_news() {
 
     coordinator.tick().unwrap();
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert!(
         news.coordinator_news.iter().any(|n| {
             matches!(n, CoordinatorNews::TransactionStuckInMempool { txid: id, .. } if *id == txid)
@@ -1133,7 +1133,7 @@ fn test_stuck_in_mempool_cpfp_resolution() {
 
     coordinator.tick().unwrap();
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert!(
         news.coordinator_news.iter().any(|n| {
             matches!(n, CoordinatorNews::TransactionStuckInMempool { txid: id, .. } if *id == parent_txid)
@@ -1269,7 +1269,7 @@ fn test_retry_dispatches_after_rate_limit() {
         "tx_subject must be InMempool after the retry interval has elapsed"
     );
 
-    assert!(coordinator.get_news().unwrap().coordinator_news.is_empty());
+    assert!(coordinator.get_news(None).unwrap().coordinator_news.is_empty());
 
     drop(coordinator);
     drop(coord_storage);
@@ -1344,7 +1344,7 @@ fn test_retry_failure() {
     );
     assert_eq!(stored.state, TransactionState::ToDispatch);
     assert!(
-        coordinator.get_news().unwrap().coordinator_news.is_empty(),
+        coordinator.get_news(None).unwrap().coordinator_news.is_empty(),
         "No news should be generated while rate-limited"
     );
 
@@ -1359,7 +1359,7 @@ fn test_retry_failure() {
         "tx must be Failed after exhausting all retry attempts"
     );
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert!(
         news.coordinator_news
             .iter()
@@ -1425,7 +1425,7 @@ fn test_double_reorg_input_consumed() {
         .unwrap(),
         "T must reach InMempool after dispatch"
     );
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Competing confirm: mine a block carrying T' (U now spent by T'); T is evicted.
     let block_with_t_prime =

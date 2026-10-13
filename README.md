@@ -175,7 +175,7 @@ coordinator.dispatch_without_speedup(
 coordinator.add_funding(Utxo::new(txid, vout, amount.to_sat(), &pubkey))?;
 
 // Pull and acknowledge news.
-let news = coordinator.get_news()?;
+let news = coordinator.get_news(None)?;
 for item in news.monitor_news.iter() {
     // ... handle item ...
 }

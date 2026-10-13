@@ -531,7 +531,7 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
         coord_storage.get_tx_by_id(dummy_txid).unwrap().is_none(),
         "tx must be removed from storage after a successful cancel"
     );
-    let post_cancel_news = coordinator.get_news().unwrap();
+    let post_cancel_news = coordinator.get_news(None).unwrap();
     assert!(
         !post_cancel_news.coordinator_news.iter().any(|n| matches!(
             n,
@@ -777,7 +777,7 @@ fn poll_until_state_with_sleep(
 
 /// Get pending news, ack every item, and return the snapshot.
 fn drain_news(coordinator: &BitcoinCoordinator) -> News {
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     info!(
         "Draining news: {} monitor news, {} coordinator news",
         news.monitor_news.len(),
@@ -804,7 +804,7 @@ fn poll_until_evicted(
     let start = Instant::now();
     loop {
         coordinator.tick()?;
-        let news = coordinator.get_news()?;
+        let news = coordinator.get_news(None)?;
         let evicted = news.coordinator_news.iter().any(
             |n| matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == txid),
         );

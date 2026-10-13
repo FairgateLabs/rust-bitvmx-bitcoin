@@ -141,8 +141,8 @@ only build and save; the broadcast happens on the next tick.
 
 When the dispatcher broadcasts a transaction it returns one of four outcomes.
 The engine, not the error string, decides what the outcome means by probing live
-node state. This requires the node to run with `-txindex=1`, which the
-coordinator asserts at construction.
+node state. This requires the node to run with `-txindex=1`. The coordinator
+does not check it: construction makes no node call.
 
 ```mermaid
 flowchart TD

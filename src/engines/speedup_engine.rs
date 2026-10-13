@@ -707,19 +707,19 @@ impl SpeedupEngine {
         if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
             let mut current_id = *replaces;
             loop {
-                let next_id =
+                let prev = self.ctx.storage.get_tx_by_id(current_id)?;
+                let next_id = prev.as_ref().and_then(|prev| match &prev.kind {
+                    TxKind::Speedup(SpeedupKind::RBF {
+                        replaces: older, ..
+                    }) => Some(*older),
+                    _ => None,
+                });
+                // Each replaced tx was registered under its own context (CPFP or RBF), so it is cancelled under that one.
+                if let Some(prev) = &prev {
                     self.ctx
-                        .storage
-                        .get_tx_by_id(current_id)?
-                        .and_then(|prev| match &prev.kind {
-                            TxKind::Speedup(SpeedupKind::RBF {
-                                replaces: older, ..
-                            }) => Some(*older),
-                            _ => None,
-                        });
-                self.ctx
-                    .monitor
-                    .cancel(&[MonitorTarget::Transaction(current_id)], &tx.context)?;
+                        .monitor
+                        .cancel(&[MonitorTarget::Transaction(current_id)], &prev.context)?;
+                }
                 self.ctx
                     .storage
                     .settle_tx(current_id, TransactionState::Failed, current_height)?;

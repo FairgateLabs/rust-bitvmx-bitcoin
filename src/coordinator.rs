@@ -2,9 +2,7 @@ use std::rc::Rc;
 
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::{
-    bitcoin_client::{BitcoinClient, BitcoinClientApi},
-    rpc_config::RpcConfig,
-    types::BlockHeight,
+    bitcoin_client::BitcoinClient, rpc_config::RpcConfig, types::BlockHeight,
 };
 use bitvmx_transaction_monitor::{
     monitor::Monitor,
@@ -55,13 +53,6 @@ impl BitcoinCoordinator {
         settings.validate()?;
 
         let bitcoin_client = Rc::new(BitcoinClient::new_from_config(rpc_config)?);
-
-        // Fail fast if it is off.
-        if !bitcoin_client.is_txindex_enabled()? {
-            return Err(BitcoinCoordinatorError::InvalidConfiguration(
-                "the Bitcoin node must run with -txindex=1".to_string(),
-            ));
-        }
 
         let monitor = Monitor::new(rpc_config, storage.clone(), Some(settings.monitor))?;
 
@@ -303,21 +294,29 @@ impl BitcoinCoordinator {
         Ok(self.tx_engine.ctx.monitor.get_tx_status(&txid, true)?)
     }
 
-    /// Returns all unacknowledged monitor and coordinator news. Internal
-    /// CPFP/RBF speedup news entries are filtered out.
-    pub fn get_news(&self) -> Result<News, BitcoinCoordinatorError> {
-        let monitor_news = self.tx_engine.ctx.monitor.get_news(None)?;
+    /// Returns unacknowledged monitor and coordinator news. Internal
+    /// CPFP/RBF speedup news entries are filtered out and acknowledged.
+    ///
+    /// * `max_keys` - Limits the monitor news to what is pending about the first `max_keys`
+    ///   transactions and block heights, `None` for all of it. Speedup news counts toward the
+    ///   limit and is acknowledged in the same call, so the next call moves on. Coordinator
+    ///   news is always returned in full.
+    pub fn get_news(&self, max_keys: Option<usize>) -> Result<News, BitcoinCoordinatorError> {
+        let monitor_news = self.tx_engine.ctx.monitor.get_news(max_keys)?;
         let coordinator_news = self.tx_engine.ctx.storage.get_news()?;
 
         // Filter out internal coordinator transactions (CPFP/RBF speedups),
         // since the client's Context does not distinguish speedup variants.
-        let monitor_news: Vec<MonitorNews> = monitor_news
-            .into_iter()
-            .filter(|news| {
-                !news.context.contains(CPFP_TRANSACTION_CONTEXT)
-                    && !news.context.contains(RBF_TRANSACTION_CONTEXT)
-            })
-            .collect();
+        let (speedup_news, monitor_news): (Vec<MonitorNews>, Vec<MonitorNews>) =
+            monitor_news.into_iter().partition(|news| {
+                news.context.contains(CPFP_TRANSACTION_CONTEXT)
+                    || news.context.contains(RBF_TRANSACTION_CONTEXT)
+            });
+
+        // Nothing reads the speedups news, so they are acknowledged here to keep them from piling up.
+        for news in &speedup_news {
+            self.tx_engine.ctx.monitor.ack_news(news)?;
+        }
 
         Ok(News {
             monitor_news,
