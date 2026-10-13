@@ -1,6 +1,6 @@
 use bitcoin::Txid;
 use bitvmx_bitcoin_rpc::types::BlockHeight;
-use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor};
+use bitvmx_transaction_monitor::{monitor::Monitor, types::MonitorTarget};
 use std::cell::Cell;
 use std::rc::Rc;
 use tracing::{debug, error, info, warn};
@@ -83,13 +83,6 @@ impl EngineContext {
     pub fn mark_confirmed(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         self.storage
             .update_tx_state(txid, TransactionState::Confirmed)?;
-        Ok(())
-    }
-
-    /// Tx orphaned. Keep in `InMempool`.
-    pub fn mark_orphan(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
-        self.storage
-            .update_tx_state(txid, TransactionState::InMempool)?;
         Ok(())
     }
 
@@ -184,7 +177,9 @@ impl EngineContext {
         self.storage.update_tx(&updated)?;
 
         self.monitor.monitor(
-            TypesToMonitor::Transactions(vec![txid], tx.context.clone(), tx.confirmation_trigger),
+            &[MonitorTarget::Transaction(txid)],
+            tx.context.clone(),
+            tx.confirmation_trigger,
             true,
         )?;
         info!(
@@ -218,7 +213,9 @@ impl EngineContext {
         self.storage.update_tx(&updated)?;
 
         self.monitor.monitor(
-            TypesToMonitor::Transactions(vec![txid], tx.context.clone(), tx.confirmation_trigger),
+            &[MonitorTarget::Transaction(txid)],
+            tx.context.clone(),
+            tx.confirmation_trigger,
             true,
         )?;
         info!("Transaction({}) already confirmed on-chain", txid);
@@ -240,7 +237,7 @@ impl EngineContext {
         fee_info: FeeInfo,
     ) -> Result<(), BitcoinCoordinatorError> {
         // Step 1. Does the node already have this tx, in the mempool or on chain?
-        match self.monitor.get_tx_confirmations(&txid)? {
+        match self.monitor.rpc_get_tx_confirmations(&txid)? {
             Some(0) => {
                 info!(
                     "Transaction({}) already in node mempool; treating as dispatched: {}",
@@ -480,14 +477,14 @@ impl EngineContext {
     ) -> Result<Option<bool>, BitcoinCoordinatorError> {
         // Funding inputs first, since a gone funding UTXO is recoverable.
         for op in tx.funding_outpoints() {
-            if !self.monitor.is_utxo_unspent_rpc(&op.txid, op.vout, true)? {
+            if self.monitor.rpc_is_utxo_spent(&op.txid, op.vout, true)? {
                 return Ok(Some(true));
             }
         }
 
         // Remaining external or parent inputs, where a gone one is fatal for this tx.
         for op in tx.non_funding_inputs() {
-            if !self.monitor.is_utxo_unspent_rpc(&op.txid, op.vout, true)? {
+            if self.monitor.rpc_is_utxo_spent(&op.txid, op.vout, true)? {
                 return Ok(Some(false));
             }
         }

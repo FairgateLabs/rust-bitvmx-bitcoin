@@ -2,7 +2,7 @@ use std::rc::Rc;
 
 use bitcoin::{OutPoint, Transaction, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
-use bitvmx_transaction_monitor::types::TypesToMonitor;
+use bitvmx_transaction_monitor::types::MonitorTarget;
 use key_manager::key_manager::KeyManager;
 use protocol_builder::{
     builder::ProtocolBuilder,
@@ -61,13 +61,13 @@ impl SpeedupEngine {
     /// Step 2 of `tick`: update each speedup's state from chain. Never dispatches.
     /// Reorg of a Confirmed speedup moves it back to InMempool.
     pub fn review_speedups(&self) -> Result<(), BitcoinCoordinatorError> {
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
         if all_speedups.is_empty() {
             return Ok(());
         }
 
-        let max_confs = self.ctx.monitor.settings.max_monitoring_confirmations;
+        let finality = self.ctx.monitor.finality();
 
         for tx in &all_speedups {
             if !matches!(
@@ -105,11 +105,11 @@ impl SpeedupEngine {
                 // Arm the reorg-flap fail guard.
                 self.ctx
                     .storage
-                    .requeue_not_found(tx.txid, current_height + max_confs)?;
+                    .requeue_not_found(tx.txid, current_height + finality)?;
                 continue;
             }
 
-            if status.is_finalized(max_confs) {
+            if status.is_finalized(finality) {
                 self.ctx.mark_finalized(tx.txid, current_height)?;
                 // If this is an RBF predecessor, remove any replaced-by link.
                 self.remove_replaced_rbf(tx, current_height)?;
@@ -122,11 +122,6 @@ impl SpeedupEngine {
                 self.ctx.mark_confirmed(tx.txid)?;
                 continue;
             }
-
-            if status.is_orphan() {
-                self.ctx.mark_orphan(tx.txid)?;
-                continue;
-            }
         }
 
         Ok(())
@@ -136,7 +131,7 @@ impl SpeedupEngine {
     /// Returns `true` when a dispatched boost (a speedup produced by `boost_if_stale`, not a first CPFP)
     /// settled `Failed` this call, so `boost_if_stale` can skip building another boost in the same tick.
     pub fn dispatch_pending_speedups(&self) -> Result<bool, BitcoinCoordinatorError> {
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
         let pending: Vec<CoordinatedTx> = all_speedups
@@ -200,7 +195,7 @@ impl SpeedupEngine {
             return Ok(());
         }
 
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
         let (
@@ -497,7 +492,7 @@ impl SpeedupEngine {
                     context: Self::ctx_for_kind(&kind).to_string(),
                 })?;
         }
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         self.save_speedup(cpfp_tx, fee_info, kind, current_height)?;
 
         Ok(())
@@ -695,7 +690,9 @@ impl SpeedupEngine {
             ),
         }
         self.ctx.monitor.monitor(
-            TypesToMonitor::Transactions(vec![txid], ctx_str.to_string(), None),
+            &[MonitorTarget::Transaction(txid)],
+            ctx_str.to_string(),
+            None,
             false,
         )?;
         Ok(())
@@ -720,11 +717,9 @@ impl SpeedupEngine {
                             }) => Some(*older),
                             _ => None,
                         });
-                self.ctx.monitor.cancel(TypesToMonitor::Transactions(
-                    vec![current_id],
-                    tx.context.clone(),
-                    None,
-                ))?;
+                self.ctx
+                    .monitor
+                    .cancel(&[MonitorTarget::Transaction(current_id)], &tx.context)?;
                 self.ctx
                     .storage
                     .settle_tx(current_id, TransactionState::Failed, current_height)?;

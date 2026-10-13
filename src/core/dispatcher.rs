@@ -137,7 +137,6 @@ impl Dispatcher {
         tx: &CoordinatedTx,
         monitor: &Monitor,
     ) -> Result<bool, BitcoinCoordinatorError> {
-        let max_confs = monitor.settings.max_monitoring_confirmations;
         for input in &tx.tx.input {
             let parent_txid = input.previous_output.txid;
             if !self.storage.is_tx_known(&parent_txid)? {
@@ -146,8 +145,7 @@ impl Dispatcher {
             let status = monitor
                 .get_tx_status(&parent_txid, true)
                 .map_err(|e| BitcoinCoordinatorError::Internal(e.to_string()))?;
-            let ready =
-                status.is_in_mempool() || status.is_confirmed() || status.is_finalized(max_confs);
+            let ready = status.is_in_mempool() || status.is_confirmed();
             if !ready {
                 return Ok(false);
             }

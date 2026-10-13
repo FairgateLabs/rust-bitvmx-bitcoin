@@ -176,7 +176,7 @@ impl CoordinatorStorage {
     }
 
     /// Re-queue a tx that the chain reported `not_found` back to `ToDispatch`, and arm the reorg-flap
-    /// fail guard. `fail_guard_until` is set to `current_height + max_monitoring_confirmations`.After
+    /// fail guard. `fail_guard_until` is set to `current_height + finality`. After
     /// the window, exactly one chain branch survives, so the verdict is final.
     pub fn requeue_not_found(
         &self,
