@@ -3,7 +3,6 @@ include!("../../src/test_utils/mod.rs");
 use std::collections::HashMap;
 
 pub use bitcoin_coordinator::types;
-use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
 
 use bitcoin::{Address, Amount, CompressedPublicKey, OutPoint};
 use bitcoin_coordinator::{
@@ -739,17 +738,7 @@ pub fn ctx(label: &str) -> String {
 /// Ack every item in `news` so it is not returned again.
 pub fn ack_all_news(coordinator: &BitcoinCoordinator, news: &News) {
     for n in &news.monitor_news {
-        let ack = match n {
-            MonitorNews::Transaction(t) => AckMonitorNews::Transaction(t.tx_id, t.context.clone()),
-            MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
-            MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
-                AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
-            }
-            MonitorNews::OutputPatternTransaction(t, _, ctx) => {
-                AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
-            }
-        };
-        coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
+        coordinator.ack_news(AckNews::Monitor(n.clone())).unwrap();
     }
     for n in &news.coordinator_news {
         coordinator

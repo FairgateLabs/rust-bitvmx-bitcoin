@@ -34,5 +34,6 @@ settings:
     max_tracking_confirmations: 10
   monitor:
         max_monitoring_confirmations: 6
+        finality: 6
         indexer_settings:
-            checkpoint_height: 0
+            retention_depth: 100

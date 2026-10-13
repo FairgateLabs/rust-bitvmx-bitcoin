@@ -11,7 +11,7 @@ use bitcoind::bitcoind::BitcoindFlags;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
-    types::{MonitorNews, TypesToMonitor},
+    types::{MonitorTarget, NewsKind},
 };
 use tracing::info;
 
@@ -58,11 +58,11 @@ fn test_tx_dispatch_to_mempool() {
 
     // `monitor` registers an additional txid for observation without dispatching it. Unnecessary for this test.
     coordinator
-        .monitor(TypesToMonitor::Transactions(
-            vec![txid],
+        .monitor(
+            &[MonitorTarget::Transaction(txid)],
             ctx("extra_monitor"),
             None,
-        ))
+        )
         .unwrap();
 
     // Step 1: tx must be in storage as ToDispatch before any tick.
@@ -97,7 +97,7 @@ fn test_tx_dispatch_to_mempool() {
 /// Full lifecycle: ToDispatch → InMempool → Confirmed → Finalized → Evicted,
 /// with monitor-news assertions at every transition.
 ///
-/// Settings: `max_monitoring_confirmations = 2`, `max_tracking_confirmations = 1`
+/// Settings: `finality = 2`, `max_tracking_confirmations = 1`
 /// so the whole sequence completes in 3 regtest blocks.
 #[test]
 fn test_full_lifecycle() {
@@ -107,6 +107,7 @@ fn test_full_lifecycle() {
     let settings = BitcoinSettings {
         monitor: MonitorSettingsConfig {
             max_monitoring_confirmations: Some(2),
+            finality: Some(2),
             ..Default::default()
         },
         storage: CoordinatorStorageSettings {
@@ -124,7 +125,7 @@ fn test_full_lifecycle() {
     tick_until_ready(&coordinator).unwrap();
 
     coordinator
-        .dispatch_without_speedup(tx, ctx("lifecycle"), None, Some(1), None)
+        .dispatch_without_speedup(tx, ctx("lifecycle"), None, None, None)
         .unwrap();
 
     // ── ToDispatch → InMempool ────────────────────────────────────────────────
@@ -150,7 +151,7 @@ fn test_full_lifecycle() {
     let news = coordinator.get_news().unwrap();
     assert!(
         news.monitor_news.iter().any(|n| {
-            matches!(n, MonitorNews::Transaction(t) if t.tx_id == txid && t.status.is_confirmed())
+            matches!(&n.kind, NewsKind::Transaction { txid: id, status, .. } if *id == txid && status.is_confirmed())
         }),
         "expected Confirmed monitor news for {txid}; got {:?}",
         news.monitor_news
@@ -161,7 +162,7 @@ fn test_full_lifecycle() {
     );
     ack_all_news(&coordinator, &news);
 
-    // ── Confirmed → Finalized (2nd block, max_monitoring_confirmations = 2) ──
+    // ── Confirmed → Finalized (2nd block, finality = 2) ──
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
     let reached = tick_until_state(
         &coordinator,
@@ -215,7 +216,7 @@ fn test_height_delays_dispatch() {
     let txid = tx.compute_txid();
     tick_until_ready(&coordinator).unwrap();
 
-    let current_height = setup.bitcoin_client.get_best_block().unwrap();
+    let current_height = setup.bitcoin_client.get_tip_height().unwrap();
     let target_height = current_height + 4;
     info!(
         "current_height={}, target_height={}",
@@ -465,11 +466,7 @@ fn test_cancel_pending_tx_before_dispatch() {
 
     // Cancel before any dispatch tick.
     coordinator
-        .cancel(TypesToMonitor::Transactions(
-            vec![txid],
-            ctx("cancel_test"),
-            None,
-        ))
+        .cancel(&[MonitorTarget::Transaction(txid)], &ctx("cancel_test"))
         .unwrap();
 
     // Tx must no longer be in storage.
@@ -518,9 +515,9 @@ fn test_get_transaction_old_tx() {
     // Query via coordinator.
     let status = coordinator.get_transaction(funded_txid).unwrap();
     assert!(
-        status.confirmations > 0,
+        status.confirmations() > 0,
         "funded tx must have at least 1 confirmation; got {}",
-        status.confirmations
+        status.confirmations()
     );
 
     drop(coordinator);
@@ -787,11 +784,14 @@ fn test_cancel_dispatched_tx_refused() {
     //   - unknown_txid:   never registered    → refused (not found).
     //   - funding_txid:   funding UTXO, not a tracked tx → refused (not found).
     coordinator
-        .cancel(TypesToMonitor::Transactions(
-            vec![txid, unknown_txid, funding_txid],
-            ctx("cancel_after_dispatch"),
-            None,
-        ))
+        .cancel(
+            &[
+                MonitorTarget::Transaction(txid),
+                MonitorTarget::Transaction(unknown_txid),
+                MonitorTarget::Transaction(funding_txid),
+            ],
+            &ctx("cancel_after_dispatch"),
+        )
         .unwrap();
 
     // The dispatched tx must remain in storage, and the funding UTXO must remain in the funding queue.
@@ -832,7 +832,7 @@ fn test_cancel_dispatched_tx_refused() {
     setup.end_all().unwrap();
 }
 
-/// `cancel` with a non-`Transactions` monitoring entry (here `SpendingUTXOTransaction`)
+/// `cancel` with a non-`Transaction` monitoring target (here `SpendingUtxo`)
 /// must take the pass-through arm: it forwards straight to `monitor.cancel`, touches no
 /// coordinator storage, and emits no `InvalidCancel` news.
 #[test]
@@ -845,11 +845,11 @@ fn test_cancel_passthrough_non_transactions() {
 
     // Register a non-transaction monitoring entry, then cancel it via the same variant.
     let watched = bitcoin::Txid::from_raw_hash(sha256d::Hash::hash(b"watched_utxo_for_cancel"));
-    let entry = TypesToMonitor::SpendingUTXOTransaction(watched, 0, ctx("passthrough"), None);
-    coordinator.monitor(entry.clone()).unwrap();
+    let entry = [MonitorTarget::SpendingUtxo(bitcoin::OutPoint::new(watched, 0))];
+    coordinator.monitor(&entry, ctx("passthrough"), None).unwrap();
 
     // The pass-through arm just forwards to monitor.cancel and returns Ok.
-    coordinator.cancel(entry).unwrap();
+    coordinator.cancel(&entry, &ctx("passthrough")).unwrap();
 
     // No coordinator news (no InvalidCancel): the pass-through arm never classifies or rejects.
     assert!(
@@ -941,11 +941,12 @@ fn test_tx_metadata_persisted() {
     init_trace();
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
-    // max_monitoring_confirmations = 3 so the confirmation_trigger of 2 below is valid
-    // (the monitor requires the trigger to be strictly below the max it tracks).
+    // finality = 2 and max_monitoring_confirmations = 3 so the confirmation_trigger of 2 below is valid
+    // (the monitor requires finality <= trigger <= max_monitoring_confirmations).
     let settings = BitcoinSettings {
         monitor: MonitorSettingsConfig {
             max_monitoring_confirmations: Some(3),
+            finality: Some(2),
             ..Default::default()
         },
         ..Default::default()
@@ -1391,7 +1392,8 @@ fn test_double_reorg_input_consumed() {
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let settings = BitcoinSettings {
         monitor: MonitorSettingsConfig {
-            max_monitoring_confirmations: Some(3), // guard window = 3 blocks
+            max_monitoring_confirmations: Some(3),
+            finality: Some(3), // guard window = 3 blocks
             ..Default::default()
         },
         coordinator: CoordinatorSettings {

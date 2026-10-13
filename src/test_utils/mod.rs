@@ -164,7 +164,7 @@ impl TestBitcoind {
         })
     }
     pub fn create_monitor(&self, storage: Rc<Storage>) -> Monitor {
-        Monitor::new_with_paths(&self.rpc_config, storage, None).unwrap()
+        Monitor::new(&self.rpc_config, storage, None).unwrap()
     }
     fn default_rpc_config() -> RpcConfig {
         RpcConfig::new(

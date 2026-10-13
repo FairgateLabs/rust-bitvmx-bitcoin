@@ -19,7 +19,7 @@ use bitcoin_coordinator::{
 use bitcoincore_rpc::RpcApi as _;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::config::MonitorSettingsConfig;
-use bitvmx_transaction_monitor::types::TypesToMonitor;
+use bitvmx_transaction_monitor::types::MonitorTarget;
 
 // =============================================================================
 // Helpers
@@ -28,7 +28,8 @@ use bitvmx_transaction_monitor::types::TypesToMonitor;
 fn cpfp_settings() -> BitcoinSettings {
     BitcoinSettings {
         monitor: MonitorSettingsConfig {
-            max_monitoring_confirmations: Some(2), // 2 confirmations to finalize
+            max_monitoring_confirmations: Some(2),
+            finality: Some(2), // 2 confirmations to finalize
             ..Default::default()
         },
         storage: CoordinatorStorageSettings {
@@ -891,7 +892,7 @@ fn test_cpfp_reorg() {
     let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
 
     // Record current height; the next mine will produce height + 1.
-    let height_before = setup.bitcoin_client.get_best_block().unwrap() as u64;
+    let height_before = setup.bitcoin_client.get_tip_height().unwrap() as u64;
 
     // Mine 1 block → both Confirmed.
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
@@ -2829,11 +2830,7 @@ fn test_cancel_parent_edge_cases() {
         .unwrap();
 
     coordinator
-        .cancel(TypesToMonitor::Transactions(
-            vec![parent_a_txid],
-            ctx("cancel_a"),
-            None,
-        ))
+        .cancel(&[MonitorTarget::Transaction(parent_a_txid)], &ctx("cancel_a"))
         .unwrap();
     assert!(
         coord_storage.get_tx_by_id(parent_a_txid).unwrap().is_none(),
@@ -2884,11 +2881,7 @@ fn test_cancel_parent_edge_cases() {
 
     // Cancel attempt is refused; news emitted; tx record stays put.
     coordinator
-        .cancel(TypesToMonitor::Transactions(
-            vec![parent_b_txid],
-            ctx("cancel_b"),
-            None,
-        ))
+        .cancel(&[MonitorTarget::Transaction(parent_b_txid)], &ctx("cancel_b"))
         .unwrap();
     assert!(
         coord_storage.get_tx_by_id(parent_b_txid).unwrap().is_some(),
@@ -3214,6 +3207,7 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
     // Guard window of 3 blocks gives slack to place p2's window a couple blocks behind p1's.
     let mut settings = rebuild_settings(5);
     settings.monitor.max_monitoring_confirmations = Some(3);
+    settings.monitor.finality = Some(3);
     let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings.clone());
     let coord_storage = get_coord_storage(&setup);
 
