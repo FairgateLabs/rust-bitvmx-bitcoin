@@ -30,7 +30,7 @@ introduce breaking changes without preserving backward compatibility.
   for parent/child pairs sent in the same tick.
 - 🕵️ **Transaction Monitoring**: Tracks the full lifecycle of each registered
   transaction (`ToDispatch` → `InMempool` → `Confirmed` → `Finalized`), including
-  reorg detection, orphan handling, and stuck-in-mempool detection.
+  reorg detection and stuck-in-mempool detection.
 - 🚀 **Automatic Speedups**: Builds and dispatches CPFP or RBF transactions
   automatically when parents linger in the mempool, escalating fees on each
   attempt.
@@ -81,8 +81,14 @@ behind the build/dispatch split.
 > ⚠️ **`add_funding` UTXOs must be effectively final.** Only pass UTXOs whose funding transaction is
 > deep enough on-chain that you accept it as `Finalized` (i.e., no longer reorgable in practice).
 
-> ⚠️ **Reorgs deeper than `max_monitoring_confirmations` are assumed impossible.** A `Finalized` tx is
-> treated as permanent; a reorg past the finality threshold is out of scope and not detected.
+> ⚠️ **Reorgs deeper than the monitor's `finality` are assumed impossible.** A tx is `Finalized` at
+> `finality` confirmations and treated as permanent; a reorg past it is out of scope and not detected.
+
+> ⚠️ **Tick once before any other call.** The coordinator's height is the monitor's indexed height,
+> which is unknown until the first `tick()`. A `dispatch*` call before it returns an error.
+
+> ⚠️ **`confirmation_trigger` must be within `finality..=max_monitoring_confirmations`, or `None`.**
+> Out of range, the `dispatch*` call returns an error and nothing is stored.
 
 > ⚠️ **External (non-coordinator-tracked) parents must already be confirmed.**
 > The dispatcher only gates on tracked parents; untracked ones are assumed on-chain.
@@ -111,13 +117,13 @@ The `BitcoinCoordinator` struct exposes the following methods:
 | `dispatch` | Dispatch a tx with optional speedup support. |
 | `dispatch_without_speedup` | Dispatch a plain tx with optional stuck-in-mempool detection. |
 | `dispatch_with_speedup` | Dispatch a tx and enable CPFP/RBF speedups. |
-| `cancel` | Cancel monitoring + storage for txs still in `ToDispatch` (refused once dispatched). |
+| `cancel` | Takes monitoring targets and their context. Transaction targets: cancel monitoring + storage for txs still in `ToDispatch` (refused once dispatched). Other targets are forwarded to the monitor. |
 | `add_funding` | Register a funding UTXO available for future speedups. |
 | `get_transaction` | Query the on-chain / mempool status of a tx. |
 | `get_block` | Fetch a block by height and hash. `None` when the block is above the indexed height or was replaced by a reorg. |
 | `get_news` | Retrieve unacknowledged monitor and coordinator news. `max_keys` limits the monitor news to the first `max_keys` transactions and block heights (`None` for all). |
 | `ack_news` | Acknowledge a news item so it is not returned again. |
-| `monitor` | Register data to be monitored without scheduling a dispatch. |
+| `monitor` | Register monitoring targets under a context, with an optional confirmation trigger, without scheduling a dispatch. |
 
 ## Usage Example
 
@@ -125,8 +131,8 @@ The `BitcoinCoordinator` struct exposes the following methods:
 use bitcoin_coordinator::{
     coordinator::BitcoinCoordinator,
     types::AckNews,
+    MonitorTarget, TransactionStatus,
 };
-use bitvmx_transaction_monitor::types::{AckMonitorNews, TypesToMonitor};
 use protocol_builder::types::{output::SpeedupData, Utxo};
 
 // Construct the coordinator.
@@ -147,11 +153,11 @@ if !coordinator.is_ready()? {
 
 // Track an external transaction without dispatching it.
 let ctx = "ctx".to_string();
-coordinator.monitor(TypesToMonitor::Transactions(
-    vec![external_txid],
+coordinator.monitor(
+    &[MonitorTarget::Transaction(external_txid)],
     ctx.clone(),
-    None,
-))?;
+    None, // confirmation_trigger
+)?;
 
 // Dispatch a transaction with CPFP support enabled.
 let speedup_data = SpeedupData::new(speedup_utxo);
@@ -177,13 +183,20 @@ coordinator.add_funding(Utxo::new(txid, vout, amount.to_sat(), &pubkey))?;
 
 // Pull and acknowledge news.
 let news = coordinator.get_news(None)?;
-for item in news.monitor_news.iter() {
+for item in news.monitor_news {
     // ... handle item ...
+    coordinator.ack_news(AckNews::Monitor(item))?;
 }
-coordinator.ack_news(AckNews::Monitor(AckMonitorNews::Transaction(some_txid)))?;
+for item in news.coordinator_news {
+    // ... handle item ...
+    coordinator.ack_news(AckNews::Coordinator(item))?;
+}
 
-// Query the current status of any tx.
+// Query the current status of any tx, and the block it was confirmed in.
 let status = coordinator.get_transaction(some_txid)?;
+if let TransactionStatus::Confirmed { block_height, block_hash, .. } = &status {
+    let block = coordinator.get_block(*block_height, block_hash)?;
+}
 ```
 
 ## Configuration
@@ -209,7 +222,8 @@ The main groups are:
   percentage.
 - `funding`: minimum sat amount required for a funding UTXO.
 - `storage`: how long settled txs are tracked before eviction.
-- `monitor`: max confirmations to track and indexer settings (forwarded to
+- `monitor`: `finality` (the `Finalized` depth and the fail-guard window), max
+  confirmations to track, and indexer settings (forwarded to
   `bitvmx-transaction-monitor`).
 
 The full settings table and the behavior each field drives are in

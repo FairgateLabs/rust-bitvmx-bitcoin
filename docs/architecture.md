@@ -95,7 +95,7 @@ stateDiagram-v2
 | `ToDispatch` | Registered, not yet broadcast (or re-queued for re-broadcast). |
 | `InMempool` | Accepted by the node, waiting to be mined. |
 | `Confirmed` | Mined, below the finality threshold. |
-| `Finalized` | Reached `max_monitoring_confirmations`. Treated as permanent. |
+| `Finalized` | Reached the monitor's `finality` confirmations. Treated as permanent. |
 | `Failed` | Terminal failure. Settled by classification or RBF cleanup. |
 
 `Finalized` and `Failed` are terminal for processing; records sit there until
@@ -109,6 +109,10 @@ caught up with the chain (`is_ready()` is false). Once ready, it cleans up
 acknowledged news and runs six steps in a fixed order. Review steps never
 broadcast; dispatch steps never decide finality. The order is load-bearing and
 is explained in [design.md](design.md).
+
+The coordinator's clock is the monitor's indexed height. It is unknown until the
+first `tick()`, so the coordinator must tick once before any other API call (a
+`dispatch*` call before that returns an error).
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'step'}}}%%
@@ -126,7 +130,7 @@ flowchart LR
 
 | Step | Method | What it does | Dispatches? |
 |---|---|---|---|
-| 1 | `review_active` | Reads chain status of in-flight `Normal` / `NeedsSpeedup` txs. Applies reorg, finalize, confirm, orphan, and not_found transitions. | No |
+| 1 | `review_active` | Reads chain status of in-flight `Normal` / `NeedsSpeedup` txs. Applies reorg, finalize, confirm, and not_found transitions. | No |
 | 2 | `review_speedups` | Same review for speedups. Re-queues evicted speedups, settles replaced RBF chains. | No |
 | 3 | `dispatch_pending` | Broadcasts `ToDispatch` non-speedups whose `target_block_height` is reached. | Yes |
 | 4 | `dispatch_pending_speedups` | Broadcasts `ToDispatch` speedups built in a prior tick or re-queued in step 2. | Yes |
@@ -228,7 +232,8 @@ defaults in `src/config/settings.rs`. The groups that shape behavior:
 | `speedup` | `bump_fee_percentage` | Fee escalation factor applied on each boost/RBF. |
 | `funding` | `min_funding_amount_sats` | Minimum accepted funding UTXO size. |
 | `storage` | `max_tracking_confirmations` | Blocks a settled record is kept before eviction. |
-| `monitor` | `max_monitoring_confirmations` | Confirmations to reach `Finalized`. Also the fail-guard window. |
+| `monitor` | `finality` | Confirmations to reach `Finalized`. Also the fail-guard window. The lowest valid `confirmation_trigger`. |
+| `monitor` | `max_monitoring_confirmations` | The highest valid `confirmation_trigger`. Must be at least `finality`. |
 
 Settings must not change across a restart on the same storage. Several
 invariants assume the configuration that produced the persisted state is the one

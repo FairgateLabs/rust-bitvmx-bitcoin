@@ -15,7 +15,7 @@ is not guaranteed.
 | A single coordinator instance runs against the storage. | State (slot accounting, funding chain, fee-rate state) assumes one writer. |
 | The node runs with `-txindex=1`. | Classification reads live node state for any txid, even when its outputs are already spent. Not checked by the coordinator: construction makes no node call, so the operator must ensure it. |
 | The operator does not spend a registered funding UTXO or a registered parent out of band. | The coordinator owns those outputs and is the only intended spender. |
-| Reorgs deeper than `max_monitoring_confirmations` do not happen. | A `Finalized` transaction is treated as permanent and is never re-examined. |
+| Reorgs deeper than the monitor's `finality` do not happen. | A `Finalized` transaction is treated as permanent and is never re-examined. |
 | Registered settings do not change across a restart on the same storage. | Persisted state assumes the configuration that produced it. |
 
 ## Invariants
@@ -85,7 +85,7 @@ is not acted on immediately.
 
 - When review finds an already-broadcast transaction `not_found` (gone from both
   chain and mempool), it re-queues the transaction `ToDispatch` and arms
-  `fail_guard_until = current_height + max_monitoring_confirmations`. The anchor
+  `fail_guard_until = current_height + finality`. The anchor
   is set once, at the first `not_found`.
 - While the chain height is below `fail_guard_until`, an input-consumed verdict is
   deferred: the transaction stays `ToDispatch` and is re-dispatched, paced by the
@@ -94,17 +94,16 @@ is not acted on immediately.
 - Recovery is the re-dispatch itself: once the input frees, the next broadcast is
   accepted and the guard is disarmed.
 
-The guard is block-paced and bounded. Within `max_monitoring_confirmations`
+The guard is block-paced and bounded. Within `finality`
 blocks exactly one competing branch survives, so the transaction is either back or
 genuinely gone; the window cannot be extended.
 
-## Reorgs and orphans
+## Reorgs
 
 | Event | Handling |
 |---|---|
 | A `Confirmed` transaction reappears in the mempool. | Reset to `InMempool` and refresh the broadcast height. |
-| The block of a transaction is orphaned. | Keep the transaction `InMempool`. |
-| A deep reorg evicts both blocks and mempool. | Caught by the not_found path; the same txid is re-dispatched. |
+| A reorg removes a transaction from both chain and mempool. | Caught by the not_found path; the same txid is re-dispatched. |
 
 ## Retry budget
 
@@ -138,7 +137,7 @@ still in `ToDispatch`.
 | `Normal` or `NeedsSpeedup` in `ToDispatch` | Cancelled: removed from storage, monitoring, and the pending-speedup set. |
 | Already dispatched (`InMempool` / `Confirmed` / `Finalized` / `Failed`) | Refused with `InvalidCancel`. |
 | `Speedup` kind, or an unknown txid (a funding UTXO is not a tracked tx, so it is refused as not found) | Refused with `InvalidCancel`. |
-| A non-`Transactions` monitoring entry | Passed straight through to the monitor. |
+| A non-`Transaction` monitoring target (`SpendingUtxo`, `OutputPattern`, `NewBlock`) | Passed straight through to the monitor under the given context. |
 
 ## News rules
 
@@ -155,6 +154,8 @@ still in `ToDispatch`.
 | Register transaction B only after transaction A it depends on is `Finalized`. | An in-flight A can disappear and be re-dispatched; the coordinator preserves no ordering between independently registered transactions. |
 | External (untracked) parents must already be confirmed. | The dispatcher gates only on tracked parents; an untracked, unconfirmed parent makes the node reject the child. |
 | Acknowledge news only after acting on it. | Acking is the only way to clear an item. Act first or drop an unprocessed event. |
+| Tick once before any other API call. | The coordinator's clock is the monitor's indexed height, unknown until the first tick; a `dispatch*` call before it returns an error. |
+| Pass a `confirmation_trigger` within `finality..=max_monitoring_confirmations`, or `None`. | Out of range, the `dispatch*` call returns an error and nothing is stored. |
 
 ## Glossary
 
