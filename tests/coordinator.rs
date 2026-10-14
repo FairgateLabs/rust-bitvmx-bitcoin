@@ -389,7 +389,11 @@ fn test_add_funding_validation() {
     let first_utxo = utxo(20_000);
     coordinator.add_funding(first_utxo.clone()).unwrap();
     assert!(
-        coordinator.get_news(None).unwrap().coordinator_news.is_empty(),
+        coordinator
+            .get_news(None)
+            .unwrap()
+            .coordinator_news
+            .is_empty(),
         "no news must fire when a valid funding UTXO is added"
     );
 
@@ -419,7 +423,11 @@ fn test_add_funding_validation() {
     let third_utxo = utxo(50_000);
     coordinator.add_funding(third_utxo.clone()).unwrap();
     assert!(
-        coordinator.get_news(None).unwrap().coordinator_news.is_empty(),
+        coordinator
+            .get_news(None)
+            .unwrap()
+            .coordinator_news
+            .is_empty(),
         "no news must fire when a valid funding UTXO is added, even after a previous invalid one"
     );
 
@@ -864,21 +872,33 @@ fn test_cancel_passthrough_non_transactions() {
 
     // Register a non-transaction monitoring entry, then cancel it via the same variant.
     let watched = bitcoin::Txid::from_raw_hash(sha256d::Hash::hash(b"watched_utxo_for_cancel"));
-    let entry = [MonitorTarget::SpendingUtxo(bitcoin::OutPoint::new(watched, 0))];
-    coordinator.monitor(&entry, ctx("passthrough"), None).unwrap();
+    let entry = [MonitorTarget::SpendingUtxo(bitcoin::OutPoint::new(
+        watched, 0,
+    ))];
+    coordinator
+        .monitor(&entry, ctx("passthrough"), None)
+        .unwrap();
 
     // The pass-through arm just forwards to monitor.cancel and returns Ok.
     coordinator.cancel(&entry, &ctx("passthrough")).unwrap();
 
     // No coordinator news (no InvalidCancel): the pass-through arm never classifies or rejects.
     assert!(
-        coordinator.get_news(None).unwrap().coordinator_news.is_empty(),
+        coordinator
+            .get_news(None)
+            .unwrap()
+            .coordinator_news
+            .is_empty(),
         "pass-through cancel must not emit any coordinator news"
     );
 
     // A second tick must stay clean; cancelling an unknown spending-UTXO entry is a no-op.
     coordinator.tick().unwrap();
-    assert!(coordinator.get_news(None).unwrap().coordinator_news.is_empty());
+    assert!(coordinator
+        .get_news(None)
+        .unwrap()
+        .coordinator_news
+        .is_empty());
 
     drop(coordinator);
     setup.end_all().unwrap();
@@ -1288,7 +1308,11 @@ fn test_retry_dispatches_after_rate_limit() {
         "tx_subject must be InMempool after the retry interval has elapsed"
     );
 
-    assert!(coordinator.get_news(None).unwrap().coordinator_news.is_empty());
+    assert!(coordinator
+        .get_news(None)
+        .unwrap()
+        .coordinator_news
+        .is_empty());
 
     drop(coordinator);
     drop(coord_storage);
@@ -1363,7 +1387,11 @@ fn test_retry_failure() {
     );
     assert_eq!(stored.state, TransactionState::ToDispatch);
     assert!(
-        coordinator.get_news(None).unwrap().coordinator_news.is_empty(),
+        coordinator
+            .get_news(None)
+            .unwrap()
+            .coordinator_news
+            .is_empty(),
         "No news should be generated while rate-limited"
     );
 

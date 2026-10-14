@@ -1630,8 +1630,9 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
         .get_news(None)
         .unwrap();
     assert!(
-        !pending.iter().any(|n| n.context == CPFP_TRANSACTION_CONTEXT
-            || n.context == RBF_TRANSACTION_CONTEXT),
+        !pending
+            .iter()
+            .any(|n| n.context == CPFP_TRANSACTION_CONTEXT || n.context == RBF_TRANSACTION_CONTEXT),
         "speedup monitor news must be acknowledged by get_news; got {:?}",
         pending
     );
@@ -2871,7 +2872,10 @@ fn test_cancel_parent_edge_cases() {
         .unwrap();
 
     coordinator
-        .cancel(&[MonitorTarget::Transaction(parent_a_txid)], &ctx("cancel_a"))
+        .cancel(
+            &[MonitorTarget::Transaction(parent_a_txid)],
+            &ctx("cancel_a"),
+        )
         .unwrap();
     assert!(
         coord_storage.get_tx_by_id(parent_a_txid).unwrap().is_none(),
@@ -2922,7 +2926,10 @@ fn test_cancel_parent_edge_cases() {
 
     // Cancel attempt is refused; news emitted; tx record stays put.
     coordinator
-        .cancel(&[MonitorTarget::Transaction(parent_b_txid)], &ctx("cancel_b"))
+        .cancel(
+            &[MonitorTarget::Transaction(parent_b_txid)],
+            &ctx("cancel_b"),
+        )
         .unwrap();
     assert!(
         coord_storage.get_tx_by_id(parent_b_txid).unwrap().is_some(),
