@@ -73,7 +73,7 @@ The `BitcoinCoordinator` struct exposes the following methods:
 | `dispatch_with_speedup` | Dispatch a tx and enable CPFP/RBF speedups. |
 | `cancel` | Takes monitoring targets and their context. Transaction targets: cancel monitoring + storage for txs still in `ToDispatch` and never broadcast (refused once broadcast). Unknown txids and other targets are forwarded to the monitor. |
 | `add_funding` | Register a funding UTXO available for future speedups. |
-| `get_transaction` | Query the on-chain / mempool status of a tx. |
+| `get_transaction` | Query the on-chain / mempool status of a tx. `InMempool` is only reported for txs the coordinator dispatched. |
 | `get_block` | Fetch a block by height and hash. `None` when the block is above the indexed height or was replaced by a reorg. |
 | `get_news` | Retrieve unacknowledged monitor and coordinator news. `max_keys` limits the monitor news to the first `max_keys` transactions and block heights (`None` for all). |
 | `ack_news` | Acknowledge a news item so it is not returned again. |

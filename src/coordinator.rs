@@ -286,7 +286,8 @@ impl BitcoinCoordinator {
     }
 
     /// Queries the current blockchain status of a transaction via the monitor.
-    /// The mempool is also searched.
+    /// `InMempool` is only reported for txs the coordinator dispatched; any other
+    ///  tx in the mempool reads as not found.
     ///
     /// * `txid` - Transaction to look up.
     pub fn get_transaction(

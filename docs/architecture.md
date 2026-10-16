@@ -116,7 +116,7 @@ flowchart LR
 | 5 | `boost_if_stale` | If the live speedup tip is stale, builds one boost (CPFP or RBF) and saves it `ToDispatch`. | No (saves only) |
 | 6 | `create_cpfp_batch` | Builds one CPFP covering pending `NeedsSpeedup` parents and saves it `ToDispatch`. | No (saves only) |
 
-Steps 3 and 4 are ordered parent-before-child: a re-dispatched parent is back in the node mempool before its CPFP is re-broadcast in the same tick. Steps 5 and 6 only build and save; the broadcast happens on the next tick.
+Steps 3 and 4 are ordered parent-before-child: a re-dispatched parent is sent before its CPFP, and the CPFP follows on the next tick, once the mempool snapshot shows the parent. Steps 5 and 6 only build and save; the broadcast happens on the next tick.
 
 ## Dispatch classification
 

@@ -39,7 +39,7 @@ The six tick steps run in a fixed order, and the order carries meaning.
 | Rule | Reason |
 |---|---|
 | Review steps (1, 2) never broadcast. | A tick first reads a consistent chain view, then acts on it. |
-| Non-speedups dispatch (3) before speedups (4). | A re-dispatched parent is back in the node mempool before its CPFP is re-broadcast in the same tick. |
+| Non-speedups dispatch (3) before speedups (4). | A re-dispatched parent is sent before its CPFP. The CPFP follows on the next tick, once the mempool snapshot shows the parent. |
 | Build/save steps (5, 6) run last and only save. | The broadcast is deferred to the next tick, which is what makes I1 hold. |
 | Decisions are made only when `is_ready()` is true. | The monitor advances at most one block per tick; acting only when synced means every classification reads the real chain tip, not a lagging view. |
 
