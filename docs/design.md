@@ -86,6 +86,8 @@ Transient failures are retried on two independent limits:
 | `retry_attempts_sending_tx` | Count | How many transient failures before settling `Failed`. |
 | `retry_interval_seconds` | Wall clock | Minimum gap between retry batches, shared across both engines. |
 
+The interval is shared so the two engines together never retry against the node more often than once per interval. The transaction engine runs first in the tick, so when both engines have retries pending, the regular transactions take the open slot and the speedup retries wait for a later interval. A held retry keeps its budget, and a speedup that was never sent is not held.
+
 The fail guard is separate from this budget: it is block-paced, so a guarded transaction can outlive the retry budget without being failed.
 
 ## Funding rules
