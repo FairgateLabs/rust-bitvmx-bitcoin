@@ -172,16 +172,17 @@ impl SpeedupEngine {
         }
 
         // We only report a boost that actually settled `Failed`.
-        let boost_failed = boost_txids.iter().any(|id| {
-            self.ctx
+        for id in &boost_txids {
+            if self
+                .ctx
                 .storage
-                .get_tx_by_id(*id)
-                .ok()
-                .flatten()
-                .map(|t| t.state == TransactionState::Failed)
-                .unwrap_or(false)
-        });
-        Ok(boost_failed)
+                .get_tx_by_id(*id)?
+                .is_some_and(|t| t.state == TransactionState::Failed)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Step 5 of `tick`: if the latest live speedup is stale, build a boost (new CPFP when its package fits

@@ -59,6 +59,8 @@ See [`docs/architecture.md`](docs/architecture.md) for the full tick pipeline an
 
 > ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in `ToDispatch` and never broadcast are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` / `Finalized` / `Failed`, or back in `ToDispatch` after a broadcast), or if the txid is internal (Speedup) or a funding UTXO, the request is refused and a news item is emitted. A txid the coordinator does not know under the given context (for example one registered only through `monitor`, or one it tracks under another context) is passed to the monitor's cancel, and the coordinator's own record is left untouched.
 
+> ⚠️ **A txid can be registered only once while it is live.** A `dispatch*` call for a txid the coordinator still stores is discarded with a warning log, except when that tx settled `Failed`: then it is registered again from scratch (state `ToDispatch`, full retry budget).
+
 > ⚠️ **Ack news only AFTER acting on it.** News is deduplicated by value. Acking early means a second occurrence of the same event within the same block will NOT re-fire.
 
 The `BitcoinCoordinator` struct exposes the following methods:

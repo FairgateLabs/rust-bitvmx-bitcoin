@@ -1448,7 +1448,7 @@ fn test_retry_failure() {
     let tx = create_zero_fee_tx(&setup.bitcoin_client).unwrap();
     let txid = tx.compute_txid();
     coordinator
-        .dispatch_without_speedup(tx, ctx("retry_inc"), None, None, None)
+        .dispatch_without_speedup(tx.clone(), ctx("retry_inc"), None, None, None)
         .unwrap();
 
     let coord_storage = get_coord_storage(&setup);
@@ -1509,6 +1509,17 @@ fn test_retry_failure() {
             .any(|n| matches!(n, CoordinatorNews::DispatchError { txid: id, .. } if *id == txid)),
         "DispatchError news must be present after retry exhaustion; got {:?}",
         news.coordinator_news
+    );
+
+    // Dispatching the Failed tx again registers it from scratch.
+    coordinator
+        .dispatch_without_speedup(tx, ctx("retry_inc"), None, None, None)
+        .unwrap();
+    let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(
+        (stored.state, stored.retry_count),
+        (TransactionState::ToDispatch, 0),
+        "a re-dispatched Failed tx must be registered again with a full retry budget"
     );
 
     drop(coordinator);

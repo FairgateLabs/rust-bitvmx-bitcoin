@@ -325,8 +325,7 @@ impl BitcoinCoordinator {
         // since the client's Context does not distinguish speedup variants.
         let (speedup_news, monitor_news): (Vec<MonitorNews>, Vec<MonitorNews>) =
             monitor_news.into_iter().partition(|news| {
-                news.context.contains(CPFP_TRANSACTION_CONTEXT)
-                    || news.context.contains(RBF_TRANSACTION_CONTEXT)
+                news.context == CPFP_TRANSACTION_CONTEXT || news.context == RBF_TRANSACTION_CONTEXT
             });
 
         // Nothing reads the speedups news, so they are acknowledged here to keep them from piling up.
@@ -392,13 +391,19 @@ impl BitcoinCoordinator {
     ) -> Result<(), BitcoinCoordinatorError> {
         let txid = tx.compute_txid();
 
-        // Check if the txid is already registered before doing any work.
+        // Check if the txid is already registered before doing any work. A client tx that settled Failed is registered
+        // again from scratch: the new record below replaces the old one. Any other stored record discards the request.
         if let Some(tx) = self.tx_engine.ctx.storage.get_tx_by_id(txid)? {
-            warn!(
-                "Transaction({}) is already registered, skipping. Transaction info: {:?}",
-                txid, tx
-            );
-            return Ok(());
+            let client_kind = matches!(tx.kind, TxKind::Normal | TxKind::NeedsSpeedup(_));
+            if tx.state == TransactionState::Failed && client_kind {
+                info!("Transaction({}) was Failed; registering it again", txid);
+            } else {
+                warn!(
+                    "Transaction({}) is already registered (state={:?}); dispatch request discarded. Transaction info: {:?}",
+                    txid, tx.state, tx
+                );
+                return Ok(());
+            }
         }
 
         let current_height = self.tx_engine.ctx.monitor.get_indexed_height()?;

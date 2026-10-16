@@ -85,7 +85,7 @@ stateDiagram-v2
 | `Finalized` | Reached the monitor's `finality` confirmations. Treated as permanent. |
 | `Failed` | Terminal failure. Settled by classification or RBF cleanup. |
 
-`Finalized` and `Failed` are terminal for processing; records sit there until `max_tracking_confirmations` blocks pass, then storage evicts them and emits `TransactionEvicted`.
+`Finalized` and `Failed` are terminal for processing; records sit there until `max_tracking_confirmations` blocks pass, then storage evicts them and emits `TransactionEvicted`. A client `Failed` tx dispatched again is registered from scratch, replacing its old record.
 
 ## The tick pipeline
 
