@@ -238,9 +238,10 @@ impl BitcoinCoordinator {
     ///
     /// Only client-registered txs (`Normal` / `NeedsSpeedup`) still in `ToDispatch` state and never broadcast are
     /// cancellable. A tx re-queued to `ToDispatch` after a broadcast is refused, because it may still be mined.
-    /// Already-dispatched, Speedup-kind, fundings or missing txids are refused and a news item is
-    /// emitted per rejected txid. Other targets (`SpendingUtxo`, `OutputPattern`, `NewBlock`) pass through to
-    /// monitor cancellation as-is.
+    /// Already-dispatched, Speedup-kind or funding txids are refused and a news item is
+    /// emitted per rejected txid. A txid the coordinator does not know (for example one registered only through
+    /// `monitor`) and other targets (`SpendingUtxo`, `OutputPattern`, `NewBlock`) pass through to monitor
+    /// cancellation as-is.
     ///
     /// * `targets` - Monitoring targets to cancel.
     /// * `context` - The context the targets were registered with.
@@ -441,16 +442,29 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
-    /// Classify each txid, emit `InvalidCancel` news for rejected ones, then drop
-    /// PSP entries + cancel monitoring + remove storage for the eligible set.
+    /// Classify each txid, emit `InvalidCancel` news for rejected ones, forward the untracked ones to the monitor,
+    /// then drop PSP entries + cancel monitoring + remove storage for the eligible set.
     fn cancel_transactions(
         &self,
         txids: Vec<Txid>,
         context: &str,
     ) -> Result<(), BitcoinCoordinatorError> {
         let mut eligible: Vec<Txid> = Vec::new();
+        let mut untracked: Vec<MonitorTarget> = Vec::new();
         for txid in &txids {
-            match self.classify_cancel_request(*txid)? {
+            let verdict = match self.tx_engine.ctx.storage.get_tx_by_id(*txid)? {
+                Some(tx) => Self::classify_cancel_request(&tx),
+                None if self.tx_engine.ctx.funding_manager.is_funding_tx(*txid)? => {
+                    Err("txid is a funding UTXO, not a tracked tx".to_string())
+                }
+                None => {
+                    // Not known to the coordinator, for example a tx registered only through `monitor()`, so only
+                    // the monitor can hold a subscription for it. Cancelling a target nothing watches is a no-op.
+                    untracked.push(MonitorTarget::Transaction(*txid));
+                    continue;
+                }
+            };
+            match verdict {
                 Ok(()) => eligible.push(*txid),
                 Err(reason) => {
                     warn!(%txid, %reason, "cancel refused");
@@ -463,6 +477,11 @@ impl BitcoinCoordinator {
                         })?;
                 }
             }
+        }
+
+        if !untracked.is_empty() {
+            self.tx_engine.ctx.monitor.cancel(&untracked, context)?;
+            info!("Cancelled monitoring for untracked {:?}", untracked);
         }
 
         if eligible.is_empty() {
@@ -488,35 +507,29 @@ impl BitcoinCoordinator {
         Ok(())
     }
 
-    /// `Ok(Ok(()))` when the txid is eligible for cancel; `Ok(Err(reason))` when
-    /// rejected, with the reason string the operator will see in the news.
-    fn classify_cancel_request(
-        &self,
-        txid: Txid,
-    ) -> Result<Result<(), String>, BitcoinCoordinatorError> {
-        let Some(tx) = self.tx_engine.ctx.storage.get_tx_by_id(txid)? else {
-            return Ok(Err("tx not found in coordinator storage".to_string()));
-        };
+    /// `Ok(())` when the stored tx is eligible for cancel; `Err(reason)` when rejected, with the reason string the
+    /// operator will see in the news.
+    fn classify_cancel_request(tx: &CoordinatedTx) -> Result<(), String> {
         if !matches!(tx.kind, TxKind::Normal | TxKind::NeedsSpeedup(_)) {
-            return Ok(Err(format!(
+            return Err(format!(
                 "tx kind {:?} is not cancellable (only Normal / NeedsSpeedup)",
                 tx.kind
-            )));
+            ));
         }
         if tx.state != TransactionState::ToDispatch {
-            return Ok(Err(format!(
+            return Err(format!(
                 "tx already dispatched (state={:?}); cancel is only valid in ToDispatch",
                 tx.state
-            )));
+            ));
         }
         // A tx re-queued to ToDispatch after a broadcast (not found, or deferred by the fail guard) may still be mined,
         // so it counts as dispatched: a broadcast cannot be undone.
         if let Some(height) = tx.broadcast_block_height {
-            return Ok(Err(format!(
+            return Err(format!(
                 "tx already broadcast at height {}; cancel is only valid before the first broadcast",
                 height
-            )));
+            ));
         }
-        Ok(Ok(()))
+        Ok(())
     }
 }

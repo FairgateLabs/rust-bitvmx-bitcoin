@@ -57,7 +57,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full tick pipeline an
 
 > 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold. To unblock: dispatch a CPFP spending one of its outputs via `dispatch_without_speedup`. The coordinator tracks both and mines them together.
 
-> ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in `ToDispatch` and never broadcast are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` / `Finalized` / `Failed`, or back in `ToDispatch` after a broadcast), or if the txid is internal (Speedup) or not a tracked tx (a funding UTXO, or an unknown txid), the request is refused and a news item is emitted.
+> ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in `ToDispatch` and never broadcast are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` / `Finalized` / `Failed`, or back in `ToDispatch` after a broadcast), or if the txid is internal (Speedup) or a funding UTXO, the request is refused and a news item is emitted. A txid the coordinator does not know (for example one registered only through `monitor`) is passed to the monitor's cancel.
 
 > ⚠️ **Ack news only AFTER acting on it.** News is deduplicated by value. Acking early means a second occurrence of the same event within the same block will NOT re-fire.
 
@@ -71,7 +71,7 @@ The `BitcoinCoordinator` struct exposes the following methods:
 | `dispatch` | Dispatch a tx with optional speedup support. |
 | `dispatch_without_speedup` | Dispatch a plain tx with optional stuck-in-mempool detection. |
 | `dispatch_with_speedup` | Dispatch a tx and enable CPFP/RBF speedups. |
-| `cancel` | Takes monitoring targets and their context. Transaction targets: cancel monitoring + storage for txs still in `ToDispatch` and never broadcast (refused once broadcast). Other targets are forwarded to the monitor. |
+| `cancel` | Takes monitoring targets and their context. Transaction targets: cancel monitoring + storage for txs still in `ToDispatch` and never broadcast (refused once broadcast). Unknown txids and other targets are forwarded to the monitor. |
 | `add_funding` | Register a funding UTXO available for future speedups. |
 | `get_transaction` | Query the on-chain / mempool status of a tx. |
 | `get_block` | Fetch a block by height and hash. `None` when the block is above the indexed height or was replaced by a reorg. |

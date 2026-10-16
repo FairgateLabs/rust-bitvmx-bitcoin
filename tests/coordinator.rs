@@ -776,8 +776,9 @@ fn test_valid_and_invalid_tx() {
 }
 
 /// Cancel rejection contract: only `Normal` / `NeedsSpeedup` in `ToDispatch` are
-/// cancellable. Everything else (post-dispatch, unknown txid, `Funding`-kind) is
-/// refused with an `InvalidCancel` news entry and storage is left untouched.
+/// cancellable. Every other known txid (post-dispatch, `Funding`-kind) is refused with
+/// an `InvalidCancel` news entry and storage is left untouched. An unknown txid is
+/// forwarded to the monitor and gets no news.
 #[test]
 fn test_cancel_dispatched_tx_refused() {
     init_trace();
@@ -806,10 +807,10 @@ fn test_cancel_dispatched_tx_refused() {
         "tx must be InMempool before cancel"
     );
 
-    // Batch cancel mixing all three rejection causes:
+    // Batch cancel mixing both rejection causes and an unknown txid:
     //   - txid:           Normal in InMempool → refused (state).
-    //   - unknown_txid:   never registered    → refused (not found).
-    //   - funding_txid:   funding UTXO, not a tracked tx → refused (not found).
+    //   - unknown_txid:   never registered    → forwarded to the monitor, no news.
+    //   - funding_txid:   funding UTXO, not a tracked tx → refused (funding).
     coordinator
         .cancel(
             &[
@@ -845,7 +846,7 @@ fn test_cancel_dispatched_tx_refused() {
             _ => None,
         })
         .collect();
-    for expected in [&txid, &unknown_txid, &funding_txid] {
+    for expected in [&txid, &funding_txid] {
         assert!(
             rejected.contains(expected),
             "InvalidCancel news must include {} (got {:?})",
@@ -853,6 +854,11 @@ fn test_cancel_dispatched_tx_refused() {
             rejected,
         );
     }
+    assert!(
+        !rejected.contains(&unknown_txid),
+        "an unknown txid is forwarded to the monitor, not refused (got {:?})",
+        rejected,
+    );
 
     drop(coordinator);
     drop(coord_storage);
@@ -911,9 +917,10 @@ fn test_cancel_requeued_broadcast_tx_refused() {
     setup.end_all().unwrap();
 }
 
-/// `cancel` with a non-`Transaction` monitoring target (here `SpendingUtxo`)
-/// must take the pass-through arm: it forwards straight to `monitor.cancel`, touches no
-/// coordinator storage, and emits no `InvalidCancel` news.
+/// `cancel` with a non-`Transaction` monitoring target (here `SpendingUtxo`), or with a
+/// `Transaction` target registered only through `monitor()`, must take the pass-through arm:
+/// it forwards straight to `monitor.cancel`, touches no coordinator storage, and emits no
+/// `InvalidCancel` news.
 #[test]
 fn test_cancel_passthrough_non_transactions() {
     init_trace();
@@ -951,6 +958,33 @@ fn test_cancel_passthrough_non_transactions() {
         .unwrap()
         .coordinator_news
         .is_empty());
+
+    // A `Transaction` target registered only through `monitor()` is not in coordinator storage, so cancel forwards it
+    // to the monitor. Once it is mined, no monitor news may report it.
+    let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid = tx.compute_txid();
+    let tx_entry = [MonitorTarget::Transaction(txid)];
+    coordinator
+        .monitor(&tx_entry, ctx("passthrough"), None)
+        .unwrap();
+    coordinator.cancel(&tx_entry, &ctx("passthrough")).unwrap();
+
+    setup.bitcoin_client.send_transaction(&tx).unwrap();
+    mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let news = coordinator.get_news(None).unwrap();
+    assert!(
+        news.coordinator_news.is_empty(),
+        "cancelling a monitor-only tx must not emit coordinator news (got {:?})",
+        news.coordinator_news
+    );
+    assert!(
+        !news.monitor_news.iter().any(
+            |n| matches!(&n.kind, NewsKind::Transaction { txid: id, .. } if *id == txid)
+        ),
+        "a cancelled monitor-only tx must not be reported (got {:?})",
+        news.monitor_news
+    );
 
     drop(coordinator);
     setup.end_all().unwrap();
