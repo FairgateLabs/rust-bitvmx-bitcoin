@@ -175,6 +175,8 @@ impl EngineContext {
         updated.fee_info = fee_info;
         // The tx is live again: disarm any reorg-flap fail guard. A future not_found re-arms it.
         updated.fail_guard_until = None;
+        // This broadcast attempt is over, so a later re-dispatch starts with a full retry budget.
+        updated.retry_count = 0;
         self.storage.update_tx(&updated)?;
 
         self.monitor.monitor(
@@ -209,8 +211,9 @@ impl EngineContext {
         let mut updated = tx.clone();
         updated.broadcast_block_height.get_or_insert(current_height); // only if missing
         updated.state = TransactionState::Confirmed;
-        // Recovered on-chain: disarm the fail guard.
+        // Recovered on-chain: disarm the fail guard and restore the full retry budget.
         updated.fail_guard_until = None;
+        updated.retry_count = 0;
         self.storage.update_tx(&updated)?;
 
         self.monitor.monitor(

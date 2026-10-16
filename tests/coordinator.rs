@@ -1384,14 +1384,15 @@ fn test_retry_dispatches_after_rate_limit() {
     // Tick 3: After the interval, must dispatch successfully.
     std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
     coordinator.tick().unwrap();
+    let subject = coord_storage.get_tx_by_id(txid_subject).unwrap().unwrap();
     assert_eq!(
-        coord_storage
-            .get_tx_by_id(txid_subject)
-            .unwrap()
-            .unwrap()
-            .state,
+        subject.state,
         TransactionState::InMempool,
         "tx_subject must be InMempool after the retry interval has elapsed"
+    );
+    assert_eq!(
+        subject.retry_count, 0,
+        "acceptance must reset retry_count so a later re-dispatch has a full budget"
     );
 
     assert!(coordinator

@@ -178,7 +178,7 @@ Tuning lives in `BitcoinSettings`. Every field is optional and falls back to the
 | Group | Field | Role |
 |---|---|---|
 | `coordinator` | `retry_interval_seconds` | Minimum wall-clock gap between retry batches. |
-| `coordinator` | `retry_attempts_sending_tx` | Retry budget before a transient failure becomes `Failed`. |
+| `coordinator` | `retry_attempts_sending_tx` | Retry budget before a transient failure becomes `Failed`. Reset when the tx is accepted. |
 | `dispatcher` | `max_tx_weight` | Upper bound on broadcastable weight. Over it is `Fatal`. |
 | `fee` | `min_safe_fee_rate` | Floor and fallback for the effective speedup fee rate. |
 | `fee` | `max_feerate_sat_vb` | Hard cap on the speedup package fee rate (parents + child). |
