@@ -1,54 +1,31 @@
 # rust-bitvmx-bitcoin
 
-`rust-bitvmx-bitcoin` is the Bitcoin coordinator library for the BitVMX client. It
-sits between application code and a Bitcoin node, taking care of broadcasting
-transactions, monitoring their lifecycle on-chain, and keeping stuck transactions
-moving via Child-Pays-For-Parent (CPFP) and Replace-By-Fee (RBF) speedups.
+`rust-bitvmx-bitcoin` is the Bitcoin coordinator library for the BitVMX client. It sits between application code and a Bitcoin node, taking care of broadcasting transactions, monitoring their lifecycle on-chain, and keeping stuck transactions moving via Child-Pays-For-Parent (CPFP) and Replace-By-Fee (RBF) speedups.
 
 ## Documentation
 
-The `docs/` folder explains the concepts a new developer needs without reading
-the source:
+The `docs/` folder explains the concepts a new developer needs without reading the source:
 
-- [`docs/architecture.md`](docs/architecture.md): components, the tick pipeline,
-  the transaction lifecycle, dispatch classification, and the news stream.
-- [`docs/speedup.md`](docs/speedup.md): CPFP vs RBF, the funding chain, and the
-  fee model.
-- [`docs/design.md`](docs/design.md): the durable rules and invariants the
-  coordinator is built on, plus a glossary.
+- [`docs/architecture.md`](docs/architecture.md): components, the tick pipeline, the transaction lifecycle, dispatch classification, and the news stream.
+- [`docs/speedup.md`](docs/speedup.md): CPFP vs RBF, the funding chain, and the fee model.
+- [`docs/design.md`](docs/design.md): the durable rules and invariants the coordinator is built on, plus a glossary.
 
 ## ⚠️ Disclaimer
 
-This library is currently under development and may not be fully stable.
-It is not production-ready, has not been audited, and future updates may
-introduce breaking changes without preserving backward compatibility.
+This library is currently under development and may not be fully stable. It is not production-ready, has not been audited, and future updates may introduce breaking changes without preserving backward compatibility.
 
 ## Key Features
 
-- 📤 **Transaction Dispatch**: Broadcasts signed transactions through the
-  Bitcoin RPC, with retry, target-block-height gating, and topological ordering
-  for parent/child pairs sent in the same tick.
-- 🕵️ **Transaction Monitoring**: Tracks the full lifecycle of each registered
-  transaction (`ToDispatch` → `InMempool` → `Confirmed` → `Finalized`), including
-  reorg detection and stuck-in-mempool detection.
-- 🚀 **Automatic Speedups**: Builds and dispatches CPFP or RBF transactions
-  automatically when parents linger in the mempool, escalating fees on each
-  attempt.
-- 💰 **Funding Management**: Maintains a funding UTXO chain that survives
-  reorgs and mempool evictions, so speedup fees always come from a known
-  spendable output. Funding is keyed by `OutPoint` (txid + vout), so several
-  UTXOs from the same funding transaction can be registered without collision.
-- 📰 **News Stream**: Emits structured news for state transitions, dispatch
-  errors, stuck transactions, and other lifecycle events that the client
-  acknowledges explicitly.
-- 💾 **Persistent Storage**: All coordinator state is persisted through
-  `rust-bitvmx-storage-backend`, so a restart resumes work without losing
-  in-flight transactions.
+- 📤 **Transaction Dispatch**: Broadcasts signed transactions through the Bitcoin RPC, with retry, target-block-height gating, and topological ordering for parent/child pairs sent in the same tick.
+- 🕵️ **Transaction Monitoring**: Tracks the full lifecycle of each registered transaction (`ToDispatch` → `InMempool` → `Confirmed` → `Finalized`), including reorg detection and stuck-in-mempool detection.
+- 🚀 **Automatic Speedups**: Builds and dispatches CPFP or RBF transactions automatically when parents linger in the mempool, escalating fees on each attempt.
+- 💰 **Funding Management**: Maintains a funding UTXO chain that survives reorgs and mempool evictions, so speedup fees always come from a known spendable output. Funding is keyed by `OutPoint` (txid + vout), so several UTXOs from the same funding transaction can be registered without collision.
+- 📰 **News Stream**: Emits structured news for state transitions, dispatch errors, stuck transactions, and other lifecycle events that the client acknowledges explicitly.
+- 💾 **Persistent Storage**: All coordinator state is persisted through `rust-bitvmx-storage-backend`, so a restart resumes work without losing in-flight transactions.
 
 ## Architecture
 
-The coordinator is composed of small, focused components wired together inside
-`BitcoinCoordinator`:
+The coordinator is composed of small, focused components wired together inside `BitcoinCoordinator`:
 
 | Component | Responsibility |
 |---|---|
@@ -60,52 +37,29 @@ The coordinator is composed of small, focused components wired together inside
 | `FundingManager` | Tracks the spendable funding UTXO. |
 | `CoordinatorStorage` | Persists `CoordinatedTx` records and news. |
 
-Each call to `tick()` runs one pass: it advances the monitor, reviews
-in-flight transactions, dispatches anything ready, and schedules speedups for
-parents that need them. Build/save of a new speedup happens in one tick and
-the broadcast happens in the next, with at most one pre-built speedup in
-flight at a time.
+Each call to `tick()` runs one pass: it advances the monitor, reviews in-flight transactions, dispatches anything ready, and schedules speedups for parents that need them. Build/save of a new speedup happens in one tick and the broadcast happens in the next, with at most one pre-built speedup in flight at a time.
 
-See [`docs/architecture.md`](docs/architecture.md) for the full tick pipeline and
-component diagram, and [`docs/design.md`](docs/design.md) for the invariants
-behind the build/dispatch split.
+See [`docs/architecture.md`](docs/architecture.md) for the full tick pipeline and component diagram, and [`docs/design.md`](docs/design.md) for the invariants behind the build/dispatch split.
 
 ## Public API
 
-> ⚠️ **Indirect dependencies must wait for finality.** If transaction B
-> indirectly depends on transaction A, do not register B until A has reached
-> `Finalized`. While A is still in flight it may disappear from the mempool
-> and be re-dispatched, and the coordinator does not preserve any ordering
-> between independently registered transactions.
+> ⚠️ **Indirect dependencies must wait for finality.** If transaction B indirectly depends on transaction A, do not register B until A has reached `Finalized`. While A is still in flight it may disappear from the mempool and be re-dispatched, and the coordinator does not preserve any ordering between independently registered transactions.
 
-> ⚠️ **`add_funding` UTXOs must be effectively final.** Only pass UTXOs whose funding transaction is
-> deep enough on-chain that you accept it as `Finalized` (i.e., no longer reorgable in practice).
+> ⚠️ **`add_funding` UTXOs must be effectively final.** Only pass UTXOs whose funding transaction is deep enough on-chain that you accept it as `Finalized` (i.e., no longer reorgable in practice).
 
-> ⚠️ **Reorgs deeper than the monitor's `finality` are assumed impossible.** A tx is `Finalized` at
-> `finality` confirmations and treated as permanent; a reorg past it is out of scope and not detected.
+> ⚠️ **Reorgs deeper than the monitor's `finality` are assumed impossible.** A tx is `Finalized` at `finality` confirmations and treated as permanent; a reorg past it is out of scope and not detected.
 
-> ⚠️ **Tick once before any other call.** The coordinator's height is the monitor's indexed height,
-> which is unknown until the first `tick()`. A `dispatch*` call before it returns an error.
+> ⚠️ **Tick once before any other call.** The coordinator's height is the monitor's indexed height, which is unknown until the first `tick()`. A `dispatch*` call before it returns an error.
 
-> ⚠️ **`confirmation_trigger` must be within `finality..=max_monitoring_confirmations`, or `None`.**
-> Out of range, the `dispatch*` call returns an error and nothing is stored.
+> ⚠️ **`confirmation_trigger` must be within `finality..=max_monitoring_confirmations`, or `None`.** Out of range, the `dispatch*` call returns an error and nothing is stored.
 
-> ⚠️ **External (non-coordinator-tracked) parents must already be confirmed.**
-> The dispatcher only gates on tracked parents; untracked ones are assumed on-chain.
-> Registering a tx whose input references an unregistered, not-yet-confirmed tx will be
-> rejected by bitcoind with a missing-input error.
+> ⚠️ **External (non-coordinator-tracked) parents must already be confirmed.** The dispatcher only gates on tracked parents; untracked ones are assumed on-chain. Registering a tx whose input references an unregistered, not-yet-confirmed tx will be rejected by bitcoind with a missing-input error.
 
-> 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold.
-> To unblock: dispatch a CPFP spending one of its outputs via `dispatch_without_speedup`. The
-> coordinator tracks both and mines them together.
+> 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold. To unblock: dispatch a CPFP spending one of its outputs via `dispatch_without_speedup`. The coordinator tracks both and mines them together.
 
-> ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in
-> `ToDispatch` and never broadcast are cancellable. Once a tx has been broadcast (`InMempool` /
-> `Confirmed` / `Finalized` / `Failed`, or back in `ToDispatch` after a broadcast), or if the txid is internal (Speedup) or not a tracked tx (a
-> funding UTXO, or an unknown txid), the request is refused and a news item is emitted.
+> ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in `ToDispatch` and never broadcast are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` / `Finalized` / `Failed`, or back in `ToDispatch` after a broadcast), or if the txid is internal (Speedup) or not a tracked tx (a funding UTXO, or an unknown txid), the request is refused and a news item is emitted.
 
-> ⚠️ **Ack news only AFTER acting on it.** News is deduplicated by value.Acking early 
-> means a second occurrence of the same event within the same block will NOT re-fire.
+> ⚠️ **Ack news only AFTER acting on it.** News is deduplicated by value. Acking early means a second occurrence of the same event within the same block will NOT re-fire.
 
 The `BitcoinCoordinator` struct exposes the following methods:
 
@@ -201,32 +155,21 @@ if let TransactionStatus::Confirmed { block_height, block_hash, .. } = &status {
 
 ## Configuration
 
-Tuning constants live in `BitcoinSettings`. A sample YAML used by the test
-suite is in `config/coordinator_config.yaml`; every field is optional and falls
-back to the defaults in `src/config/settings.rs`.
+Tuning constants live in `BitcoinSettings`. A sample YAML used by the test suite is in `config/coordinator_config.yaml`; every field is optional and falls back to the defaults in `src/config/settings.rs`.
 
-> ⚠️ **Do not change `BitcoinSettings` values across a restart on the same
-> storage.** Several invariants (ancestor accounting, fee-rate state, retention
-> bounds) assume the configuration that produced the persisted state is the
-> one used to resume it. Reload the coordinator with the same settings, or
-> start from clean storage.
+> ⚠️ **Do not change `BitcoinSettings` values across a restart on the same storage.** Several invariants (ancestor accounting, fee-rate state, retention bounds) assume the configuration that produced the persisted state is the one used to resume it. Reload the coordinator with the same settings, or start from clean storage.
 
 The main groups are:
 
 - `coordinator`: retry interval and retry attempts for failed dispatches.
 - `dispatcher`: maximum allowed transaction weight.
-- `fee`: minimum, maximum, and base fee multipliers used by `FeeManager`. The
-  `max_feerate_sat_vb` ceiling bounds the speedup PACKAGE effective fee rate
-  (parents + child together), not the child transaction alone.
+- `fee`: minimum, maximum, and base fee multipliers used by `FeeManager`. The `max_feerate_sat_vb` ceiling bounds the speedup PACKAGE effective fee rate (parents + child together), not the child transaction alone.
 - `speedup`: maximum unconfirmed ancestors of a speedup package, resend spacing, and bump-fee percentage.
 - `funding`: minimum sat amount required for a funding UTXO.
 - `storage`: how long settled txs are tracked before eviction.
-- `monitor`: `finality` (the `Finalized` depth and the fail-guard window), max
-  confirmations to track, and indexer settings (forwarded to
-  `bitvmx-transaction-monitor`).
+- `monitor`: `finality` (the `Finalized` depth and the fail-guard window), max confirmations to track, and indexer settings (forwarded to `bitvmx-transaction-monitor`).
 
-The full settings table and the behavior each field drives are in
-[`docs/architecture.md`](docs/architecture.md#configuration).
+The full settings table and the behavior each field drives are in [`docs/architecture.md`](docs/architecture.md#configuration).
 
 ## Development Setup
 
@@ -234,8 +177,7 @@ Prerequisites:
 
 - Rust
 - Docker, used by integration tests
-- A Bitcoin node running with `-txindex=1` (required: see
-  [`docs/design.md`](docs/design.md#failure-classification) for more detail)
+- A Bitcoin node running with `-txindex=1` (required: see [`docs/design.md`](docs/design.md#failure-classification) for more detail)
 
 Common commands:
 
@@ -251,21 +193,16 @@ cargo test
 ```
 ## Contributing
 
-Contributions are welcome! Please open an issue or submit a pull request on
-GitHub.
+Contributions are welcome! Please open an issue or submit a pull request on GitHub.
 
 ## License
 
-This project is licensed under the MIT License. See [LICENSE](LICENSE) for
-details.
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
 ## 🧩 Part of the BitVMX Ecosystem
 
-This repository is a component of the **BitVMX Ecosystem**, an open platform
-for disputable computation secured by Bitcoin.
-You can find the index of all BitVMX open-source components at
-[**FairgateLabs/BitVMX**](https://github.com/FairgateLabs/BitVMX).
+This repository is a component of the **BitVMX Ecosystem**, an open platform for disputable computation secured by Bitcoin. You can find the index of all BitVMX open-source components at [**FairgateLabs/BitVMX**](https://github.com/FairgateLabs/BitVMX).
 
 ---
