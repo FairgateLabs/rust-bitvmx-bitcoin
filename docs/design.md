@@ -36,6 +36,16 @@ Only one speedup sits in `ToDispatch` at a time. Reorg edges may briefly leave
 two pre-dispatched speedups, which is safe because the network already accepted
 them.
 
+While that single speedup is held (deferred by the parent gate because a covered
+parent vanished and is inside its fail-guard window, or itself guarded), no other
+speedup is built: no boost and no new CPFP for any parent. The stall lasts at most
+one guard window (`finality` blocks), after which the parent is back or settles
+`Failed` and the batch is rebuilt. It only happens when a broadcast parent vanishes
+and its resend finds an input consumed; normal dispatches are never held. The
+funding chain is linear, so building past the held speedup would spend a change
+output that may still be needed: if the reorg reverts, the held speedup goes out
+as built and no funding is lost.
+
 ### I3: the CPFP builder yields to an existing pre-built speedup
 
 `create_cpfp_batch` (step 6) does nothing if any speedup is already `ToDispatch`.

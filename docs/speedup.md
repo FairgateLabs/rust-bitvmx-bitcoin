@@ -139,8 +139,12 @@ with it.
   instead, letting the first CPFP underneath do the rebuild.
 
 This holds for a CPFP-of-CPFP chain and for an RBF over the batch, and it keeps each
-disappeared parent's guard window independent so one absent parent never delays the
-acceleration of the healthy ones.
+disappeared parent's guard window independent: the rebuild never waits on a second
+absent parent. The healthy parents of the batch do wait while the dead parent is
+still inside its guard window, up to `finality` blocks. Until the dead parent settles
+`Failed`, the batch CPFP stays `ToDispatch` (held by the parent gate), and by I2 no
+other speedup is built meanwhile. This is deliberate: if the reorg reverts, the parent
+re-confirms, the CPFP is sent as built, and no funding is lost.
 
 ## Fee model
 
