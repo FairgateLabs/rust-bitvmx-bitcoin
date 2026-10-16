@@ -3615,3 +3615,75 @@ fn test_cpfp_over_ancestor_limit_leaves_parent_pending() {
     drop(coord_storage);
     setup.end_all().unwrap();
 }
+
+/// An RBF rejected by the node for a fee reason has every input intact: the inputs it shares with its predecessor
+/// are spent in the mempool only by that predecessor, which the RBF replaces. So the rejection must take the retry
+/// path (step 3), like any other transient failure, and not be read as a missing input.
+#[test]
+fn test_rbf_fee_rejection_is_retried() {
+    init_trace();
+
+    // max_unconfirmed_ancestors = 2: the parent plus CPFP1 fill the package, so the first boost is an RBF.
+    let settings = rebuild_settings(2);
+    let retry_sleep =
+        std::time::Duration::from_millis(settings.coordinator.retry_interval_seconds * 1000 + 300);
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings);
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &key_manager,
+        Network::Regtest,
+        2_000_000,
+    )
+    .unwrap();
+    let (parent_tx, speedup_data) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("rbf_fee_reject"), None, None)
+        .unwrap();
+    let cpfp1_id = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+
+    // Raise CPFP1's modified fee in the node's mempool, so any replacement fails BIP125 rule 3 ("insufficient fee").
+    // The coordinator reads fees from its own storage, so the RBF it builds is unchanged.
+    let _: bool = setup
+        .bitcoin_client
+        .client
+        .call(
+            "prioritisetransaction",
+            &[
+                serde_json::json!(cpfp1_id.to_string()),
+                serde_json::json!(0),
+                serde_json::json!(100_000_000i64),
+            ],
+        )
+        .unwrap();
+
+    // The block makes CPFP1 stale, so this tick builds the RBF.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 2, "the boost must build an RBF");
+    let rbf_id = speedups[1].txid;
+    assert!(speedups[1].speedup_kind().unwrap().is_rbf());
+
+    // This tick sends the RBF and the node rejects it. Its inputs are intact, so it must stay queued for a retry.
+    std::thread::sleep(retry_sleep);
+    coordinator.tick().unwrap();
+    let rbf = coord_storage.get_tx_by_id(rbf_id).unwrap().unwrap();
+    assert_eq!(
+        (rbf.state, rbf.retry_count),
+        (TransactionState::ToDispatch, 1),
+        "a fee rejection of an RBF must be retried, not failed as a missing input"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}

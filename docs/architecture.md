@@ -148,7 +148,7 @@ flowchart TD
 Classification of a `DispatchError`:
 
 1. `getrawtransaction(txid)` says the node already has it. `Some(0)` means the mempool already holds it, treat as accepted. `Some(n>=1)` means it is already mined, settle `Confirmed`.
-2. The tx is absent, so a missing or spent input is definitive. A funding input gone means recreate funding; an external or parent input gone means fail. Both branches are first gated by the reorg-flap fail guard (see [design.md](design.md)).
+2. The tx is absent, so a missing or spent input is definitive. A funding input gone means recreate funding; an external or parent input gone means fail. Both branches are first gated by the reorg-flap fail guard (see [design.md](design.md)). An RBF's inputs shared with its `InMempool` predecessor are not counted as gone.
 3. Inputs are intact and the cause is unknown (fee or policy). Retry until `retry_attempts_sending_tx` is spent, then fail.
 
 The `Failed` paths route through `fail_and_cascade`, which also settles every `ToDispatch` speedup that depends on the failed transaction.

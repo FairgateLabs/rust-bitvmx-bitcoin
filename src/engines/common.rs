@@ -1,7 +1,8 @@
-use bitcoin::Txid;
+use bitcoin::{OutPoint, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
 use bitvmx_transaction_monitor::{monitor::Monitor, types::MonitorTarget};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use tracing::{debug, error, info, warn};
 
@@ -472,7 +473,8 @@ impl EngineContext {
         Ok(())
     }
 
-    /// Probe the node for a missing or spent input of `tx`. Returns:
+    /// Probe the node for a missing or spent input of `tx`, leaving out an RBF's inputs shared with its live
+    /// predecessor. Returns:
     ///   * `Some(true)`: a coordinator funding input is gone, recoverable by recreating funding.
     ///   * `Some(false)`: a non-funding or external (parent) input is gone, fatal for this tx.
     ///   * `None`: every input is still unspent, so the failure is transient (fee or policy), retry.
@@ -480,8 +482,16 @@ impl EngineContext {
         &self,
         tx: &CoordinatedTx,
     ) -> Result<Option<bool>, BitcoinCoordinatorError> {
+        // An RBF spends every input of the predecessor it replaces, and while the predecessor is in the mempool those
+        // inputs read as spent by it. That is the conflict the RBF exists for, not a missing input, so they are skipped.
+        // If one of them is really gone, the predecessor's own review catches it.
+        let shared = self.inputs_shared_with_live_predecessor(tx)?;
+
         // Funding inputs first, since a gone funding UTXO is recoverable.
         for op in tx.funding_outpoints() {
+            if shared.contains(&op) {
+                continue;
+            }
             if self.monitor.rpc_is_utxo_spent(&op.txid, op.vout, true)? {
                 return Ok(Some(true));
             }
@@ -489,12 +499,37 @@ impl EngineContext {
 
         // Remaining external or parent inputs, where a gone one is fatal for this tx.
         for op in tx.non_funding_inputs() {
+            if shared.contains(&op) {
+                continue;
+            }
             if self.monitor.rpc_is_utxo_spent(&op.txid, op.vout, true)? {
                 return Ok(Some(false));
             }
         }
 
         Ok(None)
+    }
+
+    /// For an RBF whose predecessor is still `InMempool`, the inputs it shares with that predecessor. Empty otherwise.
+    fn inputs_shared_with_live_predecessor(
+        &self,
+        tx: &CoordinatedTx,
+    ) -> Result<HashSet<OutPoint>, BitcoinCoordinatorError> {
+        let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind else {
+            return Ok(HashSet::new());
+        };
+        let Some(predecessor) = self.storage.get_tx_by_id(*replaces)? else {
+            return Ok(HashSet::new());
+        };
+        if predecessor.state != TransactionState::InMempool {
+            return Ok(HashSet::new());
+        }
+        Ok(predecessor
+            .tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .collect())
     }
 
     fn dispatch_error_news(tx: &CoordinatedTx, txid: Txid) -> CoordinatorNews {

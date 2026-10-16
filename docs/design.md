@@ -55,6 +55,8 @@ Failures are classified by live node state, not by matching the node's error tex
 | Absent and an external or parent input is gone | Settle `Failed`, after the fail guard. |
 | Absent but all inputs intact | Transient cause. Retry until the budget is spent, then `Failed`. |
 
+An RBF spends every input of the speedup it replaces. While that predecessor is `InMempool`, those shared inputs read as spent by it, which is the conflict the RBF exists for, so they are not counted as gone. A rejected RBF therefore gets the normal retries. If a shared input is really gone, the predecessor's own review catches it.
+
 A structural problem decidable from the transaction alone (weight over `max_tx_weight`, or zero inputs) is settled `Failed` immediately with no node round-trip.
 
 A child whose tracked parent has already settled `Failed` is also failed pre-send (the `ParentFailed` outcome), carrying no fail guard of its own: the parent's `Failed` is itself the output of the parent's guard, so the reorg window is already spent. For a batch CPFP the engine then rebuilds a fresh CPFP over the surviving parents, so one dead parent never sinks the batch (see [speedup.md](speedup.md)).
