@@ -46,10 +46,7 @@ pub struct TestKeyManager {
 impl TestKeyManager {
     pub fn new() -> Self {
         let path = format!("temp-runs/km_{}", Uuid::new_v4());
-        let config = StorageConfig {
-            path: path.clone(),
-            password: None,
-        };
+        let config = StorageConfig::new(path.clone(), None);
         let km = Rc::new(
             KeyManager::new(bitcoin::Network::Regtest, None, None, &config)
                 .expect("TestKeyManager: failed to construct KeyManager"),
