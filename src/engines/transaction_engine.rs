@@ -21,7 +21,7 @@ impl TransactionEngine {
     /// Step 1 of `tick`: walk in-flight non-speedup transactions and update
     /// their state from the chain. Never dispatches.
     pub fn review_active(&self) -> Result<(), BitcoinCoordinatorError> {
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         self.ctx.storage.evict_stale_txs(current_height)?;
 
         let active_txs = self.ctx.storage.get_active_txs()?;
@@ -52,7 +52,7 @@ impl TransactionEngine {
     /// Step 3 of `tick`: broadcast every non-speedup transaction currently in
     /// `ToDispatch` whose `target_block_height` has been reached.
     pub fn dispatch_pending(&self) -> Result<(), BitcoinCoordinatorError> {
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         let active_txs = self.ctx.storage.get_active_txs()?;
         if active_txs.is_empty() {
             return Ok(());
@@ -87,7 +87,7 @@ impl TransactionEngine {
         txs: Vec<CoordinatedTx>,
         current_height: BlockHeight,
     ) -> Result<(), BitcoinCoordinatorError> {
-        let max_confs = self.ctx.monitor.settings.max_monitoring_confirmations;
+        let finality = self.ctx.monitor.finality();
 
         for tx in txs {
             // Only search the mempool after the tx has been broadcast.
@@ -134,16 +134,17 @@ impl TransactionEngine {
                 // Re-queue and arm the reorg-flap fail guard.
                 self.ctx
                     .storage
-                    .requeue_not_found(tx.txid, current_height + max_confs)?;
+                    .requeue_not_found(tx.txid, current_height + finality)?;
                 // No need to re-add a NeedsSpeedup parent to PendingSpeedupParents here: the
                 // covering CPFP is independently re-queued in `review_speedups`'s not_found arm
                 continue;
             }
 
-            if status.is_finalized(max_confs) {
+            if status.is_finalized(finality) {
                 info!(
                     "Transaction({}) finalized ({} confirmations)",
-                    tx.txid, status.confirmations
+                    tx.txid,
+                    status.confirmations()
                 );
                 self.ctx.mark_finalized(tx.txid, current_height)?;
                 continue;
@@ -152,15 +153,10 @@ impl TransactionEngine {
             if status.is_confirmed() {
                 debug!(
                     "Transaction({}) confirmed ({} confirmations)",
-                    tx.txid, status.confirmations
+                    tx.txid,
+                    status.confirmations()
                 );
                 self.ctx.mark_confirmed(tx.txid)?;
-                continue;
-            }
-
-            if status.is_orphan() {
-                debug!("Transaction({}) orphaned, keeping InMempool", tx.txid);
-                self.ctx.mark_orphan(tx.txid)?;
                 continue;
             }
 

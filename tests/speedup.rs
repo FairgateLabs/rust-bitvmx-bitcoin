@@ -5,9 +5,12 @@ use std::rc::Rc;
 
 use bitcoin::{Network, OutPoint};
 use bitcoin_coordinator::{
-    config::configs::{
-        BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings, FeeSettings,
-        FundingSettings, SpeedupSettings,
+    config::{
+        configs::{
+            BitcoinSettings, CoordinatorSettings, CoordinatorStorageSettings, FeeSettings,
+            FundingSettings, SpeedupSettings,
+        },
+        settings::{CPFP_TRANSACTION_CONTEXT, RBF_TRANSACTION_CONTEXT},
     },
     coordinator::BitcoinCoordinator,
     core::{
@@ -19,7 +22,7 @@ use bitcoin_coordinator::{
 use bitcoincore_rpc::RpcApi as _;
 use bitvmx_bitcoin_rpc::bitcoin_client::BitcoinClientApi;
 use bitvmx_transaction_monitor::config::MonitorSettingsConfig;
-use bitvmx_transaction_monitor::types::TypesToMonitor;
+use bitvmx_transaction_monitor::types::MonitorTarget;
 
 // =============================================================================
 // Helpers
@@ -28,14 +31,15 @@ use bitvmx_transaction_monitor::types::TypesToMonitor;
 fn cpfp_settings() -> BitcoinSettings {
     BitcoinSettings {
         monitor: MonitorSettingsConfig {
-            max_monitoring_confirmations: Some(2), // 2 confirmations to finalize
+            max_monitoring_confirmations: Some(2),
+            finality: Some(2), // 2 confirmations to finalize
             ..Default::default()
         },
         storage: CoordinatorStorageSettings {
             max_tracking_confirmations: 1, // 1 block tracking after finalization before eviction
         },
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: 2,         // A second boost creates RBF
+            max_unconfirmed_ancestors: 3,        // A second boost creates RBF
             min_blocks_before_resend_speedup: 1, // Enables boost after one block
             bump_fee_percentage: 1.5,
         },
@@ -51,7 +55,7 @@ fn cpfp_settings() -> BitcoinSettings {
 fn boost_settings(max_unconfirmed: u32) -> BitcoinSettings {
     BitcoinSettings {
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: max_unconfirmed,
+            max_unconfirmed_ancestors: max_unconfirmed,
             min_blocks_before_resend_speedup: 1,
             bump_fee_percentage: 2.0,
         },
@@ -84,7 +88,7 @@ fn cap_settings() -> BitcoinSettings {
             base_fee_multiplier: 1.0,
         },
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: 5,
+            max_unconfirmed_ancestors: 5,
             min_blocks_before_resend_speedup: 1,
             bump_fee_percentage: 2.0,
         },
@@ -134,7 +138,7 @@ fn build_and_dispatch_cpfp(
 /// (slots free) or an RBF replacement (slots full).
 fn rebuild_settings(max_unconfirmed: u32) -> BitcoinSettings {
     let mut s = cpfp_settings();
-    s.speedup.max_unconfirmed_speedups = max_unconfirmed;
+    s.speedup.max_unconfirmed_ancestors = max_unconfirmed;
     s
 }
 
@@ -192,7 +196,7 @@ fn drive_dead_parent_recovery(
     for _ in 0..phase1_budget {
         std::thread::sleep(sleep);
         coordinator.tick().unwrap();
-        let news = coordinator.get_news().unwrap();
+        let news = coordinator.get_news(None).unwrap();
         for n in &news.coordinator_news {
             if matches!(n, CoordinatorNews::SpeedupDispatchError { txid, .. } if *txid == root_cpfp_txid)
             {
@@ -235,7 +239,7 @@ fn drive_dead_parent_recovery(
     for _ in 0..phase2_budget {
         mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
         coordinator.tick().unwrap();
-        ack_all_news(coordinator, &coordinator.get_news().unwrap());
+        ack_all_news(coordinator, &coordinator.get_news(None).unwrap());
         let sc = coord_storage
             .get_tx_by_id(survivor_cpfp)
             .unwrap()
@@ -254,6 +258,51 @@ fn drive_dead_parent_recovery(
         "the surviving parent and its fresh CPFP must confirm"
     );
     survivor_cpfp
+}
+
+/// Fund the coordinator and register `n` independent parents with speedup at once, with `max_unconfirmed_ancestors`
+/// at 25. Returns the parent txids.
+fn register_parents_with_speedup(
+    n: usize,
+) -> (
+    TestSetup,
+    BitcoinCoordinator,
+    CoordinatorStorage,
+    Vec<bitcoin::Txid>,
+) {
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), rebuild_settings(25));
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &key_manager,
+        Network::Regtest,
+        5_000_000,
+    )
+    .unwrap();
+    let parents: Vec<_> = (0..n)
+        .map(|_| {
+            create_coordinator_parent_tx(
+                &setup.bitcoin_client,
+                &key_manager,
+                Network::Regtest,
+                10_000,
+            )
+            .unwrap()
+        })
+        .collect();
+    let parent_txids = parents.iter().map(|(tx, _)| tx.compute_txid()).collect();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding).unwrap();
+    for (i, (tx, sd)) in parents.into_iter().enumerate() {
+        coordinator
+            .dispatch_with_speedup(tx, sd, ctx(&format!("parent_{i}")), None, None)
+            .unwrap();
+    }
+    (setup, coordinator, coord_storage, parent_txids)
 }
 
 // =============================================================================
@@ -323,7 +372,7 @@ fn test_cpfp_lifecycle() {
         reached,
         "parent and CPFP must both reach Confirmed after 1 block"
     );
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Block 2: both Finalized. When the CPFP finalizes, `replace_funding_on_finalize` consumes the
     // user funding record and materializes the CPFP change into the funding queue. Funding-queue
@@ -332,7 +381,7 @@ fn test_cpfp_lifecycle() {
     let mut reached_finalized = false;
     for _ in 0..10 {
         coordinator.tick().unwrap();
-        let news = coordinator.get_news().unwrap();
+        let news = coordinator.get_news(None).unwrap();
         ack_all_news(&coordinator, &news);
         let parent_state = coord_storage
             .get_tx_by_id(parent_txid)
@@ -366,7 +415,7 @@ fn test_cpfp_lifecycle() {
     let mut parent_evicted = false;
     for _ in 0..10 {
         coordinator.tick().unwrap();
-        let news = coordinator.get_news().unwrap();
+        let news = coordinator.get_news(None).unwrap();
         for n in &news.coordinator_news {
             if matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == parent_txid)
             {
@@ -617,7 +666,7 @@ fn test_cpfp_two_parents() {
         parents
     );
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert!(
         news.coordinator_news.is_empty(),
         "no coordinator news expected; got {:?}",
@@ -673,7 +722,7 @@ fn test_cpfp_no_funding() {
         "parent must be InMempool even without funding"
     );
 
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert!(
         news.coordinator_news
             .iter()
@@ -766,7 +815,7 @@ fn test_cpfp_capped_then_insufficient_funding_emit_news() {
         cpfp1.fee_info.fee_rate,
     );
 
-    let news_a = coordinator.get_news().unwrap();
+    let news_a = coordinator.get_news(None).unwrap();
     let cap_news = news_a
         .coordinator_news
         .iter()
@@ -827,7 +876,7 @@ fn test_cpfp_capped_then_insufficient_funding_emit_news() {
         "no second CPFP must be created when the chain tip + combine cannot cover the fee",
     );
 
-    let news_b = coordinator.get_news().unwrap();
+    let news_b = coordinator.get_news(None).unwrap();
     let cpfp1_leftover = cpfp1.speedup_kind().unwrap().context().funding_inputs[0]
         .amount
         .saturating_sub(cpfp1.fee_info.fee);
@@ -891,7 +940,7 @@ fn test_cpfp_reorg() {
     let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
 
     // Record current height; the next mine will produce height + 1.
-    let height_before = setup.bitcoin_client.get_best_block().unwrap() as u64;
+    let height_before = setup.bitcoin_client.get_tip_height().unwrap() as u64;
 
     // Mine 1 block → both Confirmed.
     mine_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
@@ -914,7 +963,7 @@ fn test_cpfp_reorg() {
         reached,
         "parent and CPFP must both be Confirmed before the reorg"
     );
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Reorg: invalidate the confirming block; txs return to the mempool.
     setup
@@ -1043,7 +1092,7 @@ fn test_cpfp_fee_escalates_across_boosts() {
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let key_manager = TestKeyManager::new();
-    // max_unconfirmed_speedups large enough that every boost stays CPFP (not RBF).
+    // max_unconfirmed_ancestors large enough that every boost stays CPFP (not RBF).
     let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), boost_settings(20));
     let coord_storage = get_coord_storage(&setup);
 
@@ -1301,7 +1350,7 @@ fn test_boost_cap_reached() {
     );
 
     // The `MaxFeeRateReached` news must reference the capped txid.
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     let cap_news = news
         .coordinator_news
         .iter()
@@ -1335,7 +1384,7 @@ fn test_boost_cap_reached() {
     setup.end_all().unwrap();
 }
 
-/// When `boost_if_stale` selects RBF (in-mempool count reached `max_unconfirmed_speedups`) and
+/// When `boost_if_stale` selects RBF (in-mempool count reached `max_unconfirmed_ancestors`) and
 /// the BIP-125 bandwidth floor would exceed the configured  `max_feerate_sat_vb` cap, the RBF
 /// is still built, clamped at the cap, but bitcoind will reject the broadcast for being below
 /// the floor. To break the doomed-retry busy-loop, `boost_if_stale` marks the predecessor at-cap
@@ -1346,7 +1395,7 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
     init_trace();
 
     // Network rate floors at 6; cap is 10. RBF bandwidth floor would be
-    // 6 × 2 = 12 sat/vB, above the cap. max_unconfirmed_speedups = 1 forces
+    // 6 × 2 = 12 sat/vB, above the cap. max_unconfirmed_ancestors = 2 forces
     // the first boost to be an RBF.
     let settings = BitcoinSettings {
         fee: FeeSettings {
@@ -1355,7 +1404,7 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
             base_fee_multiplier: 1.0,
         },
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: 1,
+            max_unconfirmed_ancestors: 2,
             min_blocks_before_resend_speedup: 1,
             bump_fee_percentage: 1.5,
         },
@@ -1420,7 +1469,7 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
     );
 
     // News log must contain MaxFeeRateReached referencing the new RBF.
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     let cap_news = news
         .coordinator_news
         .iter()
@@ -1456,9 +1505,9 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
     setup.end_all().unwrap();
 }
 
-/// Once the in-mempool speedup count reaches max_unconfirmed_speedups, the next boost switches from CPFP to RBF.
+/// Once the in-mempool speedup count reaches max_unconfirmed_ancestors, the next boost switches from CPFP to RBF.
 /// After the RBF is dispatched, the predecessor must have its `replaced_by` set so the funding walk-back and
-/// boost_if_stale skip it. cpfp_settings: max_unconfirmed_speedups = 2.
+/// boost_if_stale skip it. cpfp_settings: max_unconfirmed_ancestors = 3.
 #[test]
 fn test_cpfp_rbf_after_max_unconfirmed_reached() {
     init_trace();
@@ -1575,7 +1624,7 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
         TransactionState::InMempool,
         "CPFP2 must stay InMempool while its RBF replacement is in flight"
     );
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Mine the second confirming block (max_monitoring_confirmations=2) so the RBF
     // reaches is_finalized. review_speedups then calls remove_replaced_rbf(rbf, height),
@@ -1605,6 +1654,32 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
     assert!(
         reached,
         "CPFP2 must be settled Failed by remove_replaced_rbf when its replacing RBF finalizes"
+    );
+
+    // remove_replaced_rbf cancels CPFP2 under its own CPFP context, which releases the mempool watch it got when accepted.
+    let watch_list = bitcoin_indexer::store::IndexerStore::new(setup.storage.get_raw_storage())
+        .unwrap()
+        .get_mempool_watch_list()
+        .unwrap();
+    assert!(
+        !watch_list.iter().any(|(txid, _)| *txid == cpfp2_txid),
+        "replaced CPFP2 must no longer be on the mempool watch list; got {:?}",
+        watch_list
+    );
+
+    // get_news acknowledges the speedups' monitor news it filters out, so none of it stays pending in the monitor.
+    coordinator.get_news(None).unwrap();
+    let pending = setup
+        .bitcoind
+        .create_monitor(setup.storage.get_raw_storage())
+        .get_news(None)
+        .unwrap();
+    assert!(
+        !pending
+            .iter()
+            .any(|n| n.context == CPFP_TRANSACTION_CONTEXT || n.context == RBF_TRANSACTION_CONTEXT),
+        "speedup monitor news must be acknowledged by get_news; got {:?}",
+        pending
     );
 
     drop(coordinator);
@@ -1981,6 +2056,19 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
         "parent, CPFP, boost CPFP, and RBF must all settle Failed after the parent double-spend is mined"
     );
 
+    // Settling Failed cancels the monitor subscription, which releases the mempool watch each one got when it was accepted.
+    let watch_list = bitcoin_indexer::store::IndexerStore::new(setup.storage.get_raw_storage())
+        .unwrap()
+        .get_mempool_watch_list()
+        .unwrap();
+    for failed in [parent_txid, cpfp_txid, rbf_txid] {
+        assert!(
+            !watch_list.iter().any(|(txid, _)| *txid == failed),
+            "Failed tx {failed} must no longer be on the mempool watch list; got {:?}",
+            watch_list
+        );
+    }
+
     // CPFP's funding UTXO must have been released by `mark_parents_unspent`.
     let funding_records = coord_storage.read_funding_records().unwrap();
     let funding_record = funding_records
@@ -2004,7 +2092,7 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
     );
 
     // `SpeedupDispatchError` news must have fired for the cascaded speedups.
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     for cascaded in [cpfp_txid, rbf_txid] {
         assert!(
             news.coordinator_news.iter().any(|n| matches!(
@@ -2183,7 +2271,7 @@ fn test_cpfp_funding_restored_after_finalization() {
     )
     .unwrap();
     assert!(reached, "parent1 and CPFP1 must reach Confirmed");
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Block 2 → both Finalized. At finalization, update_funding stores CPFP1's
     // change output as the new base funding.
@@ -2198,7 +2286,7 @@ fn test_cpfp_funding_restored_after_finalization() {
     )
     .unwrap();
     assert!(reached, "parent1 and CPFP1 must reach Finalized");
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Dispatch a second parent.
     let (parent_tx2, speedup_data2) = create_coordinator_parent_tx(
@@ -2341,7 +2429,7 @@ fn test_chain_tip_combine_after_finalize() {
     )
     .unwrap();
     assert!(reached, "parent1 and CPFP1 must reach Finalized");
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // After finalize the funding queue holds: CPFP1's materialized change (from_speedup) + funding_extra (user, unspent).
     let funding_records = coord_storage.read_funding_records().unwrap();
@@ -2472,7 +2560,7 @@ fn test_cpfp_built_for_parent_confirmed_before_funding() {
     );
     assert!(
         coordinator
-            .get_news()
+            .get_news(None)
             .unwrap()
             .coordinator_news
             .iter()
@@ -2660,7 +2748,7 @@ fn test_rbf_combines_when_inherited_funding_insufficient() {
             base_fee_multiplier: 1.0,
         },
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: 2,
+            max_unconfirmed_ancestors: 3,
             min_blocks_before_resend_speedup: 1,
             bump_fee_percentage: 2.0,
         },
@@ -2829,11 +2917,10 @@ fn test_cancel_parent_edge_cases() {
         .unwrap();
 
     coordinator
-        .cancel(TypesToMonitor::Transactions(
-            vec![parent_a_txid],
-            ctx("cancel_a"),
-            None,
-        ))
+        .cancel(
+            &[MonitorTarget::Transaction(parent_a_txid)],
+            &ctx("cancel_a"),
+        )
         .unwrap();
     assert!(
         coord_storage.get_tx_by_id(parent_a_txid).unwrap().is_none(),
@@ -2884,17 +2971,16 @@ fn test_cancel_parent_edge_cases() {
 
     // Cancel attempt is refused; news emitted; tx record stays put.
     coordinator
-        .cancel(TypesToMonitor::Transactions(
-            vec![parent_b_txid],
-            ctx("cancel_b"),
-            None,
-        ))
+        .cancel(
+            &[MonitorTarget::Transaction(parent_b_txid)],
+            &ctx("cancel_b"),
+        )
         .unwrap();
     assert!(
         coord_storage.get_tx_by_id(parent_b_txid).unwrap().is_some(),
         "parent_b must REMAIN in storage; cancel after dispatch is refused",
     );
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     assert!(
         news.coordinator_news.iter().any(|n| matches!(
             n,
@@ -2932,7 +3018,7 @@ fn test_cancel_parent_edge_cases() {
     )
     .unwrap();
     assert!(reached, "CPFP must finalize after blocks are mined");
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // ---------------------------------------------------------------
     // Phase C: register a fresh parent and verify the post-rejection state is clean
@@ -3025,7 +3111,7 @@ fn test_cpfp_chain_survivor_after_parent_replaced() {
     let mut boost_txid = None;
     for _ in 0..8 {
         coordinator.tick().unwrap();
-        ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+        ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
         for s in coord_storage.get_speedups_ordered().unwrap() {
             if s.txid != root_cpfp && s.state == TransactionState::InMempool {
                 boost_txid = Some(s.txid);
@@ -3089,7 +3175,7 @@ fn test_rbf_of_root_survivor_after_parent_replaced() {
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let key_manager = TestKeyManager::new();
-    let mut settings = rebuild_settings(1);
+    let mut settings = rebuild_settings(3);
     settings.fee = FeeSettings {
         min_safe_fee_rate: 10,
         max_feerate_sat_vb: 1000,
@@ -3141,7 +3227,7 @@ fn test_rbf_of_root_survivor_after_parent_replaced() {
     let mut rbf_txid = None;
     for _ in 0..8 {
         coordinator.tick().unwrap();
-        ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+        ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
         for s in coord_storage.get_speedups_ordered().unwrap() {
             if s.txid != root_cpfp
                 && s.state == TransactionState::InMempool
@@ -3214,6 +3300,7 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
     // Guard window of 3 blocks gives slack to place p2's window a couple blocks behind p1's.
     let mut settings = rebuild_settings(5);
     settings.monitor.max_monitoring_confirmations = Some(3);
+    settings.monitor.finality = Some(3);
     let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings.clone());
     let coord_storage = get_coord_storage(&setup);
 
@@ -3289,13 +3376,13 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
     replace_parent_by_opponent(&setup.bitcoin_client, &setup.regtest_wallet, &p1_clone, 0).unwrap();
     std::thread::sleep(sleep);
     coordinator.tick().unwrap();
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Advance one block so p2's guard will start behind p1's.
     mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
     std::thread::sleep(sleep);
     coordinator.tick().unwrap();
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Kill p2 in its own block (its guard now trails p1's). The conflict pays a low fee (reclaims 99_000 of
     // the parent's 100_000 fee) so that, once we invalidate this block, the higher-fee p2 can RBF-replace the
@@ -3309,7 +3396,7 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
     .unwrap();
     std::thread::sleep(sleep);
     coordinator.tick().unwrap();
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Drive until p1's window elapses: the root fails (ParentFailed) and rebuild_survivors runs. p2 must
     // still be inside its own (later) window, so a fresh CPFP is built over the live p3 only, not p2.
@@ -3317,7 +3404,7 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
     for _ in 0..(max_confs + 4) * 3 {
         std::thread::sleep(sleep);
         coordinator.tick().unwrap();
-        ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+        ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
         let root_failed = coord_storage
             .get_tx_by_id(root_cpfp)
@@ -3387,7 +3474,7 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
         .unwrap(),
         "the fresh CPFP over p3 must reach the mempool"
     );
-    ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+    ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
 
     // Revert p2's disappearance: invalidate its kill block. p1's kill block is older and survives, so p1
     // stays dead, but p2's input is free again.
@@ -3402,7 +3489,7 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
     for i in 0..((max_confs + 4) * 3) {
         std::thread::sleep(sleep);
         coordinator.tick().unwrap();
-        ack_all_news(&coordinator, &coordinator.get_news().unwrap());
+        ack_all_news(&coordinator, &coordinator.get_news(None).unwrap());
         let p2_state = coord_storage
             .get_tx_by_id(p2_txid)
             .unwrap()
@@ -3452,6 +3539,148 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
         coord_storage.get_tx_by_id(p1_txid).unwrap().unwrap().state,
         TransactionState::Failed,
         "p1 must remain Failed after the reorg revert"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// 24 unconfirmed parents plus the CPFP itself is 25, within the limit: one CPFP covers all of them and the node accepts it.
+#[test]
+fn test_cpfp_within_ancestor_limit_covers_all_parents() {
+    init_trace();
+    let (setup, coordinator, coord_storage, parent_txids) = register_parents_with_speedup(24);
+
+    // Tick 1 builds the CPFP, tick 2 dispatches it; the helper asserts it reaches InMempool.
+    let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 1);
+    let covered = coord_storage
+        .get_tx_by_id(cpfp_txid)
+        .unwrap()
+        .unwrap()
+        .speedup_kind()
+        .unwrap()
+        .parents()
+        .len();
+    assert_eq!(
+        covered,
+        parent_txids.len(),
+        "the CPFP must cover all 24 parents"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// 25 unconfirmed parents plus the CPFP itself would be 26, over the limit, so no CPFP over all of them can be built. The
+/// coordinator builds the largest CPFP that fits (24 parents, accepted by the node) and the 25th parent stays pending.
+#[test]
+fn test_cpfp_over_ancestor_limit_leaves_parent_pending() {
+    init_trace();
+    let (setup, coordinator, coord_storage, parent_txids) = register_parents_with_speedup(25);
+
+    let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 1);
+    let covered = coord_storage
+        .get_tx_by_id(cpfp_txid)
+        .unwrap()
+        .unwrap()
+        .speedup_kind()
+        .unwrap()
+        .parents()
+        .to_vec();
+    assert_eq!(covered.len(), 24, "the CPFP must stop at 24 parents");
+
+    let pending: Vec<bitcoin::Txid> = coord_storage
+        .get_pending_speedup_parents()
+        .unwrap()
+        .iter()
+        .map(|t| t.txid)
+        .collect();
+    let left_out: Vec<bitcoin::Txid> = parent_txids
+        .into_iter()
+        .filter(|p| !covered.contains(p))
+        .collect();
+    assert_eq!(
+        pending, left_out,
+        "the parent left out must stay pending for a later CPFP"
+    );
+    assert_eq!(
+        coord_storage.get_speedups_ordered().unwrap().len(),
+        1,
+        "no second CPFP may be built while the chain is at the limit"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// An RBF rejected by the node for a fee reason has every input intact: the inputs it shares with its predecessor
+/// are spent in the mempool only by that predecessor, which the RBF replaces. So the rejection must take the retry
+/// path (step 3), like any other transient failure, and not be read as a missing input.
+#[test]
+fn test_rbf_fee_rejection_is_retried() {
+    init_trace();
+
+    // max_unconfirmed_ancestors = 2: the parent plus CPFP1 fill the package, so the first boost is an RBF.
+    let settings = rebuild_settings(2);
+    let retry_sleep =
+        std::time::Duration::from_millis(settings.coordinator.retry_interval_seconds * 1000 + 300);
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), settings);
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding_utxo = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &key_manager,
+        Network::Regtest,
+        2_000_000,
+    )
+    .unwrap();
+    let (parent_tx, speedup_data) =
+        create_coordinator_parent_tx(&setup.bitcoin_client, &key_manager, Network::Regtest, 1_000)
+            .unwrap();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding_utxo).unwrap();
+    coordinator
+        .dispatch_with_speedup(parent_tx, speedup_data, ctx("rbf_fee_reject"), None, None)
+        .unwrap();
+    let cpfp1_id = build_and_dispatch_cpfp(&coordinator, &coord_storage, 3);
+
+    // Raise CPFP1's modified fee in the node's mempool, so any replacement fails BIP125 rule 3 ("insufficient fee").
+    // The coordinator reads fees from its own storage, so the RBF it builds is unchanged.
+    let _: bool = setup
+        .bitcoin_client
+        .client
+        .call(
+            "prioritisetransaction",
+            &[
+                serde_json::json!(cpfp1_id.to_string()),
+                serde_json::json!(0),
+                serde_json::json!(100_000_000i64),
+            ],
+        )
+        .unwrap();
+
+    // The block makes CPFP1 stale, so this tick builds the RBF.
+    mine_empty_blocks(&setup.bitcoin_client, 1, &setup.regtest_wallet).unwrap();
+    coordinator.tick().unwrap();
+    let speedups = coord_storage.get_speedups_ordered().unwrap();
+    assert_eq!(speedups.len(), 2, "the boost must build an RBF");
+    let rbf_id = speedups[1].txid;
+    assert!(speedups[1].speedup_kind().unwrap().is_rbf());
+
+    // This tick sends the RBF and the node rejects it. Its inputs are intact, so it must stay queued for a retry.
+    std::thread::sleep(retry_sleep);
+    coordinator.tick().unwrap();
+    let rbf = coord_storage.get_tx_by_id(rbf_id).unwrap().unwrap();
+    assert_eq!(
+        (rbf.state, rbf.retry_count),
+        (TransactionState::ToDispatch, 1),
+        "a fee rejection of an RBF must be retried, not failed as a missing input"
     );
 
     drop(coordinator);

@@ -25,7 +25,7 @@ settings:
     base_fee_multiplier: 1.0
     min_safe_fee_rate: 1
   speedup:
-    max_unconfirmed_speedups: 10
+    max_unconfirmed_ancestors: 25
     min_blocks_before_resend_speedup: 1
     bump_fee_percentage: 1.5
   funding:
@@ -34,5 +34,6 @@ settings:
     max_tracking_confirmations: 10
   monitor:
         max_monitoring_confirmations: 6
+        finality: 6
         indexer_settings:
-            checkpoint_height: 0
+            retention_depth: 100
