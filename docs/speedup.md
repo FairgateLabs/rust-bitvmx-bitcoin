@@ -77,23 +77,40 @@ not live in the transaction store.
   consumed and inserts its change. These queue mutations emit no news: `TransactionEvicted` is reserved
   for settled `CoordinatedTx` records removed after `max_tracking_confirmations`, not funding UTXOs.
 
+## The mempool ancestor limit
+
+Bitcoin Core rejects a transaction whose unconfirmed ancestors, counting the
+transaction itself, exceed 25 (`-limitancestorcount`). 
+A new speedup chains on the live tip, so its package is:
+
+- the chain ancestors: every live (`InMempool`, not replaced) speedup plus every
+  coordinator-tracked `InMempool` transaction they spend from, directly or
+  through other such transactions;
+- for a first CPFP, each unconfirmed parent it covers and that parent's own
+  unconfirmed ancestors not already counted (a confirmed parent adds nothing);
+- the speedup itself.
+
+`max_unconfirmed_ancestors` bounds that
+package. The minimum is 2 because the smallest CPFP package is one unconfirmed
+parent plus the CPFP. Ancestors the coordinator does not track are not counted.
+
 ## CPFP versus RBF
 
-Each boost is either a new CPFP or an RBF. The choice depends only on how many
-speedups are currently unconfirmed in the mempool:
+Each boost is either a new CPFP or an RBF. The choice depends on whether a CPFP
+boost on the tip still fits the ancestor limit:
 
 ```mermaid
 flowchart TD
     Stale{Tip stale and below cap?} -->|no| Skip[do nothing]
-    Stale -->|yes| Count{unconfirmed >= max_unconfirmed_speedups?}
+    Stale -->|yes| Count{chain ancestors + 1 > max_unconfirmed_ancestors?}
     Count -->|no| CPFP[Build boost as a new CPFP]
     Count -->|yes| RBF[Build boost as an RBF replacing the tip]
 ```
 
 | Boost kind | Built when | Effect |
 |---|---|---|
-| CPFP | Unconfirmed speedup count is below `max_unconfirmed_speedups`. | Adds another child on top of the chain tip. |
-| RBF | Unconfirmed count has reached `max_unconfirmed_speedups`. | Replaces the chain tip in place, reusing its inputs and paying more. |
+| CPFP | The chain ancestors plus the boost itself fit `max_unconfirmed_ancestors`. | Adds another child on top of the chain tip. |
+| RBF | A CPFP boost would exceed `max_unconfirmed_ancestors`. | Replaces the chain tip in place, reusing its inputs and paying more. It adds no ancestor, so it always fits. |
 
 A boost is considered only when the live tip has aged at least
 `min_blocks_before_resend_speedup` blocks and its package fee rate

@@ -12,7 +12,7 @@ is not guaranteed.
 
 | Assumption | Why it holds |
 |---|---|
-| A single coordinator instance runs against the storage. | State (slot accounting, funding chain, fee-rate state) assumes one writer. |
+| A single coordinator instance runs against the storage. | State (ancestor accounting, funding chain, fee-rate state) assumes one writer. |
 | The node runs with `-txindex=1`. | Classification reads live node state for any txid, even when its outputs are already spent. Not checked by the coordinator: construction makes no node call, so the operator must ensure it. |
 | The operator does not spend a registered funding UTXO or a registered parent out of band. | The coordinator owns those outputs and is the only intended spender. |
 | Reorgs deeper than the monitor's `finality` do not happen. | A `Finalized` transaction is treated as permanent and is never re-examined. |

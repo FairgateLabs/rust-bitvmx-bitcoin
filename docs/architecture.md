@@ -227,7 +227,7 @@ defaults in `src/config/settings.rs`. The groups that shape behavior:
 | `fee` | `min_safe_fee_rate` | Floor and fallback for the effective speedup fee rate. |
 | `fee` | `max_feerate_sat_vb` | Hard cap on the speedup package fee rate (parents + child). |
 | `fee` | `base_fee_multiplier` | Multiplier on the network estimate. |
-| `speedup` | `max_unconfirmed_speedups` | Boost stays CPFP below this in-mempool count, switches to RBF at it. |
+| `speedup` | `max_unconfirmed_ancestors` | Maximum unconfirmed txs in a new speedup's package, counting the speedup itself. Bounds each CPFP batch; a boost switches to RBF when a CPFP boost would exceed it. |
 | `speedup` | `min_blocks_before_resend_speedup` | Blocks a speedup tip must age before it is boosted. |
 | `speedup` | `bump_fee_percentage` | Fee escalation factor applied on each boost/RBF. |
 | `funding` | `min_funding_amount_sats` | Minimum accepted funding UTXO size. |

@@ -39,7 +39,7 @@ fn cpfp_settings() -> BitcoinSettings {
             max_tracking_confirmations: 1, // 1 block tracking after finalization before eviction
         },
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: 2,         // A second boost creates RBF
+            max_unconfirmed_ancestors: 3,        // A second boost creates RBF
             min_blocks_before_resend_speedup: 1, // Enables boost after one block
             bump_fee_percentage: 1.5,
         },
@@ -55,7 +55,7 @@ fn cpfp_settings() -> BitcoinSettings {
 fn boost_settings(max_unconfirmed: u32) -> BitcoinSettings {
     BitcoinSettings {
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: max_unconfirmed,
+            max_unconfirmed_ancestors: max_unconfirmed,
             min_blocks_before_resend_speedup: 1,
             bump_fee_percentage: 2.0,
         },
@@ -88,7 +88,7 @@ fn cap_settings() -> BitcoinSettings {
             base_fee_multiplier: 1.0,
         },
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: 5,
+            max_unconfirmed_ancestors: 5,
             min_blocks_before_resend_speedup: 1,
             bump_fee_percentage: 2.0,
         },
@@ -138,7 +138,7 @@ fn build_and_dispatch_cpfp(
 /// (slots free) or an RBF replacement (slots full).
 fn rebuild_settings(max_unconfirmed: u32) -> BitcoinSettings {
     let mut s = cpfp_settings();
-    s.speedup.max_unconfirmed_speedups = max_unconfirmed;
+    s.speedup.max_unconfirmed_ancestors = max_unconfirmed;
     s
 }
 
@@ -258,6 +258,51 @@ fn drive_dead_parent_recovery(
         "the surviving parent and its fresh CPFP must confirm"
     );
     survivor_cpfp
+}
+
+/// Fund the coordinator and register `n` independent parents with speedup at once, with `max_unconfirmed_ancestors`
+/// at 25. Returns the parent txids.
+fn register_parents_with_speedup(
+    n: usize,
+) -> (
+    TestSetup,
+    BitcoinCoordinator,
+    CoordinatorStorage,
+    Vec<bitcoin::Txid>,
+) {
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let key_manager = TestKeyManager::new();
+    let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), rebuild_settings(25));
+    let coord_storage = get_coord_storage(&setup);
+
+    let funding = create_funded_speedup_utxo(
+        &setup.bitcoin_client,
+        &key_manager,
+        Network::Regtest,
+        5_000_000,
+    )
+    .unwrap();
+    let parents: Vec<_> = (0..n)
+        .map(|_| {
+            create_coordinator_parent_tx(
+                &setup.bitcoin_client,
+                &key_manager,
+                Network::Regtest,
+                10_000,
+            )
+            .unwrap()
+        })
+        .collect();
+    let parent_txids = parents.iter().map(|(tx, _)| tx.compute_txid()).collect();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator.add_funding(funding).unwrap();
+    for (i, (tx, sd)) in parents.into_iter().enumerate() {
+        coordinator
+            .dispatch_with_speedup(tx, sd, ctx(&format!("parent_{i}")), None, None)
+            .unwrap();
+    }
+    (setup, coordinator, coord_storage, parent_txids)
 }
 
 // =============================================================================
@@ -1047,7 +1092,7 @@ fn test_cpfp_fee_escalates_across_boosts() {
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let key_manager = TestKeyManager::new();
-    // max_unconfirmed_speedups large enough that every boost stays CPFP (not RBF).
+    // max_unconfirmed_ancestors large enough that every boost stays CPFP (not RBF).
     let coordinator = create_coordinator_with_km(&setup, key_manager.rc(), boost_settings(20));
     let coord_storage = get_coord_storage(&setup);
 
@@ -1339,7 +1384,7 @@ fn test_boost_cap_reached() {
     setup.end_all().unwrap();
 }
 
-/// When `boost_if_stale` selects RBF (in-mempool count reached `max_unconfirmed_speedups`) and
+/// When `boost_if_stale` selects RBF (in-mempool count reached `max_unconfirmed_ancestors`) and
 /// the BIP-125 bandwidth floor would exceed the configured  `max_feerate_sat_vb` cap, the RBF
 /// is still built, clamped at the cap, but bitcoind will reject the broadcast for being below
 /// the floor. To break the doomed-retry busy-loop, `boost_if_stale` marks the predecessor at-cap
@@ -1350,7 +1395,7 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
     init_trace();
 
     // Network rate floors at 6; cap is 10. RBF bandwidth floor would be
-    // 6 × 2 = 12 sat/vB, above the cap. max_unconfirmed_speedups = 1 forces
+    // 6 × 2 = 12 sat/vB, above the cap. max_unconfirmed_ancestors = 2 forces
     // the first boost to be an RBF.
     let settings = BitcoinSettings {
         fee: FeeSettings {
@@ -1359,7 +1404,7 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
             base_fee_multiplier: 1.0,
         },
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: 1,
+            max_unconfirmed_ancestors: 2,
             min_blocks_before_resend_speedup: 1,
             bump_fee_percentage: 1.5,
         },
@@ -1460,9 +1505,9 @@ fn test_rbf_floor_above_cap_marks_predecessor_terminal() {
     setup.end_all().unwrap();
 }
 
-/// Once the in-mempool speedup count reaches max_unconfirmed_speedups, the next boost switches from CPFP to RBF.
+/// Once the in-mempool speedup count reaches max_unconfirmed_ancestors, the next boost switches from CPFP to RBF.
 /// After the RBF is dispatched, the predecessor must have its `replaced_by` set so the funding walk-back and
-/// boost_if_stale skip it. cpfp_settings: max_unconfirmed_speedups = 2.
+/// boost_if_stale skip it. cpfp_settings: max_unconfirmed_ancestors = 3.
 #[test]
 fn test_cpfp_rbf_after_max_unconfirmed_reached() {
     init_trace();
@@ -2703,7 +2748,7 @@ fn test_rbf_combines_when_inherited_funding_insufficient() {
             base_fee_multiplier: 1.0,
         },
         speedup: SpeedupSettings {
-            max_unconfirmed_speedups: 2,
+            max_unconfirmed_ancestors: 3,
             min_blocks_before_resend_speedup: 1,
             bump_fee_percentage: 2.0,
         },
@@ -3130,7 +3175,7 @@ fn test_rbf_of_root_survivor_after_parent_replaced() {
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let key_manager = TestKeyManager::new();
-    let mut settings = rebuild_settings(1);
+    let mut settings = rebuild_settings(3);
     settings.fee = FeeSettings {
         min_safe_fee_rate: 10,
         max_feerate_sat_vb: 1000,
@@ -3494,6 +3539,76 @@ fn test_batch_transiently_missing_parent_kept_then_recovered() {
         coord_storage.get_tx_by_id(p1_txid).unwrap().unwrap().state,
         TransactionState::Failed,
         "p1 must remain Failed after the reorg revert"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// 24 unconfirmed parents plus the CPFP itself is 25, within the limit: one CPFP covers all of them and the node accepts it.
+#[test]
+fn test_cpfp_within_ancestor_limit_covers_all_parents() {
+    init_trace();
+    let (setup, coordinator, coord_storage, parent_txids) = register_parents_with_speedup(24);
+
+    // Tick 1 builds the CPFP, tick 2 dispatches it; the helper asserts it reaches InMempool.
+    let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 1);
+    let covered = coord_storage
+        .get_tx_by_id(cpfp_txid)
+        .unwrap()
+        .unwrap()
+        .speedup_kind()
+        .unwrap()
+        .parents()
+        .len();
+    assert_eq!(
+        covered,
+        parent_txids.len(),
+        "the CPFP must cover all 24 parents"
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
+/// 25 unconfirmed parents plus the CPFP itself would be 26, over the limit, so no CPFP over all of them can be built. The
+/// coordinator builds the largest CPFP that fits (24 parents, accepted by the node) and the 25th parent stays pending.
+#[test]
+fn test_cpfp_over_ancestor_limit_leaves_parent_pending() {
+    init_trace();
+    let (setup, coordinator, coord_storage, parent_txids) = register_parents_with_speedup(25);
+
+    let cpfp_txid = build_and_dispatch_cpfp(&coordinator, &coord_storage, 1);
+    let covered = coord_storage
+        .get_tx_by_id(cpfp_txid)
+        .unwrap()
+        .unwrap()
+        .speedup_kind()
+        .unwrap()
+        .parents()
+        .to_vec();
+    assert_eq!(covered.len(), 24, "the CPFP must stop at 24 parents");
+
+    let pending: Vec<bitcoin::Txid> = coord_storage
+        .get_pending_speedup_parents()
+        .unwrap()
+        .iter()
+        .map(|t| t.txid)
+        .collect();
+    let left_out: Vec<bitcoin::Txid> = parent_txids
+        .into_iter()
+        .filter(|p| !covered.contains(p))
+        .collect();
+    assert_eq!(
+        pending, left_out,
+        "the parent left out must stay pending for a later CPFP"
+    );
+    assert_eq!(
+        coord_storage.get_speedups_ordered().unwrap().len(),
+        1,
+        "no second CPFP may be built while the chain is at the limit"
     );
 
     drop(coordinator);

@@ -111,7 +111,7 @@ impl Default for FeeSettings {
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct SpeedupSettings {
-    pub max_unconfirmed_speedups: u32,
+    pub max_unconfirmed_ancestors: u32, // Maximum unconfirmed txs in a new speedup's package, counting the speedup itself
     pub min_blocks_before_resend_speedup: u32,
     pub bump_fee_percentage: f64,
 }
@@ -119,7 +119,7 @@ pub struct SpeedupSettings {
 impl Default for SpeedupSettings {
     fn default() -> Self {
         Self {
-            max_unconfirmed_speedups: DEFAULT_MAX_UNCONFIRMED_SPEEDUPS,
+            max_unconfirmed_ancestors: DEFAULT_MAX_UNCONFIRMED_ANCESTORS,
             min_blocks_before_resend_speedup: DEFAULT_MIN_BLOCKS_BEFORE_RESEND_SPEEDUP,
             bump_fee_percentage: DEFAULT_BUMP_FEE_PERCENTAGE,
         }
@@ -154,10 +154,11 @@ impl Default for CoordinatorStorageSettings {
 
 impl BitcoinSettings {
     pub fn validate(&self) -> Result<(), BitcoinCoordinatorError> {
+        // The smallest CPFP package is one unconfirmed parent plus the CPFP itself, so below 2 no CPFP could ever be built.
         ensure!(
-            self.speedup.max_unconfirmed_speedups > 0
-                && self.speedup.max_unconfirmed_speedups <= MAX_LIMIT_UNCONFIRMED_PARENTS,
-            "invalid max_unconfirmed_speedups"
+            self.speedup.max_unconfirmed_ancestors >= 2
+                && self.speedup.max_unconfirmed_ancestors <= MAX_LIMIT_UNCONFIRMED_PARENTS,
+            "invalid max_unconfirmed_ancestors"
         );
 
         ensure!(
@@ -245,17 +246,17 @@ mod tests {
             ));
         }
 
-        // max_unconfirmed_speedups: must be 1..=MAX_LIMIT_UNCONFIRMED_PARENTS
+        // max_unconfirmed_ancestors: must be 2..=MAX_LIMIT_UNCONFIRMED_PARENTS
         check(BitcoinSettings {
             speedup: SpeedupSettings {
-                max_unconfirmed_speedups: 0,
+                max_unconfirmed_ancestors: 1,
                 ..Default::default()
             },
             ..Default::default()
         });
         check(BitcoinSettings {
             speedup: SpeedupSettings {
-                max_unconfirmed_speedups: MAX_LIMIT_UNCONFIRMED_PARENTS + 1,
+                max_unconfirmed_ancestors: MAX_LIMIT_UNCONFIRMED_PARENTS + 1,
                 ..Default::default()
             },
             ..Default::default()

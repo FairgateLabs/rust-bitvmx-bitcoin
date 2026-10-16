@@ -206,7 +206,7 @@ suite is in `config/coordinator_config.yaml`; every field is optional and falls
 back to the defaults in `src/config/settings.rs`.
 
 > ⚠️ **Do not change `BitcoinSettings` values across a restart on the same
-> storage.** Several invariants (slot accounting, fee-rate state, retention
+> storage.** Several invariants (ancestor accounting, fee-rate state, retention
 > bounds) assume the configuration that produced the persisted state is the
 > one used to resume it. Reload the coordinator with the same settings, or
 > start from clean storage.
@@ -218,8 +218,7 @@ The main groups are:
 - `fee`: minimum, maximum, and base fee multipliers used by `FeeManager`. The
   `max_feerate_sat_vb` ceiling bounds the speedup PACKAGE effective fee rate
   (parents + child together), not the child transaction alone.
-- `speedup`: maximum unconfirmed speedups, resend spacing, and bump-fee
-  percentage.
+- `speedup`: maximum unconfirmed ancestors of a speedup package, resend spacing, and bump-fee percentage.
 - `funding`: minimum sat amount required for a funding UTXO.
 - `storage`: how long settled txs are tracked before eviction.
 - `monitor`: `finality` (the `Finalized` depth and the fail-guard window), max
