@@ -473,6 +473,15 @@ fn test_cancel_pending_tx_before_dispatch() {
     let coord_storage = get_coord_storage(&setup);
     assert!(coord_storage.get_tx_by_id(txid).unwrap().is_some());
 
+    // A cancel under another context must not touch the tx the coordinator tracks under "cancel_test".
+    coordinator
+        .cancel(&[MonitorTarget::Transaction(txid)], &ctx("other_context"))
+        .unwrap();
+    assert!(
+        coord_storage.get_tx_by_id(txid).unwrap().is_some(),
+        "a cancel under another context must leave the tx in storage"
+    );
+
     // Cancel before any dispatch tick.
     coordinator
         .cancel(&[MonitorTarget::Transaction(txid)], &ctx("cancel_test"))

@@ -238,10 +238,10 @@ impl BitcoinCoordinator {
     ///
     /// Only client-registered txs (`Normal` / `NeedsSpeedup`) still in `ToDispatch` state and never broadcast are
     /// cancellable. A tx re-queued to `ToDispatch` after a broadcast is refused, because it may still be mined.
-    /// Already-dispatched, Speedup-kind or funding txids are refused and a news item is
-    /// emitted per rejected txid. A txid the coordinator does not know (for example one registered only through
-    /// `monitor`) and other targets (`SpendingUtxo`, `OutputPattern`, `NewBlock`) pass through to monitor
-    /// cancellation as-is.
+    /// Already-dispatched, Speedup-kind or funding txids are refused and a news item is emitted per rejected txid.
+    /// A txid the coordinator does not know under `context` (for example one registered only through `monitor`,
+    /// or one it tracks under another context) and other targets (`SpendingUtxo`,`OutputPattern`, `NewBlock`) pass
+    /// through to monitor cancellation as-is.
     ///
     /// * `targets` - Monitoring targets to cancel.
     /// * `context` - The context the targets were registered with.
@@ -453,13 +453,14 @@ impl BitcoinCoordinator {
         let mut untracked: Vec<MonitorTarget> = Vec::new();
         for txid in &txids {
             let verdict = match self.tx_engine.ctx.storage.get_tx_by_id(*txid)? {
-                Some(tx) => Self::classify_cancel_request(&tx),
+                Some(tx) if tx.context == context => Self::classify_cancel_request(&tx),
                 None if self.tx_engine.ctx.funding_manager.is_funding_tx(*txid)? => {
                     Err("txid is a funding UTXO, not a tracked tx".to_string())
                 }
-                None => {
-                    // Not known to the coordinator, for example a tx registered only through `monitor()`, so only
-                    // the monitor can hold a subscription for it. Cancelling a target nothing watches is a no-op.
+                _ => {
+                    // Not known to the coordinator under this context, for example a tx registered only through
+                    // `monitor()`, so only the monitor can hold a subscription for it. A tx the coordinator tracks
+                    // under another context is left untouched. Cancelling a target nothing watches is a no-op.
                     untracked.push(MonitorTarget::Transaction(*txid));
                     continue;
                 }

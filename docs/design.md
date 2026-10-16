@@ -112,7 +112,7 @@ The fail guard is separate from this budget: it is block-paced, so a guarded tra
 | Already dispatched (`InMempool` / `Confirmed` / `Finalized` / `Failed`) | Refused with `InvalidCancel`. |
 | Back in `ToDispatch` after a broadcast (re-queued as not found, or deferred by the fail guard) | Refused with `InvalidCancel`. |
 | `Speedup` kind, or the txid of a registered funding UTXO | Refused with `InvalidCancel`. |
-| A txid the coordinator does not know (for example one registered only through `monitor`) | Passed straight through to the monitor under the given context. |
+| A txid the coordinator does not know under the given context (for example one registered only through `monitor`, or one it tracks under another context) | Passed straight through to the monitor under the given context. The coordinator's own record is left untouched. |
 | A non-`Transaction` monitoring target (`SpendingUtxo`, `OutputPattern`, `NewBlock`) | Passed straight through to the monitor under the given context. |
 
 ## News rules

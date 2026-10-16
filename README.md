@@ -57,7 +57,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full tick pipeline an
 
 > 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold. To unblock: dispatch a CPFP spending one of its outputs via `dispatch_without_speedup`. The coordinator tracks both and mines them together.
 
-> ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in `ToDispatch` and never broadcast are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` / `Finalized` / `Failed`, or back in `ToDispatch` after a broadcast), or if the txid is internal (Speedup) or a funding UTXO, the request is refused and a news item is emitted. A txid the coordinator does not know (for example one registered only through `monitor`) is passed to the monitor's cancel.
+> ⚠️ **`cancel` only works pre-dispatch.** Only `Normal` / `NeedsSpeedup` txs still in `ToDispatch` and never broadcast are cancellable. Once a tx has been broadcast (`InMempool` / `Confirmed` / `Finalized` / `Failed`, or back in `ToDispatch` after a broadcast), or if the txid is internal (Speedup) or a funding UTXO, the request is refused and a news item is emitted. A txid the coordinator does not know under the given context (for example one registered only through `monitor`, or one it tracks under another context) is passed to the monitor's cancel, and the coordinator's own record is left untouched.
 
 > ⚠️ **Ack news only AFTER acting on it.** News is deduplicated by value. Acking early means a second occurrence of the same event within the same block will NOT re-fire.
 
