@@ -859,6 +859,58 @@ fn test_cancel_dispatched_tx_refused() {
     setup.end_all().unwrap();
 }
 
+/// A tx that was broadcast and then re-queued to `ToDispatch` (review found it missing) may still be mined, so `cancel`
+/// must refuse it even though its state is `ToDispatch` again.
+#[test]
+fn test_cancel_requeued_broadcast_tx_refused() {
+    init_trace();
+
+    let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
+    let coordinator = create_coordinator(&setup);
+
+    let tx = create_signed_tx_to_dispatch(&setup.bitcoin_client).unwrap();
+    let txid = tx.compute_txid();
+
+    tick_until_ready(&coordinator).unwrap();
+    coordinator
+        .dispatch_without_speedup(tx, ctx("cancel_requeued"), None, None, None)
+        .unwrap();
+    coordinator.tick().unwrap();
+    let coord_storage = get_coord_storage(&setup);
+    assert_eq!(
+        coord_storage.get_tx_by_id(txid).unwrap().unwrap().state,
+        TransactionState::InMempool,
+        "tx must be InMempool before it is re-queued"
+    );
+
+    // The path review takes when a broadcast tx vanishes: back to ToDispatch, guard armed.
+    coord_storage.requeue_not_found(txid, 1_000).unwrap();
+    let requeued = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
+    assert_eq!(requeued.state, TransactionState::ToDispatch);
+    assert!(requeued.broadcast_block_height.is_some());
+
+    coordinator
+        .cancel(&[MonitorTarget::Transaction(txid)], &ctx("cancel_requeued"))
+        .unwrap();
+
+    assert!(
+        coord_storage.get_tx_by_id(txid).unwrap().is_some(),
+        "a re-queued broadcast tx must REMAIN in storage after cancel was refused"
+    );
+    let news = coordinator.get_news(None).unwrap();
+    assert!(
+        news.coordinator_news
+            .iter()
+            .any(|n| matches!(n, CoordinatorNews::InvalidCancel { txid: t, .. } if *t == txid)),
+        "InvalidCancel news must be emitted for the re-queued broadcast tx; got {:?}",
+        news.coordinator_news
+    );
+
+    drop(coordinator);
+    drop(coord_storage);
+    setup.end_all().unwrap();
+}
+
 /// `cancel` with a non-`Transaction` monitoring target (here `SpendingUtxo`)
 /// must take the pass-through arm: it forwards straight to `monitor.cancel`, touches no
 /// coordinator storage, and emits no `InvalidCancel` news.

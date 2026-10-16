@@ -236,7 +236,8 @@ impl BitcoinCoordinator {
 
     /// Cancels monitoring and removes the targeted transactions from coordinator storage.
     ///
-    /// Only client-registered txs (`Normal` / `NeedsSpeedup`) still in `ToDispatch` state are cancellable.
+    /// Only client-registered txs (`Normal` / `NeedsSpeedup`) still in `ToDispatch` state and never broadcast are
+    /// cancellable. A tx re-queued to `ToDispatch` after a broadcast is refused, because it may still be mined.
     /// Already-dispatched, Speedup-kind, fundings or missing txids are refused and a news item is
     /// emitted per rejected txid. Other targets (`SpendingUtxo`, `OutputPattern`, `NewBlock`) pass through to
     /// monitor cancellation as-is.
@@ -506,6 +507,14 @@ impl BitcoinCoordinator {
             return Ok(Err(format!(
                 "tx already dispatched (state={:?}); cancel is only valid in ToDispatch",
                 tx.state
+            )));
+        }
+        // A tx re-queued to ToDispatch after a broadcast (not found, or deferred by the fail guard) may still be mined,
+        // so it counts as dispatched: a broadcast cannot be undone.
+        if let Some(height) = tx.broadcast_block_height {
+            return Ok(Err(format!(
+                "tx already broadcast at height {}; cancel is only valid before the first broadcast",
+                height
             )));
         }
         Ok(Ok(()))

@@ -130,12 +130,14 @@ transaction can outlive the retry budget without being failed.
 ## Cancel contract
 
 `cancel` removes monitoring and storage only for client-registered transactions
-still in `ToDispatch`.
+still in `ToDispatch` that were never broadcast. A broadcast cannot be undone, so
+a transaction that vanished and was re-queued for a resend may still be mined.
 
 | Target | Result |
 |---|---|
-| `Normal` or `NeedsSpeedup` in `ToDispatch` | Cancelled: removed from storage, monitoring, and the pending-speedup set. |
+| `Normal` or `NeedsSpeedup` in `ToDispatch`, never broadcast | Cancelled: removed from storage, monitoring, and the pending-speedup set. |
 | Already dispatched (`InMempool` / `Confirmed` / `Finalized` / `Failed`) | Refused with `InvalidCancel`. |
+| Back in `ToDispatch` after a broadcast (re-queued as not found, or deferred by the fail guard) | Refused with `InvalidCancel`. |
 | `Speedup` kind, or an unknown txid (a funding UTXO is not a tracked tx, so it is refused as not found) | Refused with `InvalidCancel`. |
 | A non-`Transaction` monitoring target (`SpendingUtxo`, `OutputPattern`, `NewBlock`) | Passed straight through to the monitor under the given context. |
 
