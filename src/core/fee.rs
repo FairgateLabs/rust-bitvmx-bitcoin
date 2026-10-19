@@ -227,7 +227,6 @@ mod tests {
 
         drop(monitor);
         storage.remove().unwrap();
-        bitcoind.stop().unwrap();
     }
 
     /// `get_network_fee_rate` lifts a low network estimate (or the
@@ -253,7 +252,6 @@ mod tests {
 
         drop(monitor);
         storage.remove().unwrap();
-        bitcoind.stop().unwrap();
     }
 
     /// When `min_safe_fee_rate` exceeds `max_feerate_sat_vb`, the network rate
@@ -290,7 +288,6 @@ mod tests {
 
         drop(monitor);
         storage.remove().unwrap();
-        bitcoind.stop().unwrap();
     }
 
     #[test]

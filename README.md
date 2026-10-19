@@ -190,9 +190,12 @@ cargo build --tests
 # Run the unit test suite.
 cargo test --lib
 
-# Run integration tests (require Docker running; one bitcoind per test).
+# Run integration tests (require Docker running; one bitcoind per test binary).
 cargo test
 ```
+
+The tests of each test binary share one regtest node in the `bitcoin-regtest` Docker container, restarted only when a test needs different node flags. Each test gets its own storage. The container keeps running after the tests finish and the next run replaces it; remove it by hand with `docker rm -f bitcoin-regtest`.
+
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a pull request on GitHub.

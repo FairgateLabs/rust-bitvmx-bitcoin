@@ -1330,7 +1330,7 @@ fn test_stuck_in_mempool_cpfp_resolution() {
 #[test]
 fn test_retry_dispatches_after_rate_limit() {
     init_trace();
-    let retry_interval_seconds = 5u64;
+    let retry_interval_seconds = 2u64;
 
     let setup = TestSetup::new(TestSetupConfig::default()).unwrap();
     let settings = BitcoinSettings {
@@ -1423,7 +1423,7 @@ fn test_retry_dispatches_after_rate_limit() {
 fn test_retry_failure() {
     init_trace();
     // Long enough that consecutive ticks are reliably below the rate-limit window.
-    let retry_interval_seconds = 8u64;
+    let retry_interval_seconds = 3u64;
 
     // Non-zero min_relay_tx_fee ensures our zero-fee tx is always rejected.
     let setup = TestSetup::new(TestSetupConfig {
@@ -1493,7 +1493,7 @@ fn test_retry_failure() {
 
     // Wait for the retry interval, then tick.  Third attempt: retry_count + 1 = 3
     // >= retry_attempts_sending_tx (3) → tx is marked Failed + DispatchError news.
-    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 5));
+    std::thread::sleep(std::time::Duration::from_secs(retry_interval_seconds + 1));
     coordinator.tick().unwrap();
     let stored = coord_storage.get_tx_by_id(txid).unwrap().unwrap();
     assert_eq!(

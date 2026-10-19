@@ -310,33 +310,27 @@ mod tests {
     fn test_valid_tx_passes_partition() {
         let tx = tx_with_input(1);
         let weight = tx.tx.weight().to_wu();
-        let (d, bitcoind) = dispatcher(weight + 100);
+        let (d, _bitcoind) = dispatcher(weight + 100);
         let (valid, failures) = d.validate(vec![tx]);
         assert_eq!(valid.len(), 1);
         assert!(failures.is_empty());
-
-        drop(d);
-        bitcoind.stop().unwrap();
     }
 
     #[test]
     fn test_overweight_tx_is_fatal() {
         let tx = get_dummy_tx();
         let weight = tx.tx.weight().to_wu();
-        let (d, bitcoind) = dispatcher(weight - 1);
+        let (d, _bitcoind) = dispatcher(weight - 1);
         let (valid, failures) = d.validate(vec![tx]);
         assert!(valid.is_empty());
         assert_eq!(failures.len(), 1);
         assert!(matches!(failures[0].1, DispatchOutcome::Fatal(_)));
-
-        drop(d);
-        bitcoind.stop().unwrap();
     }
 
     #[test]
     fn test_mixed_txs_partitioned_correctly() {
         let weight = tx_with_input(1).tx.weight().to_wu();
-        let (d, bitcoind) = dispatcher(weight); // exactly at limit
+        let (d, _bitcoind) = dispatcher(weight); // exactly at limit
 
         // Slightly under limit → both txs fail validation as overweight.
         let d2 = dispatcher_with_client(weight - 1, Rc::clone(&d.bitcoin_client));
@@ -349,9 +343,6 @@ mod tests {
         let (valid, failures) = d.validate(vec![tx_with_input(1), tx_with_input(2)]);
         assert_eq!(valid.len(), 2);
         assert!(failures.is_empty());
-        drop(d);
-
-        bitcoind.stop().unwrap();
     }
 
     #[test]
@@ -365,7 +356,7 @@ mod tests {
 
         // Case A, weight overflow: two parents each of `single_weight` but max_tx_weight = single_weight + 1
         // (fits the first, overflows on the second). Expect two batches of 1 each (up to max_batches=10).
-        let (d, bitcoind) = dispatcher(single_weight + 1);
+        let (d, _bitcoind) = dispatcher(single_weight + 1);
         let two = vec![p1.clone(), p2.clone()];
         let batches = d.batch_by_weight(&two, 10);
         assert_eq!(batches.len(), 2, "weight overflow must open a new batch");
@@ -379,9 +370,6 @@ mod tests {
         assert_eq!(batches.len(), 2, "batch count must not exceed max_batches");
         assert_eq!(batches[0].len(), 1);
         assert_eq!(batches[1].len(), 1);
-
-        drop(d);
-        bitcoind.stop().unwrap();
     }
 
     /// A tx with no inputs is trivially ready and the dispatcher proceeds to send.
@@ -400,7 +388,6 @@ mod tests {
 
         drop(d);
         drop(monitor);
-        bitcoind.stop().unwrap();
         storage_cfg.remove().unwrap();
     }
 
@@ -451,7 +438,6 @@ mod tests {
         drop(d_tracked);
         drop(d_untracked);
         drop(monitor);
-        bitcoind.stop().unwrap();
         storage_cfg.remove().unwrap();
     }
 }

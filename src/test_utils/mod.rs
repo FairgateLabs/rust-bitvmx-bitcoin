@@ -143,23 +143,35 @@ pub fn cpfp_coordinated_tx(seed: u8, fee_rate: u64) -> CoordinatedTx {
 // =============================================================================
 static RPC_LOCK: Mutex<()> = Mutex::new(());
 
+/// Flags of the node this test binary started, `None` before the first start. Starting a container takes about 2
+/// seconds, so a test reuses the running node when it asks for the same flags. The container keeps running after the
+/// process exits, and the next run's first start replaces it.
+static NODE_FLAGS: Mutex<Option<String>> = Mutex::new(None);
+
 pub struct TestBitcoind {
     pub rpc_config: RpcConfig,
-    bitcoind: Bitcoind,
+    pub fresh: bool, // True when this test started a fresh node (empty chain), false when it reuses the running one
     _guard: std::sync::MutexGuard<'static, ()>,
 }
 
 impl TestBitcoind {
-    pub fn new(
-        rpc_config: Option<RpcConfig>,
-        flags: Option<BitcoindFlags>,
-    ) -> Result<Self, anyhow::Error> {
+    pub fn new(flags: Option<BitcoindFlags>) -> Result<Self, anyhow::Error> {
         let _guard = RPC_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let rpc_config = rpc_config.unwrap_or_else(Self::default_rpc_config);
-        let bitcoind = Self::create_and_start_bitcoind(&rpc_config, flags)?;
+        let rpc_config = Self::default_rpc_config();
+        let flags_key = format!("{:?}", flags.clone().unwrap_or_default());
+
+        let mut node_flags = NODE_FLAGS.lock().unwrap_or_else(|e| e.into_inner());
+        let fresh = node_flags.as_deref() != Some(flags_key.as_str());
+        if fresh {
+            // Cleared first so a failed start leaves no node recorded as running.
+            *node_flags = None;
+            Self::start_bitcoind(&rpc_config, flags)?;
+            *node_flags = Some(flags_key);
+        }
+
         Ok(Self {
-            rpc_config: Self::default_rpc_config(),
-            bitcoind,
+            rpc_config,
+            fresh,
             _guard,
         })
     }
@@ -175,13 +187,12 @@ impl TestBitcoind {
             format!("test_wallet_{}", Uuid::new_v4()),
         )
     }
-    /// Creates and starts bitcoind with optional flags
-    fn create_and_start_bitcoind(
-        config_bitcoin_client: &RpcConfig,
+    /// Starts the bitcoind container with optional flags, replacing any container running under the same name.
+    fn start_bitcoind(
+        rpc_config: &RpcConfig,
         flags: Option<BitcoindFlags>,
-    ) -> Result<Bitcoind, anyhow::Error> {
-        let bitcoind_config = BitcoindConfig::default();
-        let bitcoind = Bitcoind::new(bitcoind_config, config_bitcoin_client.clone(), flags);
+    ) -> Result<(), anyhow::Error> {
+        let bitcoind = Bitcoind::new(BitcoindConfig::default(), rpc_config.clone(), flags);
 
         info!("Starting bitcoind");
         bitcoind.start().map_err(|e| {
@@ -189,21 +200,13 @@ impl TestBitcoind {
                 "Failed to start bitcoind: {:?}. Make sure Docker is running.",
                 e
             )
-        })?;
-
-        Ok(bitcoind)
-    }
-
-    pub fn stop(self) -> Result<(), anyhow::Error> {
-        info!("Stopping bitcoind");
-        self.bitcoind.stop()?;
-        Ok(())
+        })
     }
 }
 
 impl default::Default for TestBitcoind {
     fn default() -> Self {
-        Self::new(None, None).unwrap()
+        Self::new(None).unwrap()
     }
 }
 

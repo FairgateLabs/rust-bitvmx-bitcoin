@@ -2115,7 +2115,7 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
 #[test]
 fn test_retry_rate_limit_shared_across_engines() {
     init_trace();
-    let retry_interval_seconds = 8u64;
+    let retry_interval_seconds = 3u64;
 
     let settings = BitcoinSettings {
         coordinator: CoordinatorSettings {
