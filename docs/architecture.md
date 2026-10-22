@@ -1,22 +1,14 @@
 # Architecture
 
-How the coordinator is put together and how a single `tick()` moves transactions
-through their lifecycle. This document describes the present behavior. For the
-rules and reasons behind it, see [design.md](design.md). For the speedup
-subsystem in depth, see [speedup.md](speedup.md).
+How the coordinator is put together and how a single `tick()` moves transactions through their lifecycle. This document describes the present behavior. For the rules and reasons behind it, see [design.md](design.md). For the speedup subsystem in depth, see [speedup.md](speedup.md).
 
 ## What the coordinator does
 
-`BitcoinCoordinator` sits between application code and a Bitcoin node. The
-application registers signed transactions; the coordinator broadcasts them,
-follows each one on-chain, keeps stuck ones moving with CPFP/RBF speedups, and
-reports every state change back as news. All progress happens inside `tick()`,
-which the application calls on a timer.
+`BitcoinCoordinator` sits between application code and a Bitcoin node. The application registers signed transactions; the coordinator broadcasts them, follows each one on-chain, keeps stuck ones moving with CPFP/RBF speedups, and reports every state change back as news. All progress happens inside `tick()`, which the application calls on a timer.
 
 ## Components
 
-`BitcoinCoordinator` owns two engines. Both engines hold an `Rc<EngineContext>`,
-so they share one set of services and one storage handle.
+`BitcoinCoordinator` owns two engines. Both engines hold an `Rc<EngineContext>`, so they share one set of services and one storage handle.
 
 ```mermaid
 flowchart TD
@@ -49,8 +41,7 @@ flowchart TD
 
 ## The unit of work: `CoordinatedTx`
 
-Every transaction the coordinator knows about is a `CoordinatedTx`. Its `kind`
-decides which engine owns it and what the coordinator may do with it.
+Every transaction the coordinator knows about is a `CoordinatedTx`. Its `kind` decides which engine owns it and what the coordinator may do with it.
 
 | `TxKind` | Meaning | Owned by |
 |---|---|---|
@@ -58,15 +49,11 @@ decides which engine owns it and what the coordinator may do with it.
 | `NeedsSpeedup(data)` | Parent that wants a CPFP. Carries signing/UTXO metadata until the CPFP is built. | `TransactionEngine` |
 | `Speedup(CPFP \| RBF)` | A speedup the coordinator built. | `SpeedupEngine` |
 
-Funding UTXOs are not `CoordinatedTx` records. They live in a separate funding queue keyed by their
-`OutPoint` (txid + vout), so several UTXOs from the same funding transaction coexist. See
-[speedup.md](speedup.md) for the queue model.
+Funding UTXOs are not `CoordinatedTx` records. They live in a separate funding queue keyed by their `OutPoint` (txid + vout), so several UTXOs from the same funding transaction coexist. See [speedup.md](speedup.md) for the queue model.
 
 ## Transaction lifecycle
 
-A `CoordinatedTx` carries a `TransactionState`. The forward path is
-`ToDispatch -> InMempool -> Confirmed -> Finalized`. The remaining edges exist
-for crash recovery, mempool eviction, and reorgs.
+A `CoordinatedTx` carries a `TransactionState`. The forward path is `ToDispatch -> InMempool -> Confirmed -> Finalized`. The remaining edges exist for crash recovery, mempool eviction, and reorgs.
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'catmullRom'}}}%%
@@ -95,20 +82,16 @@ stateDiagram-v2
 | `ToDispatch` | Registered, not yet broadcast (or re-queued for re-broadcast). |
 | `InMempool` | Accepted by the node, waiting to be mined. |
 | `Confirmed` | Mined, below the finality threshold. |
-| `Finalized` | Reached `max_monitoring_confirmations`. Treated as permanent. |
+| `Finalized` | Reached the monitor's `finality` confirmations. Treated as permanent. |
 | `Failed` | Terminal failure. Settled by classification or RBF cleanup. |
 
-`Finalized` and `Failed` are terminal for processing; records sit there until
-`max_tracking_confirmations` blocks pass, then storage evicts them and emits
-`TransactionEvicted`.
+`Finalized` and `Failed` are terminal for processing; records sit there until `max_tracking_confirmations` blocks pass, then storage evicts them and emits `TransactionEvicted`. A client `Failed` tx dispatched again is registered from scratch, replacing its old record.
 
 ## The tick pipeline
 
-`tick()` first advances the monitor and returns early if the monitor has not
-caught up with the chain (`is_ready()` is false). Once ready, it cleans up
-acknowledged news and runs six steps in a fixed order. Review steps never
-broadcast; dispatch steps never decide finality. The order is load-bearing and
-is explained in [design.md](design.md).
+`tick()` first advances the monitor and returns early if the monitor has not caught up with the chain (`is_ready()` is false). Once ready, it cleans up acknowledged news and runs six steps in a fixed order. Review steps never broadcast; dispatch steps never decide finality. The order is load-bearing and is explained in [design.md](design.md).
+
+The coordinator's clock is the monitor's indexed height. It is unknown until the first `tick()`, so the coordinator must tick once before any other API call (a `dispatch*` call before that returns an error).
 
 ```mermaid
 %%{init: {'flowchart': {'curve': 'step'}}}%%
@@ -126,23 +109,18 @@ flowchart LR
 
 | Step | Method | What it does | Dispatches? |
 |---|---|---|---|
-| 1 | `review_active` | Reads chain status of in-flight `Normal` / `NeedsSpeedup` txs. Applies reorg, finalize, confirm, orphan, and not_found transitions. | No |
+| 1 | `review_active` | Reads chain status of in-flight `Normal` / `NeedsSpeedup` txs. Applies reorg, finalize, confirm, and not_found transitions. | No |
 | 2 | `review_speedups` | Same review for speedups. Re-queues evicted speedups, settles replaced RBF chains. | No |
 | 3 | `dispatch_pending` | Broadcasts `ToDispatch` non-speedups whose `target_block_height` is reached. | Yes |
 | 4 | `dispatch_pending_speedups` | Broadcasts `ToDispatch` speedups built in a prior tick or re-queued in step 2. | Yes |
 | 5 | `boost_if_stale` | If the live speedup tip is stale, builds one boost (CPFP or RBF) and saves it `ToDispatch`. | No (saves only) |
 | 6 | `create_cpfp_batch` | Builds one CPFP covering pending `NeedsSpeedup` parents and saves it `ToDispatch`. | No (saves only) |
 
-Steps 3 and 4 are ordered parent-before-child: a re-dispatched parent is back in
-the node mempool before its CPFP is re-broadcast in the same tick. Steps 5 and 6
-only build and save; the broadcast happens on the next tick.
+Steps 3 and 4 are ordered parent-before-child: a re-dispatched parent is sent before its CPFP, and the CPFP follows on the next tick, once the mempool snapshot shows the parent. Steps 5 and 6 only build and save; the broadcast happens on the next tick.
 
 ## Dispatch classification
 
-When the dispatcher broadcasts a transaction it returns one of four outcomes.
-The engine, not the error string, decides what the outcome means by probing live
-node state. This requires the node to run with `-txindex=1`, which the
-coordinator asserts at construction.
+When the dispatcher broadcasts a transaction it returns one of four outcomes. The engine, not the error string, decides what the outcome means by probing live node state. This requires the node to run with `-txindex=1`. The coordinator does not check it: construction makes no node call.
 
 ```mermaid
 flowchart TD
@@ -169,27 +147,15 @@ flowchart TD
 
 Classification of a `DispatchError`:
 
-1. `getrawtransaction(txid)` says the node already has it. `Some(0)` means the
-   mempool already holds it, treat as accepted. `Some(n>=1)` means it is already
-   mined, settle `Confirmed`.
-2. The tx is absent, so a missing or spent input is definitive. A funding input
-   gone means recreate funding; an external or parent input gone means fail. Both
-   branches are first gated by the reorg-flap fail guard (see
-   [design.md](design.md)).
-3. Inputs are intact and the cause is unknown (fee or policy). Retry until
-   `retry_attempts_sending_tx` is spent, then fail.
+1. `getrawtransaction(txid)` says the node already has it. `Some(0)` means the mempool already holds it, treat as accepted. `Some(n>=1)` means it is already mined, settle `Confirmed`.
+2. The tx is absent, so a missing or spent input is definitive. A funding input gone means recreate funding; an external or parent input gone means fail. Both branches are first gated by the reorg-flap fail guard (see [design.md](design.md)). An RBF's inputs shared with its `InMempool` predecessor are not counted as gone.
+3. Inputs are intact and the cause is unknown (fee or policy). Retry until `retry_attempts_sending_tx` is spent, then fail.
 
-The `Failed` paths route through `fail_and_cascade`, which also settles every
-`ToDispatch` speedup that depends on the failed transaction.
+The `Failed` paths route through `fail_and_cascade`, which also settles every `ToDispatch` speedup that depends on the failed transaction.
 
 ## News
 
-Every meaningful event is published as news. The application pulls news with
-`get_news()` and must acknowledge each item with `ack_news()` after acting on it.
-`get_news()` is a pure read: it returns every unacknowledged item on each call, so
-an item keeps reappearing until it is acknowledged. Identical news is stored only
-once (deduplicated by value). Internal CPFP/RBF speedup transactions are filtered
-out of the transaction news the client sees.
+Every meaningful event is published as news. The application pulls news with `get_news(max_keys)` and must acknowledge each item with `ack_news()` after acting on it. `get_news` returns every unacknowledged client item on each call, so an item keeps reappearing until it is acknowledged. `max_keys` limits the monitor news to what is pending about the first `max_keys` transactions and block heights (`None` for all); coordinator news is always returned in full. Identical coordinator news is stored only once (deduplicated by value). Monitor news about internal CPFP/RBF speedup transactions is filtered out of what the client sees and acknowledged inside `get_news`, since nothing reads it and the monitor keeps every item until it is acknowledged. That speedup news counts toward `max_keys`, so a limited call can return fewer client items, and the next call moves on.
 
 | News | Fired when |
 |---|---|
@@ -207,24 +173,22 @@ out of the transaction news the client sees.
 
 ## Configuration
 
-Tuning lives in `BitcoinSettings`. Every field is optional and falls back to the
-defaults in `src/config/settings.rs`. The groups that shape behavior:
+Tuning lives in `BitcoinSettings`. Every field is optional and falls back to the defaults in `src/config/settings.rs`. The groups that shape behavior:
 
 | Group | Field | Role |
 |---|---|---|
 | `coordinator` | `retry_interval_seconds` | Minimum wall-clock gap between retry batches. |
-| `coordinator` | `retry_attempts_sending_tx` | Retry budget before a transient failure becomes `Failed`. |
+| `coordinator` | `retry_attempts_sending_tx` | Retry budget before a transient failure becomes `Failed`. Reset when the tx is accepted. |
 | `dispatcher` | `max_tx_weight` | Upper bound on broadcastable weight. Over it is `Fatal`. |
 | `fee` | `min_safe_fee_rate` | Floor and fallback for the effective speedup fee rate. |
 | `fee` | `max_feerate_sat_vb` | Hard cap on the speedup package fee rate (parents + child). |
 | `fee` | `base_fee_multiplier` | Multiplier on the network estimate. |
-| `speedup` | `max_unconfirmed_speedups` | Boost stays CPFP below this in-mempool count, switches to RBF at it. |
+| `speedup` | `max_unconfirmed_ancestors` | Maximum unconfirmed txs in a new speedup's package, counting the speedup itself. Bounds each CPFP batch; a boost switches to RBF when a CPFP boost would exceed it. |
 | `speedup` | `min_blocks_before_resend_speedup` | Blocks a speedup tip must age before it is boosted. |
 | `speedup` | `bump_fee_percentage` | Fee escalation factor applied on each boost/RBF. |
 | `funding` | `min_funding_amount_sats` | Minimum accepted funding UTXO size. |
 | `storage` | `max_tracking_confirmations` | Blocks a settled record is kept before eviction. |
-| `monitor` | `max_monitoring_confirmations` | Confirmations to reach `Finalized`. Also the fail-guard window. |
+| `monitor` | `finality` | Confirmations to reach `Finalized`. Also the fail-guard window. The lowest valid `confirmation_trigger`. |
+| `monitor` | `max_monitoring_confirmations` | The highest valid `confirmation_trigger`. Must be at least `finality`. |
 
-Settings must not change across a restart on the same storage. Several
-invariants assume the configuration that produced the persisted state is the one
-used to resume it.
+Settings must not change across a restart on the same storage. Several invariants assume the configuration that produced the persisted state is the one used to resume it.

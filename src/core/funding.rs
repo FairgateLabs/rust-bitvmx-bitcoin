@@ -64,6 +64,15 @@ impl FundingManager {
         Ok(!self.storage.read_funding_records()?.is_empty())
     }
 
+    /// True when any record in the funding queue comes from `txid`.
+    pub fn is_funding_tx(&self, txid: Txid) -> Result<bool, BitcoinCoordinatorError> {
+        Ok(self
+            .storage
+            .read_funding_records()?
+            .iter()
+            .any(|r| r.utxo.txid == txid))
+    }
+
     /// First-call. Returns the chosen UTXO and a boolean. The bool is `true` for Speedup-kind
     /// records and `false` for plain Funding-kind records. This is because combine is only valid
     ///  when the primary is Speedup-kind.

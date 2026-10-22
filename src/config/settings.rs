@@ -4,9 +4,8 @@
 pub const CPFP_TRANSACTION_CONTEXT: &str = "CPFP_TRANSACTION";
 pub const RBF_TRANSACTION_CONTEXT: &str = "RBF_TRANSACTION";
 
-// Bitcoin Core has a mempool policy called the "chain limit":
-// You can’t have more than 25 unconfirmed transactions chained together (i.e. one spending the other).
-pub const DEFAULT_MAX_UNCONFIRMED_SPEEDUPS: u32 = 10;
+// Bitcoin Core rejects a transaction whose unconfirmed ancestors, counting the transaction itself, exceed 25
+pub const DEFAULT_MAX_UNCONFIRMED_ANCESTORS: u32 = 25;
 pub const MAX_LIMIT_UNCONFIRMED_PARENTS: u32 = 25;
 
 // Maximum transaction weight in bytes.

@@ -50,7 +50,7 @@ use bitvmx_bitcoin_rpc::{
 use bitvmx_settings::settings::load_config_file;
 use bitvmx_transaction_monitor::{
     config::MonitorSettingsConfig,
-    types::{AckMonitorNews, MonitorNews, TypesToMonitor},
+    types::{MonitorTarget, NewsKind},
 };
 use key_manager::key_type::BitcoinKeyType;
 use protocol_builder::types::{output::SpeedupData, Utxo};
@@ -58,7 +58,7 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-const FEE_RATE_SAT_PER_VBYTE: u64 = 2;
+const FEE_RATE_SAT_PER_VBYTE: u64 = 4;
 
 // =============================================================================
 // Tests
@@ -206,7 +206,7 @@ fn test_dispatch_transaction() {
 /// Expected test duration: ~3 testnet blocks (~30 minutes).
 ///
 /// Settings used:
-/// - `max_monitoring_confirmations = 2`  (finalize after 2 confirmations)
+/// - `finality = 2`  (finalize after 2 confirmations)
 /// - `max_tracking_confirmations  = 1`  (evict 1 block after finalization)
 ///
 /// Phases verified:
@@ -248,7 +248,7 @@ fn test_coordinator_full_lifecycle() {
     // ── Phase 2: dispatch ──────────────────────────────────────────────────────
     info!("[lifecycle] phase 2: dispatching {txid}");
     coordinator
-        .dispatch_without_speedup(tx, "lifecycle_test".to_string(), None, Some(1), None)
+        .dispatch_without_speedup(tx, "lifecycle_test".to_string(), None, None, None)
         .expect("dispatch failed");
 
     let remaining = cfg.amount_sats - fee_sats;
@@ -287,7 +287,7 @@ fn test_coordinator_full_lifecycle() {
 
     let news = drain_news(&coordinator);
     let has_confirmed_news = news.monitor_news.iter().any(
-        |n| matches!(n, MonitorNews::Transaction(t) if t.tx_id == txid && t.status.is_confirmed()),
+        |n| matches!(&n.kind, NewsKind::Transaction { txid: id, status, .. } if *id == txid && status.is_confirmed()),
     );
     assert!(
         has_confirmed_news,
@@ -341,7 +341,7 @@ fn test_coordinator_full_lifecycle() {
 /// - `dispatch_without_speedup` (with and without `stuck_in_mempool_blocks`)
 /// - `dispatch_without_speedup` for a parent + child in the same tick
 /// - `dispatch_with_speedup` for a CPFP parent (auto-built CPFP)
-/// - `confirmation_trigger = Some(1)` (deterministic confirmation news)
+/// - `confirmation_trigger = None` (confirmation news on every block)
 /// - `get_transaction` against the live monitor
 /// - Lifecycle: `ToDispatch -> InMempool -> Confirmed -> Finalized (no eviction tested here)`
 /// - `get_news` + `ack_news` at every phase
@@ -386,21 +386,22 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
     let ctx = ctx("test");
     // ──────────────────────── Build the splitter and its 4 children ────────────────────────
     // Output amounts are chosen so a 4-tx chain (parent_b -> child_b) can each
-    // pay a 200 sat fee while keeping every output above the 294-sat dust limit.
+    // pay a 450 sat fee while keeping every output above the 294-sat dust limit.
     const PARENT_A_SATS: u64 = 1_000;
     const PARENT_B_SATS: u64 = 1_500; // chained: parent_b -> child_b
     const PARENT_SP_SATS: u64 = 1_000;
     const FUNDING_SATS: u64 = 15_000; // >= default min_funding_amount_sats also min in protocol builder
-    const TX_FEE_SATS: u64 = 200; // ~2 sat/vbyte for a 1-in/1-out P2WPKH
+    const TX_FEE_SATS: u64 = 450; // ~4 sat/vbyte for a 1-in/1-out P2WPKH 
+    const SPLITTER_FEE_SATS: u64 = 1_000; // ~4 sat/vbyte for the 1-in/5-out P2WPKH splitter 
 
     let total_child_outputs = PARENT_A_SATS + PARENT_B_SATS + PARENT_SP_SATS + FUNDING_SATS;
     assert!(
-        cfg.amount_sats > total_child_outputs + TX_FEE_SATS,
+        cfg.amount_sats > total_child_outputs + SPLITTER_FEE_SATS,
         "funding UTXO too small for the lifecycle test (have {}, need > {})",
         cfg.amount_sats,
-        total_child_outputs + TX_FEE_SATS
+        total_child_outputs + SPLITTER_FEE_SATS
     );
-    let change_sats = cfg.amount_sats - total_child_outputs - TX_FEE_SATS;
+    let change_sats = cfg.amount_sats - total_child_outputs - SPLITTER_FEE_SATS;
 
     let splitter = build_p2wpkh_tx(
         &secret_key,
@@ -525,17 +526,13 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
         "dummy tx must be ToDispatch before cancel"
     );
     coordinator
-        .cancel(TypesToMonitor::Transactions(
-            vec![dummy_txid],
-            ctx.clone(),
-            None,
-        ))
+        .cancel(&[MonitorTarget::Transaction(dummy_txid)], &ctx)
         .expect("cancel must succeed for an eligible Normal+ToDispatch tx");
     assert!(
         coord_storage.get_tx_by_id(dummy_txid).unwrap().is_none(),
         "tx must be removed from storage after a successful cancel"
     );
-    let post_cancel_news = coordinator.get_news().unwrap();
+    let post_cancel_news = coordinator.get_news(None).unwrap();
     assert!(
         !post_cancel_news.coordinator_news.iter().any(|n| matches!(
             n,
@@ -554,7 +551,7 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
         .send_transaction(&splitter)
         .expect("direct splitter broadcast");
     let phase2_start = Instant::now();
-    while !bitcoin_client.check_in_mempool(&splitter_txid) {
+    while !bitcoin_client.check_in_mempool(&splitter_txid).unwrap() {
         assert!(
             phase2_start.elapsed() < Duration::from_secs(3 * 60),
             "splitter {splitter_txid} did not reach the testnet mempool within 3 min"
@@ -574,18 +571,18 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
 
     // parent_a sets a high stuck_in_mempool threshold (no firing expected).
     coordinator
-        .dispatch_without_speedup(parent_a, ctx.clone(), None, Some(1), Some(1_000))
+        .dispatch_without_speedup(parent_a, ctx.clone(), None, None, Some(1_000))
         .unwrap();
     // parent_b + child_b exercise topological sort in one tick.
     coordinator
-        .dispatch_without_speedup(parent_b, ctx.clone(), None, Some(1), None)
+        .dispatch_without_speedup(parent_b, ctx.clone(), None, None, None)
         .unwrap();
     coordinator
-        .dispatch_without_speedup(child_b, ctx.clone(), None, Some(1), None)
+        .dispatch_without_speedup(child_b, ctx.clone(), None, None, None)
         .unwrap();
     // CPFP path: speedup_data carries parent_sp's output for the auto-built CPFP.
     coordinator
-        .dispatch_with_speedup(parent_sp, speedup_data, ctx.clone(), None, Some(1))
+        .dispatch_with_speedup(parent_sp, speedup_data, ctx.clone(), None, None)
         .unwrap();
 
     info!("[lifecycle++] phase 2: dispatching coord-managed txs in one tick");
@@ -654,8 +651,8 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
     for txid in &user_txids {
         let saw = news.monitor_news.iter().any(|n| {
             matches!(
-                n,
-                MonitorNews::Transaction(t) if t.tx_id == *txid && t.status.is_confirmed()
+                &n.kind,
+                NewsKind::Transaction { txid: id, status, .. } if id == txid && status.is_confirmed()
             )
         });
         assert!(saw, "no Confirmed monitor news for {txid}");
@@ -697,21 +694,13 @@ fn testnet_rpc_config() -> RpcConfig {
     )
 }
 
-/// Returns `BitcoinSettings` with a checkpoint 10 blocks behind the current tip,
-/// so the coordinator only needs to sync a handful of blocks.
+/// Returns `BitcoinSettings` with a 10-block indexer window, so the coordinator only needs to sync a
+/// handful of blocks. The window must be at least `max_monitoring_confirmations`, so that is lowered to 10 too.
 fn testnet_settings_near_tip() -> BitcoinSettings {
-    let client = BitcoinClient::new_from_config(&testnet_rpc_config())
-        .expect("failed to connect to testnet RPC");
-    let tip = client
-        .client
-        .get_block_count()
-        .expect("failed to get block count") as u32;
-    let checkpoint = tip.saturating_sub(10);
     BitcoinSettings {
         monitor: MonitorSettingsConfig {
-            indexer_settings: Some(IndexerSettings {
-                checkpoint_height: Some(checkpoint),
-            }),
+            max_monitoring_confirmations: Some(10),
+            indexer_settings: Some(IndexerSettings::new(10)),
             ..Default::default()
         },
         ..Default::default()
@@ -729,19 +718,11 @@ fn testnet_coord_storage(storage: &StorageTestConfig) -> CoordinatorStorage {
 /// tracking block. Both values are as small as the system allows so the test
 /// completes in ~3 testnet blocks (~30 min).
 fn testnet_lifecycle_settings() -> BitcoinSettings {
-    let client = BitcoinClient::new_from_config(&testnet_rpc_config())
-        .expect("failed to connect to testnet RPC");
-    let tip = client
-        .client
-        .get_block_count()
-        .expect("failed to get block count") as u32;
-    let checkpoint = tip.saturating_sub(10);
     BitcoinSettings {
         monitor: MonitorSettingsConfig {
             max_monitoring_confirmations: Some(2),
-            indexer_settings: Some(IndexerSettings {
-                checkpoint_height: Some(checkpoint),
-            }),
+            finality: Some(2),
+            indexer_settings: Some(IndexerSettings::new(10)),
         },
         storage: CoordinatorStorageSettings {
             max_tracking_confirmations: 1,
@@ -797,24 +778,14 @@ fn poll_until_state_with_sleep(
 
 /// Get pending news, ack every item, and return the snapshot.
 fn drain_news(coordinator: &BitcoinCoordinator) -> News {
-    let news = coordinator.get_news().unwrap();
+    let news = coordinator.get_news(None).unwrap();
     info!(
         "Draining news: {} monitor news, {} coordinator news",
         news.monitor_news.len(),
         news.coordinator_news.len()
     );
     for n in &news.monitor_news {
-        let ack = match n {
-            MonitorNews::Transaction(t) => AckMonitorNews::Transaction(t.tx_id, t.context.clone()),
-            MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
-            MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
-                AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
-            }
-            MonitorNews::OutputPatternTransaction(t, _, ctx) => {
-                AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
-            }
-        };
-        coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
+        coordinator.ack_news(AckNews::Monitor(n.clone())).unwrap();
     }
     for n in &news.coordinator_news {
         coordinator
@@ -834,26 +805,14 @@ fn poll_until_evicted(
     let start = Instant::now();
     loop {
         coordinator.tick()?;
-        let news = coordinator.get_news()?;
+        let news = coordinator.get_news(None)?;
         let evicted = news.coordinator_news.iter().any(
             |n| matches!(n, CoordinatorNews::TransactionEvicted { txid: id, .. } if *id == txid),
         );
         if evicted {
             // Ack everything accumulated.
             for n in &news.monitor_news {
-                let ack = match n {
-                    MonitorNews::Transaction(t) => {
-                        AckMonitorNews::Transaction(t.tx_id, t.context.clone())
-                    }
-                    MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
-                    MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
-                        AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
-                    }
-                    MonitorNews::OutputPatternTransaction(t, _, ctx) => {
-                        AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
-                    }
-                };
-                coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
+                coordinator.ack_news(AckNews::Monitor(n.clone())).unwrap();
             }
             for n in &news.coordinator_news {
                 coordinator
