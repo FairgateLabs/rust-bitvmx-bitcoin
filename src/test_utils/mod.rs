@@ -77,10 +77,7 @@ pub fn dummy_pubkey() -> PublicKey {
 /// tests that do not perform real signing and do not need mnemonic persistence.
 pub fn dummy_key_manager() -> Rc<KeyManager> {
     let path = format!("temp-runs/km_{}", Uuid::new_v4());
-    let config = StorageConfig {
-        path,
-        password: None,
-    };
+    let config = StorageConfig::new(path, None);
     Rc::new(KeyManager::new(Network::Regtest, None, None, &config).unwrap())
 }
 
@@ -227,10 +224,7 @@ impl Default for StorageTestConfig {
 impl StorageTestConfig {
     pub fn new() -> Self {
         let path = Self::get_storage_path();
-        let config = StorageConfig {
-            path: path.clone(),
-            password: None,
-        };
+        let config = StorageConfig::new(path.clone(), None);
 
         let storage = Rc::new(Storage::new(&config).unwrap());
         info!("Initialized test storage at: {}", path);
