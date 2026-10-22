@@ -58,7 +58,7 @@ use serde::Deserialize;
 use std::time::{Duration, Instant};
 use tracing::info;
 
-const FEE_RATE_SAT_PER_VBYTE: u64 = 2;
+const FEE_RATE_SAT_PER_VBYTE: u64 = 4;
 
 // =============================================================================
 // Tests
@@ -386,21 +386,22 @@ fn test_full_lifecycle_multi_tx_with_speedup() {
     let ctx = ctx("test");
     // ──────────────────────── Build the splitter and its 4 children ────────────────────────
     // Output amounts are chosen so a 4-tx chain (parent_b -> child_b) can each
-    // pay a 200 sat fee while keeping every output above the 294-sat dust limit.
+    // pay a 450 sat fee while keeping every output above the 294-sat dust limit.
     const PARENT_A_SATS: u64 = 1_000;
     const PARENT_B_SATS: u64 = 1_500; // chained: parent_b -> child_b
     const PARENT_SP_SATS: u64 = 1_000;
     const FUNDING_SATS: u64 = 15_000; // >= default min_funding_amount_sats also min in protocol builder
-    const TX_FEE_SATS: u64 = 200; // ~2 sat/vbyte for a 1-in/1-out P2WPKH
+    const TX_FEE_SATS: u64 = 450; // ~4 sat/vbyte for a 1-in/1-out P2WPKH 
+    const SPLITTER_FEE_SATS: u64 = 1_000; // ~4 sat/vbyte for the 1-in/5-out P2WPKH splitter 
 
     let total_child_outputs = PARENT_A_SATS + PARENT_B_SATS + PARENT_SP_SATS + FUNDING_SATS;
     assert!(
-        cfg.amount_sats > total_child_outputs + TX_FEE_SATS,
+        cfg.amount_sats > total_child_outputs + SPLITTER_FEE_SATS,
         "funding UTXO too small for the lifecycle test (have {}, need > {})",
         cfg.amount_sats,
-        total_child_outputs + TX_FEE_SATS
+        total_child_outputs + SPLITTER_FEE_SATS
     );
-    let change_sats = cfg.amount_sats - total_child_outputs - TX_FEE_SATS;
+    let change_sats = cfg.amount_sats - total_child_outputs - SPLITTER_FEE_SATS;
 
     let splitter = build_p2wpkh_tx(
         &secret_key,
