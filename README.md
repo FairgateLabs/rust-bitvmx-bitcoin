@@ -81,6 +81,8 @@ The `BitcoinCoordinator` struct exposes the following methods:
 | `ack_news` | Acknowledge a news item so it is not returned again. |
 | `monitor` | Register monitoring targets under a context, with an optional confirmation trigger, without scheduling a dispatch. |
 
+`BitcoinCoordinatorError` exposes `is_bitcoin_client_error` and `is_storage_error`, true when the error came from the Bitcoin node client or from the storage backend, whether the coordinator raised it or the monitor or indexer did. Every other error answers false to both.
+
 ## Usage Example
 
 ```rust
