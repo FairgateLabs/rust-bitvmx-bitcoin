@@ -1,6 +1,6 @@
 use bitcoin::{Transaction, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
-use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
+use bitvmx_transaction_monitor::types::MonitorNews;
 use protocol_builder::types::{output::SpeedupData, Utxo};
 use serde::{Deserialize, Serialize};
 
@@ -35,7 +35,7 @@ pub struct CoordinatedTx {
     // competing tx T' (e.g. a counterparty timeout spend in a two-party protocol) temporarily takes one of T's inputs.
     // Re-dispatching T then fails with a missing/spent input, which would normally settle T `Failed` (irreversible). If
     // the reorg reverts, T becomes valid again. This guard defers the terminal `Failed` decision until the chain has had
-    // `max_monitoring_confirmations` blocks to settle, after which exactly one branch survives and the verdict is final.
+    // `finality` blocks to settle, after which exactly one branch survives and the verdict is final.
     pub fail_guard_until: Option<BlockHeight>,
 
     // Retry
@@ -192,6 +192,6 @@ pub struct News {
 }
 
 pub enum AckNews {
-    Monitor(AckMonitorNews),
+    Monitor(MonitorNews),
     Coordinator(CoordinatorNews),
 }
