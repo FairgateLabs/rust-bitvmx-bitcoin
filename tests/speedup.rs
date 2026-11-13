@@ -1658,7 +1658,6 @@ fn test_cpfp_rbf_after_max_unconfirmed_reached() {
 
     // remove_replaced_rbf cancels CPFP2 under its own CPFP context, which releases the mempool watch it got when accepted.
     let watch_list = bitcoin_indexer::store::IndexerStore::new(setup.storage.get_raw_storage())
-        .unwrap()
         .get_mempool_watch_list()
         .unwrap();
     assert!(
@@ -2058,7 +2057,6 @@ fn test_parent_failure_cascades_cpfp_via_parents_gate() {
 
     // Settling Failed cancels the monitor subscription, which releases the mempool watch each one got when it was accepted.
     let watch_list = bitcoin_indexer::store::IndexerStore::new(setup.storage.get_raw_storage())
-        .unwrap()
         .get_mempool_watch_list()
         .unwrap();
     for failed in [parent_txid, cpfp_txid, rbf_txid] {
