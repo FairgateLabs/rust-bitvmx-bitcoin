@@ -58,7 +58,7 @@ Bitcoin Core rejects a transaction whose unconfirmed ancestors, counting the tra
 - for a first CPFP, each unconfirmed parent it covers and that parent's own unconfirmed ancestors not already counted (a confirmed parent adds nothing);
 - the speedup itself.
 
-`max_unconfirmed_ancestors` bounds that package. The minimum is 2 because the smallest CPFP package is one unconfirmed parent plus the CPFP. Ancestors the coordinator does not track are not counted.
+`max_unconfirmed_ancestors` bounds that package. The default is 20, the maximum 25 (the node's limit) and the minimum 2, because the smallest CPFP package is one unconfirmed parent plus the CPFP. Ancestors the coordinator does not track are not counted.
 
 ## CPFP versus RBF
 

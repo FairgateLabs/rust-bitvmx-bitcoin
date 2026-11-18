@@ -4,8 +4,9 @@
 pub const CPFP_TRANSACTION_CONTEXT: &str = "CPFP_TRANSACTION";
 pub const RBF_TRANSACTION_CONTEXT: &str = "RBF_TRANSACTION";
 
-// Bitcoin Core rejects a transaction whose unconfirmed ancestors, counting the transaction itself, exceed 25
-pub const DEFAULT_MAX_UNCONFIRMED_ANCESTORS: u32 = 25;
+// Bitcoin Core rejects a transaction whose unconfirmed ancestors, counting the transaction itself, exceed 25. The default
+// stays 5 below that as margin for unconfirmed ancestors the coordinator does not track, which it cannot count.
+pub const DEFAULT_MAX_UNCONFIRMED_ANCESTORS: u32 = 20;
 pub const MAX_LIMIT_UNCONFIRMED_PARENTS: u32 = 25;
 
 // Maximum transaction weight in bytes.

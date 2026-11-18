@@ -183,7 +183,7 @@ Tuning lives in `BitcoinSettings`. Every field is optional and falls back to the
 | `fee` | `min_safe_fee_rate` | Floor and fallback for the effective speedup fee rate. |
 | `fee` | `max_feerate_sat_vb` | Hard cap on the speedup package fee rate (parents + child). |
 | `fee` | `base_fee_multiplier` | Multiplier on the network estimate. |
-| `speedup` | `max_unconfirmed_ancestors` | Maximum unconfirmed txs in a new speedup's package, counting the speedup itself. Bounds each CPFP batch; a boost switches to RBF when a CPFP boost would exceed it. |
+| `speedup` | `max_unconfirmed_ancestors` | Maximum unconfirmed txs in a new speedup's package, counting the speedup itself. Bounds each CPFP batch; a boost switches to RBF when a CPFP boost would exceed it. Default 20, 5 below the node's limit of 25 as margin for untracked ancestors (see [speedup.md](speedup.md)). |
 | `speedup` | `min_blocks_before_resend_speedup` | Blocks a speedup tip must age before it is boosted. |
 | `speedup` | `bump_fee_percentage` | Fee escalation factor applied on each boost/RBF. |
 | `funding` | `min_funding_amount_sats` | Minimum accepted funding UTXO size. |

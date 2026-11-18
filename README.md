@@ -53,7 +53,7 @@ See [`docs/architecture.md`](docs/architecture.md) for the full tick pipeline an
 
 > ⚠️ **`confirmation_trigger` must be within `finality..=max_monitoring_confirmations`, or `None`.** Out of range, the `dispatch*` call returns an error and nothing is stored.
 
-> ⚠️ **External (non-coordinator-tracked) parents must already be confirmed.** The dispatcher only gates on tracked parents; untracked ones are assumed on-chain. Registering a tx whose input references an unregistered, not-yet-confirmed tx will be rejected by bitcoind with a missing-input error.
+> ⚠️ **External (non-coordinator-tracked) parents must already be confirmed.** The dispatcher only gates on tracked parents; untracked ones are assumed on-chain and are not checked. If the untracked parent is not in the node's mempool, bitcoind rejects the tx with a missing-input error. If it is, the tx is accepted, but the coordinator cannot count that parent toward the mempool ancestor limit, so a CPFP over the tx can exceed it and be rejected. The `max_unconfirmed_ancestors` default of 20, 5 below the node's limit of 25, is margin for this case, not a guarantee.
 
 > 💡 **Stuck plain transaction.** `TransactionStuckInMempool` fires once per block past the threshold. To unblock: dispatch a CPFP spending one of its outputs via `dispatch_without_speedup`. The coordinator tracks both and mines them together.
 
