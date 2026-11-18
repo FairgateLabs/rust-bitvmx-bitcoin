@@ -1,8 +1,8 @@
-use std::rc::Rc;
+use std::{collections::HashSet, rc::Rc};
 
 use bitcoin::{OutPoint, Transaction, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
-use bitvmx_transaction_monitor::types::TypesToMonitor;
+use bitvmx_transaction_monitor::types::MonitorTarget;
 use key_manager::key_manager::KeyManager;
 use protocol_builder::{
     builder::ProtocolBuilder,
@@ -61,13 +61,13 @@ impl SpeedupEngine {
     /// Step 2 of `tick`: update each speedup's state from chain. Never dispatches.
     /// Reorg of a Confirmed speedup moves it back to InMempool.
     pub fn review_speedups(&self) -> Result<(), BitcoinCoordinatorError> {
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
         if all_speedups.is_empty() {
             return Ok(());
         }
 
-        let max_confs = self.ctx.monitor.settings.max_monitoring_confirmations;
+        let finality = self.ctx.monitor.finality();
 
         for tx in &all_speedups {
             if !matches!(
@@ -105,11 +105,11 @@ impl SpeedupEngine {
                 // Arm the reorg-flap fail guard.
                 self.ctx
                     .storage
-                    .requeue_not_found(tx.txid, current_height + max_confs)?;
+                    .requeue_not_found(tx.txid, current_height + finality)?;
                 continue;
             }
 
-            if status.is_finalized(max_confs) {
+            if status.is_finalized(finality) {
                 self.ctx.mark_finalized(tx.txid, current_height)?;
                 // If this is an RBF predecessor, remove any replaced-by link.
                 self.remove_replaced_rbf(tx, current_height)?;
@@ -122,11 +122,6 @@ impl SpeedupEngine {
                 self.ctx.mark_confirmed(tx.txid)?;
                 continue;
             }
-
-            if status.is_orphan() {
-                self.ctx.mark_orphan(tx.txid)?;
-                continue;
-            }
         }
 
         Ok(())
@@ -136,7 +131,7 @@ impl SpeedupEngine {
     /// Returns `true` when a dispatched boost (a speedup produced by `boost_if_stale`, not a first CPFP)
     /// settled `Failed` this call, so `boost_if_stale` can skip building another boost in the same tick.
     pub fn dispatch_pending_speedups(&self) -> Result<bool, BitcoinCoordinatorError> {
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
         let pending: Vec<CoordinatedTx> = all_speedups
@@ -177,20 +172,21 @@ impl SpeedupEngine {
         }
 
         // We only report a boost that actually settled `Failed`.
-        let boost_failed = boost_txids.iter().any(|id| {
-            self.ctx
+        for id in &boost_txids {
+            if self
+                .ctx
                 .storage
-                .get_tx_by_id(*id)
-                .ok()
-                .flatten()
-                .map(|t| t.state == TransactionState::Failed)
-                .unwrap_or(false)
-        });
-        Ok(boost_failed)
+                .get_tx_by_id(*id)?
+                .is_some_and(|t| t.state == TransactionState::Failed)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    /// Step 5 of `tick`: if the latest live speedup is stale, build a boost (new CPFP when slots are
-    /// available, otherwise RBF) and save it as `ToDispatch`. Short-circuits if any speedup is already
+    /// Step 5 of `tick`: if the latest live speedup is stale, build a boost (new CPFP when its package fits
+    /// `max_unconfirmed_ancestors`, otherwise RBF) and save it as `ToDispatch`. Short-circuits if any speedup is already
     /// `ToDispatch` or if the live tip is already at cap.
     pub fn boost_if_stale(&self, skip_boost: bool) -> Result<(), BitcoinCoordinatorError> {
         // A boost just settled Failed this tick: do not build another boost now. Re-boosting a dead tip
@@ -200,7 +196,7 @@ impl SpeedupEngine {
             return Ok(());
         }
 
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         let all_speedups = self.ctx.storage.get_speedups_ordered()?;
 
         let (
@@ -254,12 +250,11 @@ impl SpeedupEngine {
                 }
             };
 
-            // Decide whether to boost via RBF or CPFP, depending on how many unconfirmed speedups are currently in the mempool.
-            let inmempool_count = all_speedups
-                .iter()
-                .filter(|tx| is_live_in_mempool(tx, &all_speedups))
-                .count() as u32;
-            let use_rbf = inmempool_count >= self.settings.max_unconfirmed_speedups;
+            // Decide whether to boost via RBF or CPFP. A CPFP boost chains on the tip, so its package is every unconfirmed
+            // tx in the chain plus itself; when that exceeds the limit, an RBF replaces the tip instead and adds nothing.
+            let chain_ancestors = self.chain_ancestors(&all_speedups)?;
+            let use_rbf =
+                chain_ancestors.len() as u32 + 1 > self.settings.max_unconfirmed_ancestors;
             let parent_entries: Vec<(SpeedupData, usize)> = if use_rbf {
                 last_context
                     .parent_data
@@ -390,7 +385,8 @@ impl SpeedupEngine {
 
     /// Step 6 of `tick`: build one CPFP covering the next PendingSpeedupParents
     /// batch and save it as `ToDispatch`. Short-circuits when a `ToDispatch`
-    /// speedup already exists or when no slot is available.
+    /// speedup already exists or when the package has no room for a parent
+    /// under `max_unconfirmed_ancestors`.
     pub fn create_cpfp_batch(&self) -> Result<(), BitcoinCoordinatorError> {
         let parents = self.ctx.storage.get_pending_speedup_parents()?;
         if parents.is_empty() {
@@ -410,11 +406,11 @@ impl SpeedupEngine {
             .filter(|tx| is_live_in_mempool(tx, &all_speedups))
             .cloned()
             .collect();
-        let available_slots = self
-            .settings
-            .max_unconfirmed_speedups
-            .saturating_sub(unconfirmed.len() as u32);
-        if available_slots == 0 {
+        // The new CPFP chains on the live tip, so its package starts with every unconfirmed tx in the chain. If not even
+        // the CPFP itself fits, wait: the parents stay in PendingSpeedupParents until blocks confirm part of the chain.
+        let mut chain_ancestors = self.chain_ancestors(&all_speedups)?;
+        let limit = self.settings.max_unconfirmed_ancestors as usize;
+        if chain_ancestors.len() + 1 > limit {
             return Ok(());
         }
 
@@ -432,10 +428,30 @@ impl SpeedupEngine {
 
         // Take only the first batch: one CPFP per tick.
         let mut batches = self.ctx.dispatcher.batch_by_weight(&parents, 1);
-        let batch = match batches.pop() {
+        let weight_batch = match batches.pop() {
             Some(b) => b,
             None => return Ok(()),
         };
+
+        // Admit parents in order while the package fits. An unconfirmed parent adds itself and its own unconfirmed
+        // ancestors not already counted; a confirmed one adds nothing. The parents left out stay in
+        // PendingSpeedupParents until blocks confirm part of the chain.
+        let mut batch: Vec<&CoordinatedTx> = Vec::new();
+        for p in weight_batch {
+            let mut with_parent = chain_ancestors.clone();
+            if p.state == TransactionState::InMempool {
+                with_parent.insert(p.txid);
+                self.collect_unconfirmed_ancestors(p, &mut with_parent)?;
+            }
+            if with_parent.len() + 1 > limit {
+                break;
+            }
+            chain_ancestors = with_parent;
+            batch.push(p);
+        }
+        if batch.is_empty() {
+            return Ok(());
+        }
 
         // Fetch the SpeedupData and vsize for each parent in the batch.
         let parent_entries: Vec<(SpeedupData, usize)> = batch
@@ -497,7 +513,7 @@ impl SpeedupEngine {
                     context: Self::ctx_for_kind(&kind).to_string(),
                 })?;
         }
-        let current_height = self.ctx.monitor.get_monitor_height()?;
+        let current_height = self.ctx.monitor.get_indexed_height()?;
         self.save_speedup(cpfp_tx, fee_info, kind, current_height)?;
 
         Ok(())
@@ -613,6 +629,45 @@ impl SpeedupEngine {
         }
     }
 
+    /// Every unconfirmed tx a new speedup on the live tip would have as an ancestor: the live speedups and each
+    /// coordinator-tracked `InMempool` tx they spend from, directly or through other such txs.
+    fn chain_ancestors(
+        &self,
+        all_speedups: &[CoordinatedTx],
+    ) -> Result<HashSet<Txid>, BitcoinCoordinatorError> {
+        let mut ancestors = HashSet::new();
+        for s in all_speedups
+            .iter()
+            .filter(|tx| is_live_in_mempool(tx, all_speedups))
+        {
+            ancestors.insert(s.txid);
+            self.collect_unconfirmed_ancestors(s, &mut ancestors)?;
+        }
+        Ok(ancestors)
+    }
+
+    /// Add to `ancestors` every coordinator-tracked `InMempool` tx that `tx` spends from, directly or through other such
+    /// txs. Ancestors the coordinator does not track are not visible here.
+    fn collect_unconfirmed_ancestors(
+        &self,
+        tx: &CoordinatedTx,
+        ancestors: &mut HashSet<Txid>,
+    ) -> Result<(), BitcoinCoordinatorError> {
+        for input in &tx.tx.input {
+            let parent_txid = input.previous_output.txid;
+            if ancestors.contains(&parent_txid) {
+                continue;
+            }
+            if let Some(parent) = self.ctx.storage.get_tx_by_id(parent_txid)? {
+                if parent.state == TransactionState::InMempool {
+                    ancestors.insert(parent_txid);
+                    self.collect_unconfirmed_ancestors(&parent, ancestors)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn emit_insufficient_funds(
         &self,
         available: u64,
@@ -695,7 +750,9 @@ impl SpeedupEngine {
             ),
         }
         self.ctx.monitor.monitor(
-            TypesToMonitor::Transactions(vec![txid], ctx_str.to_string(), None),
+            &[MonitorTarget::Transaction(txid)],
+            ctx_str.to_string(),
+            None,
             false,
         )?;
         Ok(())
@@ -710,21 +767,19 @@ impl SpeedupEngine {
         if let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind {
             let mut current_id = *replaces;
             loop {
-                let next_id =
+                let prev = self.ctx.storage.get_tx_by_id(current_id)?;
+                let next_id = prev.as_ref().and_then(|prev| match &prev.kind {
+                    TxKind::Speedup(SpeedupKind::RBF {
+                        replaces: older, ..
+                    }) => Some(*older),
+                    _ => None,
+                });
+                // Each replaced tx was registered under its own context (CPFP or RBF), so it is cancelled under that one.
+                if let Some(prev) = &prev {
                     self.ctx
-                        .storage
-                        .get_tx_by_id(current_id)?
-                        .and_then(|prev| match &prev.kind {
-                            TxKind::Speedup(SpeedupKind::RBF {
-                                replaces: older, ..
-                            }) => Some(*older),
-                            _ => None,
-                        });
-                self.ctx.monitor.cancel(TypesToMonitor::Transactions(
-                    vec![current_id],
-                    tx.context.clone(),
-                    None,
-                ))?;
+                        .monitor
+                        .cancel(&[MonitorTarget::Transaction(current_id)], &prev.context)?;
+                }
                 self.ctx
                     .storage
                     .settle_tx(current_id, TransactionState::Failed, current_height)?;

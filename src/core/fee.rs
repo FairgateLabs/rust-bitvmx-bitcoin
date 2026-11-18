@@ -5,7 +5,7 @@ use crate::{
     types::{CoordinatedTx, FeeInfo},
 };
 use bitcoin::Transaction;
-use bitvmx_transaction_monitor::monitor::Monitor;
+use bitvmx_transaction_monitor::{errors::MonitorError, monitor::Monitor, IndexerError};
 use tracing::warn;
 
 /// Bitcoin's default minimum relay fee rate (sat/vB). Any transaction that reached the mempool
@@ -65,11 +65,14 @@ impl FeeManager {
         &self,
         monitor: &Monitor,
     ) -> Result<(u64, Option<CoordinatorNews>), BitcoinCoordinatorError> {
-        // `min_safe_fee_rate` doubles as the fallback when bitcoind's
-        // estimate is unavailable and as a hard lower clamp on the rate.
-        let mut network_fee_rate = monitor
-            .get_estimated_fee_rate()
-            .ok()
+        // `min_safe_fee_rate` doubles as the fallback when the last indexed block has no estimate (too few txs) and
+        // as a hard lower clamp on the rate. Any other error, such as a storage failure, propagates.
+        let estimated = match monitor.get_estimated_fee_rate() {
+            Ok(rate) => Some(rate),
+            Err(MonitorError::IndexerError(IndexerError::FeeRateNotEstimated)) => None,
+            Err(e) => return Err(e.into()),
+        };
+        let mut network_fee_rate = estimated
             .filter(|rate| *rate >= self.settings.min_safe_fee_rate)
             .unwrap_or(self.settings.min_safe_fee_rate);
 
@@ -216,6 +219,7 @@ mod tests {
         let storage = StorageTestConfig::new();
         let bitcoind = TestBitcoind::default();
         let monitor = bitcoind.create_monitor(storage.get_raw_storage());
+        monitor.tick().unwrap(); // Index a block, as the coordinator does before building any speedup.
 
         let (fee_rate, news) = manager.get_network_fee_rate(&monitor).unwrap();
         assert!(fee_rate <= 100);
@@ -223,7 +227,6 @@ mod tests {
 
         drop(monitor);
         storage.remove().unwrap();
-        bitcoind.stop().unwrap();
     }
 
     /// `get_network_fee_rate` lifts a low network estimate (or the
@@ -238,6 +241,7 @@ mod tests {
         let storage = StorageTestConfig::new();
         let bitcoind = TestBitcoind::default();
         let monitor = bitcoind.create_monitor(storage.get_raw_storage());
+        monitor.tick().unwrap(); // Index a block, as the coordinator does before building any speedup.
 
         let (fee_rate, _) = manager.get_network_fee_rate(&monitor).unwrap();
         assert!(
@@ -248,7 +252,6 @@ mod tests {
 
         drop(monitor);
         storage.remove().unwrap();
-        bitcoind.stop().unwrap();
     }
 
     /// When `min_safe_fee_rate` exceeds `max_feerate_sat_vb`, the network rate
@@ -264,6 +267,7 @@ mod tests {
         let storage = StorageTestConfig::new();
         let bitcoind = TestBitcoind::default();
         let monitor = bitcoind.create_monitor(storage.get_raw_storage());
+        monitor.tick().unwrap(); // Index a block, as the coordinator does before building any speedup.
 
         let (fee_rate, news) = manager.get_network_fee_rate(&monitor).unwrap();
         assert_eq!(
@@ -284,7 +288,6 @@ mod tests {
 
         drop(monitor);
         storage.remove().unwrap();
-        bitcoind.stop().unwrap();
     }
 
     #[test]

@@ -1,46 +1,36 @@
 # Design rules and invariants
 
-The durable rules the coordinator is built on. Each is stated as a fact about the
-current system, with a short reason. For how the pieces fit together see
-[architecture.md](architecture.md); for the speedup subsystem see
-[speedup.md](speedup.md).
+The durable rules the coordinator is built on. Each is stated as a fact about the current system, with a short reason. For how the pieces fit together see [architecture.md](architecture.md); for the speedup subsystem see [speedup.md](speedup.md).
 
 ## Operating assumptions
 
-These are the conditions the coordinator is designed for. Outside them, behavior
-is not guaranteed.
+These are the conditions the coordinator is designed for. Outside them, behavior is not guaranteed.
 
 | Assumption | Why it holds |
 |---|---|
-| A single coordinator instance runs against the storage. | State (slot accounting, funding chain, fee-rate state) assumes one writer. |
-| The node runs with `-txindex=1`. | Classification reads live node state for any txid, even when its outputs are already spent. Asserted at construction. |
+| A single coordinator instance runs against the storage. | State (ancestor accounting, funding chain, fee-rate state) assumes one writer. |
+| The node runs with `-txindex=1`. | Classification reads live node state for any txid, even when its outputs are already spent. Not checked by the coordinator: construction makes no node call, so the operator must ensure it. |
 | The operator does not spend a registered funding UTXO or a registered parent out of band. | The coordinator owns those outputs and is the only intended spender. |
-| Reorgs deeper than `max_monitoring_confirmations` do not happen. | A `Finalized` transaction is treated as permanent and is never re-examined. |
+| Reorgs deeper than the monitor's `finality` do not happen. | A `Finalized` transaction is treated as permanent and is never re-examined. |
 | Registered settings do not change across a restart on the same storage. | Persisted state assumes the configuration that produced it. |
 
 ## Invariants
 
-Named guarantees that the tick pipeline preserves. They are referenced by name in
-the code and the other docs.
+Named guarantees that the tick pipeline preserves. They are referenced by name in the code and the other docs.
 
 ### I1: build and dispatch live in different ticks
 
-A speedup or CPFP is saved `ToDispatch` in one tick and broadcast in the next. A
-crash between the two leaves a `ToDispatch` record that is simply retried. The
-result is that the system never has a transaction on-chain without a local
-record of it.
+A speedup or CPFP is saved `ToDispatch` in one tick and broadcast in the next. A crash between the two leaves a `ToDispatch` record that is simply retried. The result is that the system never has a transaction on-chain without a local record of it.
 
 ### I2: at most one pre-built speedup is in flight
 
-Only one speedup sits in `ToDispatch` at a time. Reorg edges may briefly leave
-two pre-dispatched speedups, which is safe because the network already accepted
-them.
+Only one speedup sits in `ToDispatch` at a time. Reorg edges may briefly leave two pre-dispatched speedups, which is safe because the network already accepted them.
+
+While that single speedup is held (deferred by the parent gate because a covered parent vanished and is inside its fail-guard window, or itself guarded), no other speedup is built: no boost and no new CPFP for any parent. The stall lasts at most one guard window (`finality` blocks), after which the parent is back or settles `Failed` and the batch is rebuilt. It only happens when a broadcast parent vanishes and its resend finds an input consumed; normal dispatches are never held. The funding chain is linear, so building past the held speedup would spend a change output that may still be needed: if the reorg reverts, the held speedup goes out as built and no funding is lost.
 
 ### I3: the CPFP builder yields to an existing pre-built speedup
 
-`create_cpfp_batch` (step 6) does nothing if any speedup is already `ToDispatch`.
-A boost built in step 5 therefore prevents a duplicate CPFP in step 6 of the same
-tick.
+`create_cpfp_batch` (step 6) does nothing if any speedup is already `ToDispatch`. A boost built in step 5 therefore prevents a duplicate CPFP in step 6 of the same tick.
 
 ## Pipeline ordering
 
@@ -49,15 +39,13 @@ The six tick steps run in a fixed order, and the order carries meaning.
 | Rule | Reason |
 |---|---|
 | Review steps (1, 2) never broadcast. | A tick first reads a consistent chain view, then acts on it. |
-| Non-speedups dispatch (3) before speedups (4). | A re-dispatched parent is back in the node mempool before its CPFP is re-broadcast in the same tick. |
+| Non-speedups dispatch (3) before speedups (4). | A re-dispatched parent is sent before its CPFP. The CPFP follows on the next tick, once the mempool snapshot shows the parent. |
 | Build/save steps (5, 6) run last and only save. | The broadcast is deferred to the next tick, which is what makes I1 hold. |
 | Decisions are made only when `is_ready()` is true. | The monitor advances at most one block per tick; acting only when synced means every classification reads the real chain tip, not a lagging view. |
 
 ## Failure classification
 
-Failures are classified by live node state, not by matching the node's error
-text. A single `getrawtransaction` answers mempool, confirmed, or absent
-directly, which is why `-txindex=1` is required.
+Failures are classified by live node state, not by matching the node's error text. A single `getrawtransaction` answers mempool, confirmed, or absent directly, which is why `-txindex=1` is required.
 
 | Node state on a rejected broadcast | Verdict |
 |---|---|
@@ -67,44 +55,29 @@ directly, which is why `-txindex=1` is required.
 | Absent and an external or parent input is gone | Settle `Failed`, after the fail guard. |
 | Absent but all inputs intact | Transient cause. Retry until the budget is spent, then `Failed`. |
 
-A structural problem decidable from the transaction alone (weight over
-`max_tx_weight`, or zero inputs) is settled `Failed` immediately with no node
-round-trip.
+An RBF spends every input of the speedup it replaces. While that predecessor is `InMempool`, those shared inputs read as spent by it, which is the conflict the RBF exists for, so they are not counted as gone. A rejected RBF therefore gets the normal retries. If a shared input is really gone, the predecessor's own review catches it.
 
-A child whose tracked parent has already settled `Failed` is also failed
-pre-send (the `ParentFailed` outcome), carrying no fail guard of its own: the
-parent's `Failed` is itself the output of the parent's guard, so the reorg window
-is already spent. For a batch CPFP the engine then rebuilds a fresh CPFP over the
-surviving parents, so one dead parent never sinks the batch (see
-[speedup.md](speedup.md)).
+A structural problem decidable from the transaction alone (weight over `max_tx_weight`, or zero inputs) is settled `Failed` immediately with no node round-trip.
+
+A child whose tracked parent has already settled `Failed` is also failed pre-send (the `ParentFailed` outcome), carrying no fail guard of its own: the parent's `Failed` is itself the output of the parent's guard, so the reorg window is already spent. For a batch CPFP the engine then rebuilds a fresh CPFP over the surviving parents, so one dead parent never sinks the batch (see [speedup.md](speedup.md)).
 
 ## The reorg-flap fail guard
 
-An "input consumed" verdict is reversible while a reorg is still unsettled, so it
-is not acted on immediately.
+An "input consumed" verdict is reversible while a reorg is still unsettled, so it is not acted on immediately.
 
-- When review finds an already-broadcast transaction `not_found` (gone from both
-  chain and mempool), it re-queues the transaction `ToDispatch` and arms
-  `fail_guard_until = current_height + max_monitoring_confirmations`. The anchor
-  is set once, at the first `not_found`.
-- While the chain height is below `fail_guard_until`, an input-consumed verdict is
-  deferred: the transaction stays `ToDispatch` and is re-dispatched, paced by the
-  retry interval.
+- When review finds an already-broadcast transaction `not_found` (gone from both chain and mempool), it re-queues the transaction `ToDispatch` and arms `fail_guard_until = current_height + finality`. The anchor is set once, at the first `not_found`.
+- While the chain height is below `fail_guard_until`, an input-consumed verdict is deferred: the transaction stays `ToDispatch` and is re-dispatched, paced by the retry interval.
 - Past the window, the verdict is final and the transaction settles `Failed`.
-- Recovery is the re-dispatch itself: once the input frees, the next broadcast is
-  accepted and the guard is disarmed.
+- Recovery is the re-dispatch itself: once the input frees, the next broadcast is accepted and the guard is disarmed.
 
-The guard is block-paced and bounded. Within `max_monitoring_confirmations`
-blocks exactly one competing branch survives, so the transaction is either back or
-genuinely gone; the window cannot be extended.
+The guard is block-paced and bounded. Within `finality` blocks exactly one competing branch survives, so the transaction is either back or genuinely gone; the window cannot be extended.
 
-## Reorgs and orphans
+## Reorgs
 
 | Event | Handling |
 |---|---|
 | A `Confirmed` transaction reappears in the mempool. | Reset to `InMempool` and refresh the broadcast height. |
-| The block of a transaction is orphaned. | Keep the transaction `InMempool`. |
-| A deep reorg evicts both blocks and mempool. | Caught by the not_found path; the same txid is re-dispatched. |
+| A reorg removes a transaction from both chain and mempool. | Caught by the not_found path; the same txid is re-dispatched. |
 
 ## Retry budget
 
@@ -112,11 +85,12 @@ Transient failures are retried on two independent limits:
 
 | Limit | Unit | Purpose |
 |---|---|---|
-| `retry_attempts_sending_tx` | Count | How many transient failures before settling `Failed`. |
+| `retry_attempts_sending_tx` | Count | How many transient failures before settling `Failed`. Reset when the node accepts the transaction, so each later re-dispatch starts with a full budget. |
 | `retry_interval_seconds` | Wall clock | Minimum gap between retry batches, shared across both engines. |
 
-The fail guard is separate from this budget: it is block-paced, so a guarded
-transaction can outlive the retry budget without being failed.
+The interval is shared so the two engines together never retry against the node more often than once per interval. The transaction engine runs first in the tick, so when both engines have retries pending, the regular transactions take the open slot and the speedup retries wait for a later interval. A held retry keeps its budget, and a speedup that was never sent is not held.
+
+The fail guard is separate from this budget: it is block-paced, so a guarded transaction can outlive the retry budget without being failed.
 
 ## Funding rules
 
@@ -130,22 +104,23 @@ transaction can outlive the retry budget without being failed.
 
 ## Cancel contract
 
-`cancel` removes monitoring and storage only for client-registered transactions
-still in `ToDispatch`.
+`cancel` removes monitoring and storage only for client-registered transactions still in `ToDispatch` that were never broadcast. A broadcast cannot be undone, so a transaction that vanished and was re-queued for a resend may still be mined.
 
 | Target | Result |
 |---|---|
-| `Normal` or `NeedsSpeedup` in `ToDispatch` | Cancelled: removed from storage, monitoring, and the pending-speedup set. |
+| `Normal` or `NeedsSpeedup` in `ToDispatch`, never broadcast | Cancelled: removed from storage, monitoring, and the pending-speedup set. |
 | Already dispatched (`InMempool` / `Confirmed` / `Finalized` / `Failed`) | Refused with `InvalidCancel`. |
-| `Speedup` kind, or an unknown txid (a funding UTXO is not a tracked tx, so it is refused as not found) | Refused with `InvalidCancel`. |
-| A non-`Transactions` monitoring entry | Passed straight through to the monitor. |
+| Back in `ToDispatch` after a broadcast (re-queued as not found, or deferred by the fail guard) | Refused with `InvalidCancel`. |
+| `Speedup` kind, or the txid of a registered funding UTXO | Refused with `InvalidCancel`. |
+| A txid the coordinator does not know under the given context (for example one registered only through `monitor`, or one it tracks under another context) | Passed straight through to the monitor under the given context. The coordinator's own record is left untouched. |
+| A non-`Transaction` monitoring target (`SpendingUtxo`, `OutputPattern`, `NewBlock`) | Passed straight through to the monitor under the given context. |
 
 ## News rules
 
 | Rule | Reason |
 |---|---|
-| `get_news()` returns all unacknowledged items every call. Identical news is stored once. | Items repeat until acked.|
-| Internal CPFP/RBF transactions are filtered from client transaction news. | The client's context does not distinguish speedup variants. |
+| `get_news(max_keys)` returns unacknowledged items every call, the monitor news limited to the first `max_keys` transactions and block heights (`None` for all). Identical coordinator news is stored once. | Items repeat until acked. The limit bounds one call's size. |
+| Internal CPFP/RBF monitor news is filtered from the client's news and acknowledged by `get_news` itself. | The client's context does not distinguish speedup variants, and unacknowledged monitor news is never dropped. |
 | A settled record emits `TransactionEvicted` when removed. | The client gets the full lifecycle, including teardown. |
 
 ## Application obligations
@@ -155,6 +130,8 @@ still in `ToDispatch`.
 | Register transaction B only after transaction A it depends on is `Finalized`. | An in-flight A can disappear and be re-dispatched; the coordinator preserves no ordering between independently registered transactions. |
 | External (untracked) parents must already be confirmed. | The dispatcher gates only on tracked parents; an untracked, unconfirmed parent makes the node reject the child. |
 | Acknowledge news only after acting on it. | Acking is the only way to clear an item. Act first or drop an unprocessed event. |
+| Tick once before any other API call. | The coordinator's clock is the monitor's indexed height, unknown until the first tick; a `dispatch*` call before it returns an error. |
+| Pass a `confirmation_trigger` within `finality..=max_monitoring_confirmations`, or `None`. | Out of range, the `dispatch*` call returns an error and nothing is stored. |
 
 ## Glossary
 

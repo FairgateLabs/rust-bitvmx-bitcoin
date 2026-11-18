@@ -1,7 +1,8 @@
-use bitcoin::Txid;
+use bitcoin::{OutPoint, Txid};
 use bitvmx_bitcoin_rpc::types::BlockHeight;
-use bitvmx_transaction_monitor::{monitor::Monitor, types::TypesToMonitor};
+use bitvmx_transaction_monitor::{monitor::Monitor, types::MonitorTarget};
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
 use tracing::{debug, error, info, warn};
 
@@ -83,13 +84,6 @@ impl EngineContext {
     pub fn mark_confirmed(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
         self.storage
             .update_tx_state(txid, TransactionState::Confirmed)?;
-        Ok(())
-    }
-
-    /// Tx orphaned. Keep in `InMempool`.
-    pub fn mark_orphan(&self, txid: Txid) -> Result<(), BitcoinCoordinatorError> {
-        self.storage
-            .update_tx_state(txid, TransactionState::InMempool)?;
         Ok(())
     }
 
@@ -181,10 +175,14 @@ impl EngineContext {
         updated.fee_info = fee_info;
         // The tx is live again: disarm any reorg-flap fail guard. A future not_found re-arms it.
         updated.fail_guard_until = None;
+        // This broadcast attempt is over, so a later re-dispatch starts with a full retry budget.
+        updated.retry_count = 0;
         self.storage.update_tx(&updated)?;
 
         self.monitor.monitor(
-            TypesToMonitor::Transactions(vec![txid], tx.context.clone(), tx.confirmation_trigger),
+            &[MonitorTarget::Transaction(txid)],
+            tx.context.clone(),
+            tx.confirmation_trigger,
             true,
         )?;
         info!(
@@ -213,12 +211,15 @@ impl EngineContext {
         let mut updated = tx.clone();
         updated.broadcast_block_height.get_or_insert(current_height); // only if missing
         updated.state = TransactionState::Confirmed;
-        // Recovered on-chain: disarm the fail guard.
+        // Recovered on-chain: disarm the fail guard and restore the full retry budget.
         updated.fail_guard_until = None;
+        updated.retry_count = 0;
         self.storage.update_tx(&updated)?;
 
         self.monitor.monitor(
-            TypesToMonitor::Transactions(vec![txid], tx.context.clone(), tx.confirmation_trigger),
+            &[MonitorTarget::Transaction(txid)],
+            tx.context.clone(),
+            tx.confirmation_trigger,
             true,
         )?;
         info!("Transaction({}) already confirmed on-chain", txid);
@@ -240,7 +241,7 @@ impl EngineContext {
         fee_info: FeeInfo,
     ) -> Result<(), BitcoinCoordinatorError> {
         // Step 1. Does the node already have this tx, in the mempool or on chain?
-        match self.monitor.get_tx_confirmations(&txid)? {
+        match self.monitor.rpc_get_tx_confirmations(&txid)? {
             Some(0) => {
                 info!(
                     "Transaction({}) already in node mempool; treating as dispatched: {}",
@@ -441,6 +442,11 @@ impl EngineContext {
         self.storage
             .add_news(Self::dispatch_error_news(tx, tx.txid))?;
 
+        // A Failed tx is never mined, so its subscription would never end on its own and its mempool watch would cost
+        // a node call on every tick. Cancel it under the context it was registered with.
+        self.monitor
+            .cancel(&[MonitorTarget::Transaction(tx.txid)], &tx.context)?;
+
         // Only CPFPs reset spent flags and re-add parents. RBFs skip both since they don't reserve their parents' UTXOs.
         if let TxKind::Speedup(SpeedupKind::CPFP { .. }) = &tx.kind {
             self.funding_manager.mark_parents_unspent(tx)?;
@@ -470,7 +476,8 @@ impl EngineContext {
         Ok(())
     }
 
-    /// Probe the node for a missing or spent input of `tx`. Returns:
+    /// Probe the node for a missing or spent input of `tx`, leaving out an RBF's inputs shared with its live
+    /// predecessor. Returns:
     ///   * `Some(true)`: a coordinator funding input is gone, recoverable by recreating funding.
     ///   * `Some(false)`: a non-funding or external (parent) input is gone, fatal for this tx.
     ///   * `None`: every input is still unspent, so the failure is transient (fee or policy), retry.
@@ -478,21 +485,54 @@ impl EngineContext {
         &self,
         tx: &CoordinatedTx,
     ) -> Result<Option<bool>, BitcoinCoordinatorError> {
+        // An RBF spends every input of the predecessor it replaces, and while the predecessor is in the mempool those
+        // inputs read as spent by it. That is the conflict the RBF exists for, not a missing input, so they are skipped.
+        // If one of them is really gone, the predecessor's own review catches it.
+        let shared = self.inputs_shared_with_live_predecessor(tx)?;
+
         // Funding inputs first, since a gone funding UTXO is recoverable.
         for op in tx.funding_outpoints() {
-            if !self.monitor.is_utxo_unspent_rpc(&op.txid, op.vout, true)? {
+            if shared.contains(&op) {
+                continue;
+            }
+            if self.monitor.rpc_is_utxo_spent(&op.txid, op.vout, true)? {
                 return Ok(Some(true));
             }
         }
 
         // Remaining external or parent inputs, where a gone one is fatal for this tx.
         for op in tx.non_funding_inputs() {
-            if !self.monitor.is_utxo_unspent_rpc(&op.txid, op.vout, true)? {
+            if shared.contains(&op) {
+                continue;
+            }
+            if self.monitor.rpc_is_utxo_spent(&op.txid, op.vout, true)? {
                 return Ok(Some(false));
             }
         }
 
         Ok(None)
+    }
+
+    /// For an RBF whose predecessor is still `InMempool`, the inputs it shares with that predecessor. Empty otherwise.
+    fn inputs_shared_with_live_predecessor(
+        &self,
+        tx: &CoordinatedTx,
+    ) -> Result<HashSet<OutPoint>, BitcoinCoordinatorError> {
+        let TxKind::Speedup(SpeedupKind::RBF { replaces, .. }) = &tx.kind else {
+            return Ok(HashSet::new());
+        };
+        let Some(predecessor) = self.storage.get_tx_by_id(*replaces)? else {
+            return Ok(HashSet::new());
+        };
+        if predecessor.state != TransactionState::InMempool {
+            return Ok(HashSet::new());
+        }
+        Ok(predecessor
+            .tx
+            .input
+            .iter()
+            .map(|i| i.previous_output)
+            .collect())
     }
 
     fn dispatch_error_news(tx: &CoordinatedTx, txid: Txid) -> CoordinatorNews {

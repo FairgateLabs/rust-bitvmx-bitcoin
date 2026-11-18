@@ -3,9 +3,9 @@ include!("../../src/test_utils/mod.rs");
 use std::collections::HashMap;
 
 pub use bitcoin_coordinator::types;
-use bitvmx_transaction_monitor::types::{AckMonitorNews, MonitorNews};
 
 use bitcoin::{Address, Amount, CompressedPublicKey, OutPoint};
+use bitcoin_indexer::config::IndexerSettings;
 use bitcoin_coordinator::{
     config::configs::{BitcoinSettings, CoordinatorStorageSettings},
     coordinator::BitcoinCoordinator,
@@ -98,15 +98,15 @@ pub struct TestSetup {
 impl TestSetup {
     /// Creates a complete test setup with all common components
     pub fn new(config: TestSetupConfig) -> Result<Self, anyhow::Error> {
-        let bitcoind = TestBitcoind::new(None, config.bitcoind_flags)?;
+        let bitcoind = TestBitcoind::new(config.bitcoind_flags)?;
 
         let storage = StorageTestConfig::new();
         let bitcoin_client = Rc::new(BitcoinClient::new_from_config(&bitcoind.rpc_config)?);
-        let (_public_key, _funding_wallet, regtest_wallet) = Self::setup_wallet_and_mine_blocks(
-            &bitcoin_client,
-            bitcoind.rpc_config.network,
-            config.blocks_mined,
-        )?;
+        let regtest_wallet = if bitcoind.fresh {
+            Self::setup_wallet_and_mine_blocks(&bitcoin_client, config.blocks_mined)?
+        } else {
+            Self::reset_shared_node(&bitcoin_client)?
+        };
         let key_manager = TestKeyManager::new();
 
         Ok(TestSetup {
@@ -118,16 +118,11 @@ impl TestSetup {
         })
     }
 
-    /// Sets up wallet and mines initial blocks
+    /// Sets up the test wallet on a fresh node and mines the initial blocks to it. Returns the wallet address.
     fn setup_wallet_and_mine_blocks(
         bitcoin_client: &Rc<BitcoinClient>,
-        network: Network,
         blocks_mined: u32,
-    ) -> Result<(PublicKey, Address, Address), anyhow::Error> {
-        let public_key = dummy_pubkey();
-        let compressed = CompressedPublicKey::try_from(public_key)
-            .map_err(|e| anyhow::anyhow!("Failed to compress public key: {:?}", e))?;
-        let funding_wallet = Address::p2wpkh(&compressed, network);
+    ) -> Result<Address, anyhow::Error> {
         let regtest_wallet = bitcoin_client
             .init_wallet("test_wallet")
             .map_err(|e| anyhow::anyhow!("Failed to init wallet: {:?}", e))?;
@@ -141,13 +136,47 @@ impl TestSetup {
             .mine_blocks_to_address(blocks_mined as u64, &regtest_wallet)
             .map_err(|e| anyhow::anyhow!("Failed to mine blocks: {:?}", e))?;
 
-        Ok((public_key, funding_wallet, regtest_wallet))
+        Ok(regtest_wallet)
     }
 
+    /// Brings a node a previous test used back to the state a test expects. The wallet already holds mature coins, so
+    /// nothing is mined for funding. Returns a fresh address of the test wallet.
+    fn reset_shared_node(bitcoin_client: &Rc<BitcoinClient>) -> Result<Address, anyhow::Error> {
+        let regtest_wallet = bitcoin_client
+            .init_wallet("test_wallet")
+            .map_err(|e| anyhow::anyhow!("Failed to init wallet: {:?}", e))?;
+
+        // A previous test may have moved the node's clock forward (expire_mempool) or locked wallet coins.
+        bitcoin_client
+            .set_mock_time(0)
+            .map_err(|e| anyhow::anyhow!("setmocktime failed: {:?}", e))?;
+        bitcoin_client
+            .client
+            .unlock_unspent_all()
+            .map_err(|e| anyhow::anyhow!("lockunspent failed: {:?}", e))?;
+
+        // Mine whatever a previous test left in the mempool, then one empty block, so the tip holds too few txs for a
+        // fee estimate, as on a fresh chain.
+        for _ in 0..5 {
+            let mempool = bitcoin_client
+                .client
+                .get_raw_mempool()
+                .map_err(|e| anyhow::anyhow!("getrawmempool failed: {:?}", e))?;
+            if mempool.is_empty() {
+                break;
+            }
+            bitcoin_client
+                .mine_blocks_to_address(1, &regtest_wallet)
+                .map_err(|e| anyhow::anyhow!("Failed to mine blocks: {:?}", e))?;
+        }
+        mine_empty_blocks(bitcoin_client, 1, &regtest_wallet)?;
+
+        Ok(regtest_wallet)
+    }
+
+    /// Removes this test's storage. The node keeps running for the next test.
     pub fn end_all(self) -> Result<(), anyhow::Error> {
-        self.bitcoind.stop()?;
-        self.storage.remove()?;
-        Ok(())
+        self.storage.remove()
     }
 }
 
@@ -155,13 +184,28 @@ impl TestSetup {
 // Coordinator construction helpers
 // =============================================================================
 
+/// Indexer window for the tests. A fresh indexer reads this many blocks below the tip on its first tick, so a small window
+/// keeps every test's startup short. The monitor requires `max_monitoring_confirmations <= retention_depth`.
+const TEST_RETENTION_DEPTH: u32 = 10;
+
+/// `settings` with the test indexer window, capping `max_monitoring_confirmations` to fit inside it.
+fn with_test_window(mut settings: BitcoinSettings) -> BitcoinSettings {
+    settings.monitor.indexer_settings = Some(IndexerSettings::new(TEST_RETENTION_DEPTH));
+    let max_confs = settings
+        .monitor
+        .max_monitoring_confirmations
+        .get_or_insert(TEST_RETENTION_DEPTH);
+    *max_confs = (*max_confs).min(TEST_RETENTION_DEPTH);
+    settings
+}
+
 /// Creates a `BitcoinCoordinator` from a `TestSetup` using default settings.
 pub fn create_coordinator(setup: &TestSetup) -> BitcoinCoordinator {
     BitcoinCoordinator::new_with_paths(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
         setup.key_manager.rc(),
-        None,
+        Some(with_test_window(BitcoinSettings::default())),
     )
     .expect("Failed to create BitcoinCoordinator")
 }
@@ -178,7 +222,7 @@ pub fn create_coordinator_with_km(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
         key_manager,
-        Some(settings),
+        Some(with_test_window(settings)),
     )
     .expect("Failed to create coordinator with key_manager")
 }
@@ -192,7 +236,7 @@ pub fn create_coordinator_with_settings(
         &setup.bitcoind.rpc_config,
         setup.storage.get_raw_storage(),
         setup.key_manager.rc(),
-        Some(settings),
+        Some(with_test_window(settings)),
     )
     .expect("Failed to create BitcoinCoordinator with settings")
 }
@@ -736,17 +780,7 @@ pub fn ctx(label: &str) -> String {
 /// Ack every item in `news` so it is not returned again.
 pub fn ack_all_news(coordinator: &BitcoinCoordinator, news: &News) {
     for n in &news.monitor_news {
-        let ack = match n {
-            MonitorNews::Transaction(t) => AckMonitorNews::Transaction(t.tx_id, t.context.clone()),
-            MonitorNews::NewBlock(_, _) => AckMonitorNews::NewBlock,
-            MonitorNews::SpendingUTXOTransaction(t, v, _, ctx) => {
-                AckMonitorNews::SpendingUTXOTransaction(*t, *v, ctx.clone())
-            }
-            MonitorNews::OutputPatternTransaction(t, _, ctx) => {
-                AckMonitorNews::OutputPatternTransaction(*t, ctx.clone())
-            }
-        };
-        coordinator.ack_news(AckNews::Monitor(ack)).unwrap();
+        coordinator.ack_news(AckNews::Monitor(n.clone())).unwrap();
     }
     for n in &news.coordinator_news {
         coordinator

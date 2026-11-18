@@ -19,7 +19,13 @@ struct StoredNewsItem {
     acked_at_block: Option<BlockHeight>,
 }
 
-const TX_PREFIX: &str = "bitcoin_coordinator";
+const PREFIX: &str = "bitcoin_coordinator";
+
+// The segment naming each key space.
+const TX_SPACE: &str = "txs";
+const NEWS_SPACE: &str = "news";
+const SPEEDUP_SPACE: &str = "speedup";
+const FUNDING_SPACE: &str = "funding";
 
 pub struct CoordinatorStorage {
     pub storage: Rc<Storage>,
@@ -86,8 +92,7 @@ impl CoordinatorStorage {
 
     /// Get all the txs, but not in insertion order
     pub fn get_all_txs(&self) -> Result<Vec<CoordinatedTx>, BitcoinCoordinatorError> {
-        let prefix = Self::coordinator_key(&["txs"], [])?.to_scan_prefix();
-        Ok(self.storage.partial_get(&prefix, None)?)
+        Ok(self.storage.partial_get(&self.tx_space()?, None)?)
     }
 
     pub fn get_by_state(
@@ -177,7 +182,7 @@ impl CoordinatorStorage {
     }
 
     /// Re-queue a tx that the chain reported `not_found` back to `ToDispatch`, and arm the reorg-flap
-    /// fail guard. `fail_guard_until` is set to `current_height + max_monitoring_confirmations`.After
+    /// fail guard. `fail_guard_until` is set to `current_height + finality`. After
     /// the window, exactly one chain branch survives, so the verdict is final.
     pub fn requeue_not_found(
         &self,
@@ -575,39 +580,26 @@ impl CoordinatorStorage {
     // INTERNAL HELPERS
     // ================================
 
-    fn coordinator_key<'a>(
-        namespace: &[&str],
-        tail: impl IntoIterator<Item = &'a str>,
-    ) -> Result<StorageKey, BitcoinCoordinatorError> {
-        Ok(StorageKey::new(
-            std::iter::once(TX_PREFIX)
-                .chain(namespace.iter().copied())
-                .map(str::to_string)
-                .chain(tail.into_iter().map(str::to_string)),
-        )?)
-    }
-
-    fn speedup_key<'a>(
-        tail: impl IntoIterator<Item = &'a str>,
-    ) -> Result<StorageKey, BitcoinCoordinatorError> {
-        Self::coordinator_key(&["speedup"], tail)
-    }
-
-    fn funding_key<'a>(
-        tail: impl IntoIterator<Item = &'a str>,
-    ) -> Result<StorageKey, BitcoinCoordinatorError> {
-        Self::coordinator_key(&["funding"], tail)
-    }
-
+    /// The key each variant is stored under.
     fn get_key(&self, key: StoreKey) -> Result<StorageKey, BitcoinCoordinatorError> {
-        match key {
-            StoreKey::Tx(tx_id) => Self::coordinator_key(&["txs"], [tx_id.to_string().as_str()]),
-            StoreKey::News => Self::coordinator_key(&["news"], []),
-            StoreKey::SpeedupList => Self::speedup_key(["list"]),
-            StoreKey::PendingSpeedupParents => Self::speedup_key(["pending_parents"]),
-            StoreKey::FundingList => Self::funding_key(["list"]),
-            StoreKey::Funding(op) => Self::funding_key(["record", op.to_string().as_str()]),
-        }
+        let key = match key {
+            StoreKey::Tx(tx_id) => StorageKey::new([PREFIX, TX_SPACE, tx_id.to_string().as_str()]),
+            StoreKey::News => StorageKey::new([PREFIX, NEWS_SPACE]),
+            StoreKey::SpeedupList => StorageKey::new([PREFIX, SPEEDUP_SPACE, "list"]),
+            StoreKey::PendingSpeedupParents => {
+                StorageKey::new([PREFIX, SPEEDUP_SPACE, "pending_parents"])
+            }
+            StoreKey::FundingList => StorageKey::new([PREFIX, FUNDING_SPACE, "list"]),
+            StoreKey::Funding(op) => {
+                StorageKey::new([PREFIX, FUNDING_SPACE, "record", op.to_string().as_str()])
+            }
+        };
+        Ok(key?)
+    }
+
+    /// The scan prefix of the key space holding every tx record.
+    fn tx_space(&self) -> Result<String, BitcoinCoordinatorError> {
+        Ok(StorageKey::new([PREFIX, TX_SPACE])?.to_scan_prefix())
     }
 
     fn funding_list(&self) -> Result<Vec<OutPoint>, BitcoinCoordinatorError> {
