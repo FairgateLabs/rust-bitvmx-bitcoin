@@ -10,7 +10,7 @@ use protocol_builder::types::Utxo;
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
 use storage_backend::key::StorageKey;
-use storage_backend::storage::{KeyValueStore, Storage};
+use storage_backend::storage::Storage;
 use tracing::warn;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,5 +1,6 @@
 # rust builds
 /target
+Cargo.lock
 
 # databases
 data
